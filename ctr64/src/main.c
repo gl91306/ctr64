@@ -918,6 +918,12 @@ static void run_game(void)
                                 ctr64_allocfail_where ? ctr64_allocfail_where : "?", ctr64_allocfail_bytes);
                         ctr64_allocfail_bytes = 0;
                     }
+                    {
+                        extern unsigned ctr64_gfx_evicted; /* pica_ContextImpl.cpp */
+                        if (ctr64_gfx_evicted)
+                            fprintf(g_stats, "\n  textures evicted for memory: %u times", ctr64_gfx_evicted);
+                        ctr64_gfx_evicted = 0;
+                    }
                     fprintf(g_stats, "\n");
                     memset(ctr64_prof_ticks, 0, sizeof(ctr64_prof_ticks));
                     memset(ctr64_prof_calls, 0, sizeof(ctr64_prof_calls));

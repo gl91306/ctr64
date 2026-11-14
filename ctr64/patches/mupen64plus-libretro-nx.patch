@@ -461,6 +461,104 @@ index 0000000..cc8e55c
 +#else
 +#define CTR64_PROF(id)
 +#endif
+diff --git a/GLideN64/src/DepthBuffer.cpp b/GLideN64/src/DepthBuffer.cpp
+index 05cc8fe..e284f46 100644
+--- a/GLideN64/src/DepthBuffer.cpp
++++ b/GLideN64/src/DepthBuffer.cpp
+@@ -11,6 +11,9 @@
+ #include "Config.h"
+ #include "DebugDump.h"
+ #include <Graphics/Context.h>
++#ifdef __3DS__
++extern "C" unsigned ctr64_frame_now(void); /* PICA backend frame number */
++#endif
+ #include <Graphics/Parameters.h>
+ #include "DisplayWindow.h"
+ 
+@@ -23,7 +26,14 @@ DepthBuffer::DepthBuffer()
+ 
+ DepthBuffer::~DepthBuffer()
+ {
++#ifdef __3DS__
++	/* ctr64: a renderbuffer is a texture in the PICA backend, and frame buffer ids are counted
++	 * apart: deleteFramebuffer here kept its storage (1.25 MB at 640x480) and deleted whichever
++	 * live frame buffer had the same number */
++	gfxContext.deleteTexture(m_depthRenderbuffer);
++#else
+ 	gfxContext.deleteFramebuffer(m_depthRenderbuffer);
++#endif
+ 	gfxContext.deleteFramebuffer(m_copyFBO);
+ 	gfxContext.deleteFramebuffer(m_ZTextureClearFBO);
+ 	gfxContext.deleteFramebuffer(m_DeltaZTextureClearFBO);
+@@ -438,6 +448,10 @@ void DepthBufferList::saveBuffer(u32 _address)
+ 	if (config.frameBufferEmulation.enable == 0) {
+ 		if (m_list.empty())
+ 			_createScreenSizeBuffer(_address);
++#ifdef __3DS__
++		if (!m_list.empty())
++			m_list.front().m_lastUse = ctr64_frame_now();
++#endif
+ 		return;
+ 	}
+ 
+@@ -475,8 +489,33 @@ void DepthBufferList::saveBuffer(u32 _address)
+ 		clearBuffer();
+ 	if (pDepthBuffer->m_address != gDP.depthImageAddress)
+ 		m_pCurrent = pCurrent;
++#ifdef __3DS__
++	pDepthBuffer->m_lastUse = ctr64_frame_now();
++#endif
+ }
+ 
++#ifdef __3DS__
++/* ctr64: the list keeps a depth buffer for every address a game ever used (Command & Conquer: six
++ * 640x480 ones, 1.25 MB each): under GPU memory pressure the ones not set for _age frames go
++ * (removeBuffer detaches them from the frame buffers; a later use creates a new one) */
++u32 DepthBufferList::evictOld(u32 _now, u32 _age)
++{
++	u32 freed = 0;
++	for (bool again = true; again;) {
++		again = false;
++		for (DepthBuffers::iterator iter = m_list.begin(); iter != m_list.end(); ++iter) {
++			if (&*iter == m_pCurrent || _now - iter->m_lastUse <= _age)
++				continue;
++			freed += iter->m_pDepthBufferTexture != nullptr ? iter->m_pDepthBufferTexture->textureBytes : 1;
++			removeBuffer(iter->m_address);
++			again = true;
++			break;
++		}
++	}
++	return freed;
++}
++#endif
++
+ void DepthBufferList::clearBuffer()
+ {
+ 	if (m_pCurrent != nullptr)
+diff --git a/GLideN64/src/DepthBuffer.h b/GLideN64/src/DepthBuffer.h
+index ac4e150..855667d 100644
+--- a/GLideN64/src/DepthBuffer.h
++++ b/GLideN64/src/DepthBuffer.h
+@@ -25,6 +25,9 @@ struct DepthBuffer
+ 	u32 m_address = 0;
+ 	u32 m_width = 0;
+ 	bool m_cleared = false;
++#ifdef __3DS__
++	u32 m_lastUse = 0; /* ctr64: frame of the last gDPSetDepthImage on it (evictOld) */
++#endif
+ 
+ 	CachedTexture *m_pDepthBufferTexture = nullptr;
+ 
+@@ -61,6 +64,9 @@ public:
+ 	void destroy();
+ 	void saveBuffer(u32 _address);
+ 	void removeBuffer(u32 _address);
++#ifdef __3DS__
++	u32 evictOld(u32 _now, u32 _age);
++#endif
+ 	void clearBuffer();
+ 	void setCleared(bool _cleared);
+ 	DepthBuffer *findBuffer(u32 _address);
 diff --git a/GLideN64/src/FrameBuffer.cpp b/GLideN64/src/FrameBuffer.cpp
 index 68cf2bf..39a67b1 100644
 --- a/GLideN64/src/FrameBuffer.cpp
@@ -1203,7 +1301,7 @@ index e62ff60..aa89a0b 100644
  
  private:
 diff --git a/GLideN64/src/Textures.cpp b/GLideN64/src/Textures.cpp
-index abfdaa3..aa8d35d 100644
+index abfdaa3..d26aeb9 100644
 --- a/GLideN64/src/Textures.cpp
 +++ b/GLideN64/src/Textures.cpp
 @@ -1,3 +1,4 @@
@@ -1211,7 +1309,15 @@ index abfdaa3..aa8d35d 100644
  #include <assert.h>
  #include <memory.h>
  #include <algorithm>
-@@ -809,6 +810,7 @@ void TextureCache::_checkCacheSize()
+@@ -5,6 +6,7 @@
+ #include <chrono>         // std::chrono::seconds
+ #include "Platform.h"
+ #include "Textures.h"
++#include "DepthBuffer.h"
+ #include "GBI.h"
+ #include "RSP.h"
+ #include "RDP.h"
+@@ -809,12 +811,49 @@ void TextureCache::_checkCacheSize()
  		CachedTexture& clsTex = m_textures.back();
  		if (clsTex.bHDTexture)
  			m_hdTexCacheSize -= clsTex.textureBytes;
@@ -1219,7 +1325,49 @@ index abfdaa3..aa8d35d 100644
  		gfxContext.deleteTexture(clsTex.name);
  		m_lruTextureLocations.erase(clsTex.crc);
  		m_textures.pop_back();
-@@ -911,8 +913,11 @@ void _calcTileSizes(u32 _t, TileSizes & _sizes, gDPTile * _pLoadTile)
+ 	}
+ }
+ 
++#ifdef __3DS__
++/* ctr64: the cache is limited by count only, and the 3DS's GPU memory is small: a game that
++ * uploads many large images (Command & Conquer's 320x240 screens) fills it and then every new
++ * texture or frame buffer fails. The PICA backend calls this when an allocation fails: the least
++ * recently used textures go (never the bound ones, nor the newest, which may be loading now). */
++u32 TextureCache::evictForMemory(u32 _bytes)
++{
++	u32 freed = 0;
++	const u32 want = _bytes + (_bytes >> 1);
++	while (freed < want && m_textures.size() > 1) {
++		auto it = std::prev(m_textures.end());
++		while (it != m_textures.begin() && (&*it == current[0] || &*it == current[1]))
++			--it;
++		if (it == m_textures.begin())
++			break;
++		freed += it->textureBytes;
++		if (it->bHDTexture)
++			m_hdTexCacheSize -= it->textureBytes;
++		gfxContext.deleteTexture(it->name);
++		m_lruTextureLocations.erase(it->crc);
++		m_textures.erase(it);
++	}
++	return freed;
++}
++
++extern "C" unsigned ctr64_frame_now(void);
++extern "C" unsigned ctr64_tex_evict(unsigned bytes)
++{
++	u32 freed = TextureCache::get().evictForMemory(bytes);
++	/* and depth buffers not used for half a second (DepthBuffer.cpp): the free space is often
++	 * there but in pieces, between them */
++	freed += depthBufferList().evictOld(ctr64_frame_now(), 30);
++	return freed;
++}
++#endif
++
+ CachedTexture * TextureCache::_addTexture(u64 _crc64)
+ {
+ 	if (m_curUnpackAlignment == 0)
+@@ -911,8 +950,11 @@ void _calcTileSizes(u32 _t, TileSizes & _sizes, gDPTile * _pLoadTile)
  		const TextureLoadParameters & loadParams =
  			ImageFormat::get().tlp[gDP.otherMode.textureLUT][pTile->size][pTile->format];
  
@@ -1233,7 +1381,7 @@ index abfdaa3..aa8d35d 100644
  
  		int mask_width = (pTile->masks == 0) ? (tile_width) : (1 << pTile->masks);
  		int mask_height = (pTile->maskt == 0) ? (tile_height) : (1 << pTile->maskt);
-@@ -1358,6 +1363,44 @@ void TextureCache::_getTextureDestData(CachedTexture& tmptex,
+@@ -1358,6 +1400,44 @@ void TextureCache::_getTextureDestData(CachedTexture& tmptex,
  	} else {
  		j = 0;
  		const u32 tMemMask = gDP.otherMode.textureLUT == G_TT_NONE ? 0x1FF : 0xFF;
@@ -1278,7 +1426,7 @@ index abfdaa3..aa8d35d 100644
  		for (y = 0; y < tmptex.height; ++y) {
  			ty = min(y, clampTClamp) & maskTMask;
  
-@@ -1373,6 +1416,7 @@ void TextureCache::_getTextureDestData(CachedTexture& tmptex,
+@@ -1373,6 +1453,7 @@ void TextureCache::_getTextureDestData(CachedTexture& tmptex,
  					((u16*)pDest)[j++] = GetTexel(tmemOffset, tx, i, tmptex.palette);
  			}
  		}
@@ -1286,7 +1434,7 @@ index abfdaa3..aa8d35d 100644
  	}
  }
  
-@@ -1399,6 +1443,7 @@ void doubleTexture(T* pTex, u32 width, u32 height)
+@@ -1399,6 +1480,7 @@ void doubleTexture(T* pTex, u32 width, u32 height)
  
  void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
  {
@@ -1294,7 +1442,7 @@ index abfdaa3..aa8d35d 100644
  	u64 ricecrc = 0;
  	u64 strongcrc = 0;
  	if (_loadHiresTexture(_tile, _pTexture, ricecrc, strongcrc))
-@@ -1480,7 +1525,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
+@@ -1480,7 +1562,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
  				const u16 texHeight = tmptex.height;
  				tmptex.width = mipTile.lrs - mipTile.uls + 1;
  				tmptex.height = mipTile.lrt - mipTile.ult + 1;
@@ -1303,7 +1451,7 @@ index abfdaa3..aa8d35d 100644
  				if (sizeShift == 2)
  					doubleTexture<u32>(m_tempTextureHolder.data(), tmptex.width, tmptex.height);
  				else
-@@ -1488,7 +1533,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
+@@ -1488,7 +1570,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
  				tmptex.width = texWidth;
  				tmptex.height = texHeight;
  			} else {
@@ -1312,7 +1460,7 @@ index abfdaa3..aa8d35d 100644
  			}
  		}
  
-@@ -1606,6 +1651,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
+@@ -1606,6 +1688,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
  
  void TextureCache::_loadAccurate(u32 _tile, CachedTexture *_pTexture)
  {
@@ -1320,7 +1468,7 @@ index abfdaa3..aa8d35d 100644
  	u64 ricecrc = 0;
  	u64 strongcrc = 0;
  	if (_loadHiresTexture(_tile, _pTexture, ricecrc, strongcrc))
-@@ -1736,7 +1782,10 @@ void TextureCache::_loadAccurate(u32 _tile, CachedTexture *_pTexture)
+@@ -1736,7 +1819,10 @@ void TextureCache::_loadAccurate(u32 _tile, CachedTexture *_pTexture)
  	else
  	{
  		getLoadParams(tmptex.format, tmptex.size);
@@ -1332,7 +1480,7 @@ index abfdaa3..aa8d35d 100644
  
  		if ((config.generalEmulation.hacks&hack_LoadDepthTextures) != 0 && gDP.colorImage.address == gDP.depthImageAddress) {
  			_loadDepthTexture(_pTexture, (u16*)m_tempTextureHolder.data());
-@@ -1835,6 +1884,9 @@ struct TextureParams
+@@ -1835,6 +1921,9 @@ struct TextureParams
  	u32 flags;
  };
  
@@ -1342,7 +1490,7 @@ index abfdaa3..aa8d35d 100644
  static
  u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
  {
-@@ -1853,13 +1905,69 @@ u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
+@@ -1853,13 +1942,69 @@ u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
  	if (!rgba32 && (tileTmemInBytes + _bytes > maxBytes))
  		_bytes = maxBytes - tileTmemInBytes;
  	u64 crc = UINT64_MAX;
@@ -1412,7 +1560,7 @@ index abfdaa3..aa8d35d 100644
  	if (gDP.otherMode.textureLUT != G_TT_NONE || gSP.textureTile[_t]->format == G_IM_FMT_CI) {
  		if (gSP.textureTile[_t]->size == G_IM_SIZ_4b)
  			crc = CRC_Calculate( crc, &gDP.paletteCRC16[gSP.textureTile[_t]->palette], sizeof(u64) );
-@@ -1871,6 +1979,7 @@ u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
+@@ -1871,6 +2016,7 @@ u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
  		crc = CRC_Calculate(crc, &gSP.texture.level, 4);
  
  	crc = CRC_Calculate(crc, &_params, sizeof(_params));
@@ -1420,7 +1568,7 @@ index abfdaa3..aa8d35d 100644
  
  	return crc;
  }
-@@ -2063,6 +2172,7 @@ void TextureCache::toggleDumpTex()
+@@ -2063,6 +2209,7 @@ void TextureCache::toggleDumpTex()
  
  void TextureCache::update(u32 _t)
  {
@@ -1428,7 +1576,7 @@ index abfdaa3..aa8d35d 100644
  	const gDPTile * pTile = gSP.textureTile[_t];
  	switch (pTile->textureMode) {
  	case TEXTUREMODE_BGIMAGE:
-@@ -2110,7 +2220,11 @@ void TextureCache::update(u32 _t)
+@@ -2110,7 +2257,11 @@ void TextureCache::update(u32 _t)
  	params.width = sizes.width;
  	params.height = sizes.height;
  
@@ -1441,7 +1589,7 @@ index abfdaa3..aa8d35d 100644
  
  	if (current[_t] != nullptr && current[_t]->crc == crc) {
  		activateTexture(_t, current[_t]);
-@@ -2135,7 +2249,10 @@ void TextureCache::update(u32 _t)
+@@ -2135,7 +2286,10 @@ void TextureCache::update(u32 _t)
  
  		if (currentTex.bHDTexture)
  			m_hdTexCacheSize -= currentTex.textureBytes;
@@ -1453,6 +1601,20 @@ index abfdaa3..aa8d35d 100644
  		m_lruTextureLocations.erase(locations_iter);
  		m_textures.erase(iter);
  	}
+diff --git a/GLideN64/src/Textures.h b/GLideN64/src/Textures.h
+index 9a2b8ab..338a90a 100644
+--- a/GLideN64/src/Textures.h
++++ b/GLideN64/src/Textures.h
+@@ -69,6 +69,9 @@ struct TextureCache
+ 	void toggleDumpTex();
+ 
+ 	static TextureCache & get();
++#ifdef __3DS__
++	u32 evictForMemory(u32 _bytes);
++#endif
+ 
+ private:
+ 	TextureCache()
 diff --git a/GLideN64/src/convert.cpp b/GLideN64/src/convert.cpp
 index 137c33d..9294bbb 100644
 --- a/GLideN64/src/convert.cpp
@@ -2444,7 +2606,7 @@ index c3a4acf..8ff5e97 100644
                      }
                  }
 diff --git a/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.c b/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.c
-index 8acef67..12cebf9 100644
+index 8acef67..f9f1337 100644
 --- a/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.c
 +++ b/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.c
 @@ -31,6 +31,9 @@
@@ -2513,7 +2675,7 @@ index 8acef67..12cebf9 100644
 +static void emit_fpr_addr(void *const *slot, int rt)
 +{
 +  const intptr_t off=(intptr_t)*slot-(intptr_t)&g_dev.r4300.new_dynarec_hot_state;
-+  if(off>-65536&&off<65536) emit_addimm(FP,(int)off,rt);
++  if(!ctr64_fr_dynamic&&off>-65536&&off<65536) emit_addimm(FP,(int)off,rt);
 +  else emit_readword((intptr_t)slot,rt);
 +}
  static void emit_movsbl(int addr, int rt)
@@ -2545,7 +2707,7 @@ index 8acef67..12cebf9 100644
 +static int fpr_fp_offset(void *const *slot)
 +{
 +  const intptr_t off=(intptr_t)*slot-(intptr_t)&g_dev.r4300.new_dynarec_hot_state;
-+  return off>=0&&off<=1020&&(off&3)==0?(int)off:-1;
++  return !ctr64_fr_dynamic&&off>=0&&off<=1020&&(off&3)==0?(int)off:-1;
 +}
 +static void emit_fpr_load(void *const *slot,int vr,int dbl,int temp)
 +{
@@ -3143,7 +3305,7 @@ index adcae2d..4488d21 100644
      bl     dynamic_linker
      mov    pc, r0
 diff --git a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
-index 1e8f261..9ee54bc 100644
+index 1e8f261..b991c93 100644
 --- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
 +++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
 @@ -55,7 +55,10 @@
@@ -3178,7 +3340,7 @@ index 1e8f261..9ee54bc 100644
    uint64_t u;
    uint64_t uu;
    u_int wasconst;
-@@ -296,15 +301,62 @@ int new_recompile_block(int addr);
+@@ -296,15 +301,68 @@ int new_recompile_block(int addr);
  void invalidate_block(u_int block);
  void *get_addr_ht(u_int vaddr);
  void *get_addr_32(u_int vaddr,u_int flags);
@@ -3211,6 +3373,12 @@ index 1e8f261..9ee54bc 100644
 +static uintptr_t ctr64_ct_span=2*MAX_OUTPUT_BLOCK_SIZE; /* bytes after ctr64_ct_lo the compiles in flight may write */
 +#define CTR64_CT_INFLIGHT(addr) (ctr_jit_thread_busy && (uintptr_t)(addr)-ctr64_ct_lo < ctr64_ct_span)
 +#define CTR64_CT_SYNC() do { if (ctr_jit_thread_busy && !ctr_jit_on_compile_thread()) ctr64_ct_sync(); } while (0)
++/* ctr64: FPU register addresses are built into compiled code for the current Status.FR (emit_fpr_addr).
++ * A game that keeps switching FR (Jet Force Gemini: per thread) would recompile everything at each
++ * switch: after CTR64_FR_TOGGLES switches the code loads the addresses at run time instead. */
++#define CTR64_FR_TOGGLES 8
++int ctr64_fr_dynamic;
++static int ctr64_fr_toggles;
 +#define CTR64_CT_TAKE() do { if (ctr64_ct_unfinished && !ctr_jit_thread_busy) ctr64_ct_finish(); } while (0)
 +#else
 +#define CTR64_CT_INFLIGHT(addr) 0
@@ -3241,7 +3409,7 @@ index 1e8f261..9ee54bc 100644
  
  static u_int start;
  static u_int *source;
-@@ -330,6 +382,127 @@ static u_int ba[MAXBLOCK];
+@@ -330,6 +388,127 @@ static u_int ba[MAXBLOCK];
  static char likely[MAXBLOCK];
  static char is_ds[MAXBLOCK];
  static char ooo[MAXBLOCK];
@@ -3369,7 +3537,7 @@ index 1e8f261..9ee54bc 100644
  static uint64_t unneeded_reg[MAXBLOCK];
  static uint64_t unneeded_reg_upper[MAXBLOCK];
  static uint64_t branch_unneeded_reg[MAXBLOCK];
-@@ -361,6 +534,34 @@ static u_int dirty_entry_count;
+@@ -361,6 +540,34 @@ static u_int dirty_entry_count;
  static u_int copy_size;
  static struct ll_entry* hash_table[65536][2];
  static struct ll_entry *jump_in[4096];
@@ -3404,7 +3572,7 @@ index 1e8f261..9ee54bc 100644
  static struct ll_entry *jump_dirty[4096];
  static struct ll_entry *jump_out[4096];
  static unsigned char restore_candidate[512];
-@@ -380,12 +581,128 @@ static void clear_all_regs(signed char regmap[])
+@@ -380,12 +587,128 @@ static void clear_all_regs(signed char regmap[])
    for (hr=0;hr<HOST_REGS;hr++) regmap[hr]=-1;
  }
  
@@ -3533,7 +3701,7 @@ index 1e8f261..9ee54bc 100644
  
  // Find a register that is available for two consecutive cycles
  static signed char get_reg2(signed char regmap1[],signed char regmap2[],int r)
-@@ -397,6 +714,15 @@ static signed char get_reg2(signed char regmap1[],signed char regmap2[],int r)
+@@ -397,6 +720,15 @@ static signed char get_reg2(signed char regmap1[],signed char regmap2[],int r)
  
  static int count_free_regs(signed char regmap[])
  {
@@ -3549,7 +3717,7 @@ index 1e8f261..9ee54bc 100644
    int count=0;
    int hr;
    for(hr=0;hr<HOST_REGS;hr++)
-@@ -410,13 +736,17 @@ static int count_free_regs(signed char regmap[])
+@@ -410,13 +742,17 @@ static int count_free_regs(signed char regmap[])
  
  static void dirty_reg(struct regstat *cur,signed char reg)
  {
@@ -3569,7 +3737,7 @@ index 1e8f261..9ee54bc 100644
  }
  
  // If we dirty the lower half of a 64 bit register which is now being
-@@ -427,7 +757,12 @@ static void dirty_reg(struct regstat *cur,signed char reg)
+@@ -427,7 +763,12 @@ static void dirty_reg(struct regstat *cur,signed char reg)
  static void flush_dirty_uppers(struct regstat *cur)
  {
    int hr,reg;
@@ -3583,7 +3751,7 @@ index 1e8f261..9ee54bc 100644
      if((cur->dirty>>hr)&1) {
        reg=cur->regmap[hr];
        if(reg>=64)
-@@ -610,6 +945,18 @@ static int needed_again(int r, int i)
+@@ -610,6 +951,18 @@ static int needed_again(int r, int i)
        break;
      }
    }
@@ -3602,7 +3770,7 @@ index 1e8f261..9ee54bc 100644
    for(;j>=1;j--)
    {
      if(rs1[i+j]==r) rn=j;
-@@ -1267,7 +1614,11 @@ static void provisional_r32(void)
+@@ -1267,7 +1620,11 @@ static void provisional_r32(void)
  
      // Dirty registers which are 32-bit, require 32-bit input
      // as they will be written as 32-bit values
@@ -3614,7 +3782,7 @@ index 1e8f261..9ee54bc 100644
      {
        if(regs[i].regmap_entry[hr]>0&&regs[i].regmap_entry[hr]<64) {
          if((regs[i].was32>>regs[i].regmap_entry[hr])&(regs[i].wasdirty>>hr)&1) {
-@@ -1606,6 +1957,34 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1606,6 +1963,34 @@ static void clean_registers(int istart,int iend,int wr)
      }
      will_dirty_next=will_dirty_i;
      wont_dirty_next=wont_dirty_i;
@@ -3649,7 +3817,7 @@ index 1e8f261..9ee54bc 100644
      for(r=0;r<HOST_REGS;r++) {
        if(r!=EXCLUDE_REG) {
          if((regs[i].regmap[r]&63)==rt1[i]) will_dirty_i|=1<<r;
-@@ -1646,6 +2025,12 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1646,6 +2031,12 @@ static void clean_registers(int istart,int iend,int wr)
          if(itype[i]==RJUMP||itype[i]==UJUMP||itype[i]==CJUMP||itype[i]==SJUMP||itype[i]==FJUMP)
          {
            if(i<iend-1&&itype[i]!=RJUMP&&itype[i]!=UJUMP&&(source[i]>>16)!=0x1000) {
@@ -3662,7 +3830,7 @@ index 1e8f261..9ee54bc 100644
              for(r=0;r<HOST_REGS;r++) {
                if(r!=EXCLUDE_REG) {
                  if(regs[i].regmap[r]==regmap_pre[i+2][r]) {
-@@ -1653,11 +2038,18 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1653,11 +2044,18 @@ static void clean_registers(int istart,int iend,int wr)
                  }else {/*DebugMessage(M64MSG_VERBOSE, "i: %x (%d) mismatch(+2): %d",start+i*4,i,r); / *assert(!((wont_dirty_i>>r)&1));*/}
                }
              }
@@ -3681,7 +3849,7 @@ index 1e8f261..9ee54bc 100644
              for(r=0;r<HOST_REGS;r++) {
                if(r!=EXCLUDE_REG) {
                  if(regs[i].regmap[r]==regmap_pre[i+1][r]) {
-@@ -1665,6 +2057,7 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1665,6 +2063,7 @@ static void clean_registers(int istart,int iend,int wr)
                  }else {/*DebugMessage(M64MSG_VERBOSE, "i: %x (%d) mismatch(+1): %d",start+i*4,i,r);/ *assert(!((wont_dirty_i>>r)&1));*/}
                }
              }
@@ -3689,7 +3857,7 @@ index 1e8f261..9ee54bc 100644
            }
          }
          #endif
-@@ -1673,8 +2066,23 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1673,8 +2072,23 @@ static void clean_registers(int istart,int iend,int wr)
      // Deal with changed mappings
      temp_will_dirty=will_dirty_i;
      temp_wont_dirty=wont_dirty_i;
@@ -3713,7 +3881,7 @@ index 1e8f261..9ee54bc 100644
          int nr;
          if(regs[i].regmap[r]==regmap_pre[i][r]) {
            if(wr) {
-@@ -1760,7 +2168,7 @@ static int get_final_value(int hr, int i, int *value)
+@@ -1760,7 +2174,7 @@ static int get_final_value(int hr, int i, int *value)
    }
  }
  
@@ -3722,7 +3890,7 @@ index 1e8f261..9ee54bc 100644
  {
    if((u_int)addr>=start && (u_int)addr<start+slen*4-4)
    {
-@@ -1855,13 +2263,13 @@ static void alloc_all(struct regstat *cur,int i)
+@@ -1855,13 +2269,13 @@ static void alloc_all(struct regstat *cur,int i)
           ((cur->regmap[hr]&63)!=rt1[i])&&((cur->regmap[hr]&63)!=rt2[i]))
        {
          cur->regmap[hr]=-1;
@@ -3738,7 +3906,7 @@ index 1e8f261..9ee54bc 100644
        }
      }
    }
-@@ -1965,6 +2373,7 @@ void* ERET_new(void)
+@@ -1965,6 +2379,7 @@ void* ERET_new(void)
  static void TLBWI_new(int pcaddr, int count)
  {
    unsigned int i;
@@ -3746,7 +3914,7 @@ index 1e8f261..9ee54bc 100644
    UPDATE_COUNT_IN
    state->pcaddr = pcaddr;
  
-@@ -2042,6 +2451,7 @@ static void TLBWI_new(int pcaddr, int count)
+@@ -2042,6 +2457,7 @@ static void TLBWI_new(int pcaddr, int count)
  
  static void TLBWR_new(int pcaddr, int count)
  {
@@ -3754,7 +3922,7 @@ index 1e8f261..9ee54bc 100644
    unsigned int i;
    UPDATE_COUNT_IN
    state->pcaddr = pcaddr;
-@@ -2124,13 +2534,28 @@ static void MFC0_new(int copr, int count)
+@@ -2124,13 +2540,30 @@ static void MFC0_new(int copr, int count)
    UPDATE_COUNT_OUT
  }
  
@@ -3772,7 +3940,9 @@ index 1e8f261..9ee54bc 100644
 +#if defined(__3DS__)
 +  /* ctr64: compiled code has the FPR addresses of the old Status.FR built in (emit_fpr_addr):
 +   * throw it all away and continue after this instruction in freshly compiled code */
-+  if (copr == CP0_STATUS_REG && (state->cp0_regs[CP0_STATUS_REG] & CP0_STATUS_FR) != fr_before) {
++  if (copr == CP0_STATUS_REG && (state->cp0_regs[CP0_STATUS_REG] & CP0_STATUS_FR) != fr_before && !ctr64_fr_dynamic) {
++    CTR64_CT_SYNC();
++    if (++ctr64_fr_toggles >= CTR64_FR_TOGGLES) ctr64_fr_dynamic = 1;
 +    invalidate_all_pages();
 +    if (!state->pending_exception) {
 +      state->pcaddr = pcaddr + 4;
@@ -3783,7 +3953,7 @@ index 1e8f261..9ee54bc 100644
    UPDATE_COUNT_OUT
  }
  
-@@ -2150,10 +2575,16 @@ static unsigned int hshift(uint32_t address)
+@@ -2150,10 +2583,16 @@ static unsigned int hshift(uint32_t address)
      return ((address & 2) ^ 2) << 3;
  }
  
@@ -3800,7 +3970,7 @@ index 1e8f261..9ee54bc 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    unsigned int shift = bshift(state->address);
-@@ -2167,6 +2598,7 @@ static void read_hword_new(int pcaddr, int count)
+@@ -2167,6 +2606,7 @@ static void read_hword_new(int pcaddr, int count)
  {
    uint32_t value;
    UPDATE_COUNT_IN
@@ -3808,7 +3978,7 @@ index 1e8f261..9ee54bc 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    unsigned int shift = hshift(state->address);
-@@ -2180,6 +2612,7 @@ static void read_word_new(int pcaddr, int count)
+@@ -2180,6 +2620,7 @@ static void read_word_new(int pcaddr, int count)
  {
    uint32_t value;
    UPDATE_COUNT_IN
@@ -3816,7 +3986,7 @@ index 1e8f261..9ee54bc 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    if (r4300_read_aligned_word(r4300, state->address, &value)) {
-@@ -2191,6 +2624,7 @@ static void read_word_new(int pcaddr, int count)
+@@ -2191,6 +2632,7 @@ static void read_word_new(int pcaddr, int count)
  static void read_dword_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -3824,7 +3994,7 @@ index 1e8f261..9ee54bc 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    r4300_read_aligned_dword(r4300, state->address, (uint64_t*)&state->rdword);
-@@ -2200,6 +2634,7 @@ static void read_dword_new(int pcaddr, int count)
+@@ -2200,6 +2642,7 @@ static void read_dword_new(int pcaddr, int count)
  static void write_byte_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -3832,7 +4002,7 @@ index 1e8f261..9ee54bc 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    unsigned int shift = bshift(state->address);
-@@ -2211,6 +2646,7 @@ static void write_byte_new(int pcaddr, int count)
+@@ -2211,6 +2654,7 @@ static void write_byte_new(int pcaddr, int count)
  static void write_hword_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -3840,7 +4010,7 @@ index 1e8f261..9ee54bc 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    unsigned int shift = hshift(state->address);
-@@ -2222,6 +2658,7 @@ static void write_hword_new(int pcaddr, int count)
+@@ -2222,6 +2666,7 @@ static void write_hword_new(int pcaddr, int count)
  static void write_word_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -3848,7 +4018,7 @@ index 1e8f261..9ee54bc 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    r4300_write_aligned_word(r4300, state->address, state->wword, UINT32_C(0xffffffff));
-@@ -2231,6 +2668,7 @@ static void write_word_new(int pcaddr, int count)
+@@ -2231,6 +2676,7 @@ static void write_word_new(int pcaddr, int count)
  static void write_dword_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -3856,7 +4026,7 @@ index 1e8f261..9ee54bc 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    /* NOTE: in dynarec, we only need an all-one mask */
-@@ -2395,7 +2833,7 @@ static void tlb_speed_hacks()
+@@ -2395,7 +2841,7 @@ static void tlb_speed_hacks()
        rom_addr=(uintptr_t)ROM_COPY;
      }
      #endif
@@ -3865,7 +4035,7 @@ index 1e8f261..9ee54bc 100644
        for(n=0x7F000;n<0x80000;n++) {
          g_dev.r4300.new_dynarec_hot_state.memory_map[n]=(((uintptr_t)(rom_addr+addr-0x7F000000))>>2)|WRITE_PROTECT;
        }
-@@ -2406,6 +2844,7 @@ static void tlb_speed_hacks()
+@@ -2406,6 +2852,7 @@ static void tlb_speed_hacks()
  /**** Linker ****/
  u_int verify_dirty(struct ll_entry * head)
  {
@@ -3873,7 +4043,7 @@ index 1e8f261..9ee54bc 100644
    void *source = NULL;
    if((int)head->start>=0xa0000000&&(int)head->start<0xa07fffff) {
      source=(void *)((uintptr_t)g_dev.rdram.dram+head->start-0xa0000000);
-@@ -2449,8 +2888,17 @@ static struct ll_entry *ll_add_32(struct ll_entry **head,int vaddr,u_int reg32,v
+@@ -2449,8 +2896,17 @@ static struct ll_entry *ll_add_32(struct ll_entry **head,int vaddr,u_int reg32,v
    new_entry->start=start;
    new_entry->copy=copy;
    new_entry->length=length;
@@ -3891,7 +4061,7 @@ index 1e8f261..9ee54bc 100644
    return new_entry;
  }
  
-@@ -2464,6 +2912,7 @@ static void ll_remove_matching_addrs(struct ll_entry **head,intptr_t addr,int sh
+@@ -2464,6 +2920,7 @@ static void ll_remove_matching_addrs(struct ll_entry **head,intptr_t addr,int sh
  {
    struct ll_entry **cur=head;
    struct ll_entry *next;
@@ -3899,7 +4069,7 @@ index 1e8f261..9ee54bc 100644
    while(*cur) {
      if((((uintptr_t)((*cur)->addr)-(uintptr_t)base_addr)>>shift)==((addr-(uintptr_t)base_addr)>>shift) ||
         (((uintptr_t)((*cur)->addr)-(uintptr_t)base_addr-MAX_OUTPUT_BLOCK_SIZE)>>shift)==((addr-(uintptr_t)base_addr)>>shift))
-@@ -2496,6 +2945,7 @@ static void ll_clear(struct ll_entry **head)
+@@ -2496,6 +2953,7 @@ static void ll_clear(struct ll_entry **head)
  {
    struct ll_entry *cur;
    struct ll_entry *next;
@@ -3907,7 +4077,7 @@ index 1e8f261..9ee54bc 100644
    if((cur=*head)) {
      *head=0;
      while(cur) {
-@@ -2555,17 +3005,31 @@ static struct ll_entry *get_clean(struct r4300_core* r4300,u_int vaddr,u_int fla
+@@ -2555,17 +3013,31 @@ static struct ll_entry *get_clean(struct r4300_core* r4300,u_int vaddr,u_int fla
    u_int page=(vaddr^0x80000000)>>12;
    if(page>262143&&r4300->cp0.tlb.LUT_r[vaddr>>12]) page=(r4300->cp0.tlb.LUT_r[vaddr>>12]^0x80000000)>>12;
    if(page>2048) page=2048+(page&2047);
@@ -3942,7 +4112,7 @@ index 1e8f261..9ee54bc 100644
  static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int flags)
  {
    u_int page=(vaddr^0x80000000)>>12;
-@@ -2574,13 +3038,18 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
+@@ -2574,13 +3046,18 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
    if(page>2048) page=2048+(page&2047);
    if(vpage>262143&&r4300->cp0.tlb.LUT_r[vaddr>>12]) vpage&=2047; // jump_dirty uses a hash of the virtual address instead
    if(vpage>2048) vpage=2048+(vpage&2047);
@@ -3962,7 +4132,7 @@ index 1e8f261..9ee54bc 100644
            r4300->cached_interp.invalid_code[vaddr>>12]=0;
            r4300->new_dynarec_hot_state.memory_map[vaddr>>12]|=WRITE_PROTECT;
            if(vpage<2048) {
-@@ -2597,14 +3066,467 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
+@@ -2597,14 +3074,467 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
      }
      head=head->next;
    }
@@ -4430,7 +4600,7 @@ index 1e8f261..9ee54bc 100644
  
  #ifndef DISABLE_BLOCK_LINKING
    head=get_clean(r4300,vaddr,~0);
-@@ -2623,6 +3545,7 @@ void *dynamic_linker(void * src, u_int vaddr)
+@@ -2623,6 +3553,7 @@ void *dynamic_linker(void * src, u_int vaddr)
    }
  #endif
  
@@ -4438,7 +4608,7 @@ index 1e8f261..9ee54bc 100644
    struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
    if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[0]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[1]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
-@@ -2649,6 +3572,7 @@ void *dynamic_linker(void * src, u_int vaddr)
+@@ -2649,6 +3580,7 @@ void *dynamic_linker(void * src, u_int vaddr)
      return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  
@@ -4446,7 +4616,7 @@ index 1e8f261..9ee54bc 100644
    int r=new_recompile_block(vaddr);
    if(r==0) return dynamic_linker(src,vaddr);
    // Execute in unmapped page, generate pagefault execption
-@@ -2663,6 +3587,7 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
+@@ -2663,6 +3595,7 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
  {
    struct r4300_core* r4300 = &g_dev.r4300;
    struct ll_entry *head;
@@ -4454,7 +4624,7 @@ index 1e8f261..9ee54bc 100644
  
  #ifndef DISABLE_BLOCK_LINKING
    head=get_clean(r4300,vaddr,~0);
-@@ -2681,6 +3606,7 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
+@@ -2681,6 +3614,7 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
    }
  #endif
  
@@ -4462,7 +4632,7 @@ index 1e8f261..9ee54bc 100644
    struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
    if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[0]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[1]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
-@@ -2719,16 +3645,23 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
+@@ -2719,16 +3653,23 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
  
  // Get address from virtual address
  // This is called from the recompiled JR/JALR instructions
@@ -4486,7 +4656,7 @@ index 1e8f261..9ee54bc 100644
      return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  
-@@ -2745,6 +3678,13 @@ void *get_addr(u_int vaddr)
+@@ -2745,6 +3686,13 @@ void *get_addr(u_int vaddr)
      return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  
@@ -4500,7 +4670,7 @@ index 1e8f261..9ee54bc 100644
    int r=new_recompile_block(vaddr);
    if(r==0) return get_addr(vaddr);
    // Execute in unmapped page, generate pagefault execption
-@@ -2758,9 +3698,11 @@ void *get_addr(u_int vaddr)
+@@ -2758,9 +3706,11 @@ void *get_addr(u_int vaddr)
  // Look up address in hash table first
  void *get_addr_ht(u_int vaddr)
  {
@@ -4512,7 +4682,7 @@ index 1e8f261..9ee54bc 100644
    return get_addr(vaddr);
  }
  
-@@ -2796,6 +3738,13 @@ void *get_addr_32(u_int vaddr,u_int flags)
+@@ -2796,6 +3746,13 @@ void *get_addr_32(u_int vaddr,u_int flags)
      return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  
@@ -4526,7 +4696,7 @@ index 1e8f261..9ee54bc 100644
    int r=new_recompile_block(vaddr);
    if(r==0) return get_addr(vaddr);
    // Execute in unmapped page, generate pagefault execption
-@@ -2856,6 +3805,7 @@ static void invalidate_page(u_int page)
+@@ -2856,6 +3813,7 @@ static void invalidate_page(u_int page)
    struct ll_entry *next;
    head=jump_in[page];
    jump_in[page]=0;
@@ -4534,7 +4704,7 @@ index 1e8f261..9ee54bc 100644
    while(head!=NULL) {
      inv_debug("INVALIDATE: %x\n",head->vaddr);
      remove_hash(head->vaddr);
-@@ -2882,6 +3832,10 @@ static void invalidate_page(u_int page)
+@@ -2882,6 +3840,10 @@ static void invalidate_page(u_int page)
  
  void invalidate_block(u_int block)
  {
@@ -4545,7 +4715,7 @@ index 1e8f261..9ee54bc 100644
    u_int page;
    page=block^0x80000;
    if(block<0x100000&&page>262143&&g_dev.r4300.cp0.tlb.LUT_r[block]) page=(g_dev.r4300.cp0.tlb.LUT_r[block]^0x80000000)>>12;
-@@ -2961,6 +3915,7 @@ void invalidate_block(u_int block)
+@@ -2961,6 +3923,7 @@ void invalidate_block(u_int block)
  // Anything could have changed, so invalidate everything.
  static void invalidate_all_pages(void)
  {
@@ -4553,7 +4723,7 @@ index 1e8f261..9ee54bc 100644
    u_int page;
    for(page=0;page<4096;page++)
      invalidate_page(page);
-@@ -2996,14 +3951,24 @@ void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t addre
+@@ -2996,14 +3959,24 @@ void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t addre
      size_t begin;
      size_t end;
  
@@ -4578,7 +4748,7 @@ index 1e8f261..9ee54bc 100644
  
          for(i = begin; i <= end; ++i) {
              if(r4300->cached_interp.invalid_code[i] == 0) {
-@@ -3092,17 +4057,35 @@ void* cop1_unusable(void)
+@@ -3092,17 +4065,35 @@ void* cop1_unusable(void)
      return get_addr_ht(state->pcaddr);
  }
  
@@ -4615,7 +4785,7 @@ index 1e8f261..9ee54bc 100644
      {
          for(int i=0;i<32;i++)
          {
-@@ -3692,7 +4675,7 @@ static void delayslot_alloc(struct regstat *current,int i)
+@@ -3692,7 +4683,7 @@ static void delayslot_alloc(struct regstat *current,int i)
      case SPAN:
        assem_debug("jump in the delay slot.  this shouldn't happen.");//exit(1);
        DebugMessage(M64MSG_VERBOSE, "Disabled speculative precompilation");
@@ -4624,7 +4794,7 @@ index 1e8f261..9ee54bc 100644
        ccadj[i-1]+=1;
        break;
      case IMM16:
-@@ -3794,9 +4777,47 @@ static void pagespan_alloc(struct regstat *current,int i)
+@@ -3794,9 +4785,47 @@ static void pagespan_alloc(struct regstat *current,int i)
  }
  
  /**** Assembler utils ****/
@@ -4673,7 +4843,7 @@ index 1e8f261..9ee54bc 100644
    for(hr=0;hr<HOST_REGS;hr++) {
      if(hr!=EXCLUDE_REG) {
        if(pre[hr]!=entry[hr]) {
-@@ -3839,13 +4860,18 @@ static void wb_invalidate(signed char pre[],signed char entry[],uint64_t dirty,u
+@@ -3839,13 +4868,18 @@ static void wb_invalidate(signed char pre[],signed char entry[],uint64_t dirty,u
        }
      }
    }
@@ -4693,7 +4863,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG) {
        if(((i_regmap[hr]&63)>0)&&((i_regmap[hr]&63)<CSREG)) {
          if((i_dirty>>hr)&1) {
-@@ -3873,7 +4899,7 @@ static void wb_dirtys(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirty)
+@@ -3873,7 +4907,7 @@ static void wb_dirtys(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirty)
  
  // Write out dirty registers that we need to reload (pair with load_needed_regs)
  // This writes the registers not written by store_regs_bt
@@ -4702,7 +4872,7 @@ index 1e8f261..9ee54bc 100644
  {
    int hr;
    int t=(addr-start)>>2;
-@@ -3910,11 +4936,15 @@ static void wb_needed_dirtys(signed char i_regmap[],uint64_t i_is32,uint64_t i_d
+@@ -3910,11 +4944,15 @@ static void wb_needed_dirtys(signed char i_regmap[],uint64_t i_is32,uint64_t i_d
  // This is useful where we have a 32-bit value in a register, and want to
  // keep it in a 32-bit register, but can't guarantee that it won't be read
  // as a 64-bit value later.
@@ -4719,7 +4889,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG) {
        //if(pre[hr]==entry[hr]) {
          if((reg=pre[hr])>=0) {
-@@ -3934,7 +4964,11 @@ static void wb_valid(signed char pre[],signed char entry[],u_int dirty_pre,u_int
+@@ -3934,7 +4972,11 @@ static void wb_valid(signed char pre[],signed char entry[],u_int dirty_pre,u_int
  {
    //if(dirty_pre==dirty) return;
    int hr,reg;
@@ -4731,7 +4901,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG) {
        reg=pre[hr];
        if(((~u)>>(reg&63))&1) {
-@@ -3958,10 +4992,14 @@ static void wb_valid(signed char pre[],signed char entry[],u_int dirty_pre,u_int
+@@ -3958,10 +5000,14 @@ static void wb_valid(signed char pre[],signed char entry[],u_int dirty_pre,u_int
  #endif
  
  // Write out a single register
@@ -4747,7 +4917,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG) {
        if((regmap[hr]&63)==r) {
          if((dirty>>hr)&1) {
-@@ -3981,7 +5019,7 @@ static void wb_register(signed char r,signed char regmap[],uint64_t dirty,uint64
+@@ -3981,7 +5027,7 @@ static void wb_register(signed char r,signed char regmap[],uint64_t dirty,uint64
  }
  
  // Store dirty registers prior to branch
@@ -4756,7 +4926,7 @@ index 1e8f261..9ee54bc 100644
  {
    if(internal_branch(i_is32,addr))
    {
-@@ -4024,7 +5062,7 @@ static void store_regs_bt(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirt
+@@ -4024,7 +5070,7 @@ static void store_regs_bt(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirt
  }
  
  // Load all needed registers for branch target
@@ -4765,7 +4935,7 @@ index 1e8f261..9ee54bc 100644
  {
    //if(addr>=start && addr<(start+slen*4))
    if(internal_branch(i_is32,addr))
-@@ -4097,6 +5135,54 @@ static void load_regs_bt(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirty
+@@ -4097,6 +5143,54 @@ static void load_regs_bt(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirty
  static void load_regs(signed char entry[],signed char regmap[],int is32,int rs1,int rs2)
  {
    int hr;
@@ -4820,7 +4990,7 @@ index 1e8f261..9ee54bc 100644
    // Load 32-bit regs
    for(hr=0;hr<HOST_REGS;hr++) {
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0) {
-@@ -4143,7 +5229,11 @@ static void load_consts(signed char pre[],signed char regmap[],int is32,int i)
+@@ -4143,7 +5237,11 @@ static void load_consts(signed char pre[],signed char regmap[],int is32,int i)
  {
    int hr;
    // Load 32-bit regs
@@ -4832,7 +5002,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0) {
        //if(entry[hr]!=regmap[hr]) {
        if(i==0||!((regs[i-1].isconst>>hr)&1)||pre[hr]!=regmap[hr]||bt[i]) {
-@@ -4162,7 +5252,11 @@ static void load_consts(signed char pre[],signed char regmap[],int is32,int i)
+@@ -4162,7 +5260,11 @@ static void load_consts(signed char pre[],signed char regmap[],int is32,int i)
      }
    }
    // Load 64-bit regs
@@ -4844,7 +5014,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0) {
        //if(entry[hr]!=regmap[hr]) {
        if(i==0||!((regs[i-1].isconst>>hr)&1)||pre[hr]!=regmap[hr]||bt[i]) {
-@@ -4194,7 +5288,11 @@ static void load_all_consts(signed char regmap[],int is32,u_int dirty,u_int isco
+@@ -4194,7 +5296,11 @@ static void load_all_consts(signed char regmap[],int is32,u_int dirty,u_int isco
  {
    int hr;
    // Load 32-bit regs
@@ -4856,7 +5026,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0&&((dirty>>hr)&1)) {
        if(((isconst>>hr)&1)&&regmap[hr]<64&&regmap[hr]>0) {
          int value=constmap[i][hr];
-@@ -4208,7 +5306,11 @@ static void load_all_consts(signed char regmap[],int is32,u_int dirty,u_int isco
+@@ -4208,7 +5314,11 @@ static void load_all_consts(signed char regmap[],int is32,u_int dirty,u_int isco
      }
    }
    // Load 64-bit regs
@@ -4868,7 +5038,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0&&((dirty>>hr)&1)) {
        if(((isconst>>hr)&1)&&regmap[hr]>64) {
          if((is32>>(regmap[hr]&63))&1) {
-@@ -4317,7 +5419,11 @@ static void load_regs_entry(int t)
+@@ -4317,7 +5427,11 @@ static void load_regs_entry(int t)
  static void loop_preload(signed char pre[],signed char entry[])
  {
    int hr;
@@ -4880,7 +5050,7 @@ index 1e8f261..9ee54bc 100644
      if(hr!=EXCLUDE_REG) {
        if(pre[hr]!=entry[hr]) {
          if(entry[hr]>=0) {
-@@ -4548,6 +5654,12 @@ static void do_cc(int i,signed char i_regmap[],int *adj,int addr,int taken,int i
+@@ -4548,6 +5662,12 @@ static void do_cc(int i,signed char i_regmap[],int *adj,int addr,int taken,int i
      *adj=0;
    }
    count=ccadj[i];
@@ -4893,7 +5063,7 @@ index 1e8f261..9ee54bc 100644
    if(taken==TAKEN && i==(ba[i]-start)>>2 && source[i+1]==0) {
      // Idle loop
      idle=(intptr_t)out;
-@@ -5451,32 +6563,28 @@ static void cop1_assemble(int i,struct regstat *i_regs)
+@@ -5451,32 +6571,28 @@ static void cop1_assemble(int i,struct regstat *i_regs)
    if (opcode2[i]==0) { // MFC1
      signed char tl=get_reg(i_regs->regmap,rt1[i]);
      if(tl>=0) {
@@ -4932,7 +5102,7 @@ index 1e8f261..9ee54bc 100644
    }
    else if (opcode2[i]==2) // CFC1
    {
-@@ -6465,7 +7573,7 @@ static void store_assemble(int i,struct regstat *i_regs)
+@@ -6465,7 +7581,7 @@ static void store_assemble(int i,struct regstat *i_regs)
        }
      }
  
@@ -4941,7 +5111,7 @@ index 1e8f261..9ee54bc 100644
        #ifdef DESTRUCTIVE_SHIFT
        // The x86 shift operation is 'destructive'; it overwrites the
        // source register, so we need to make a copy first and use that.
-@@ -6835,13 +7943,11 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
+@@ -6835,13 +7951,11 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
      cop1_usable=1;
    }
    if (opcode[i]==0x39) { // SWC1 (get float address)
@@ -4958,7 +5128,7 @@ index 1e8f261..9ee54bc 100644
    }
  
  #ifndef INTERPRET_C1LS
-@@ -6909,7 +8015,7 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
+@@ -6909,7 +8023,7 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
        emit_writedword_indexed_tlb(th,tl,0,addr,map);
      }
  
@@ -4967,7 +5137,7 @@ index 1e8f261..9ee54bc 100644
        if (opcode[i]==0x39||opcode[i]==0x3D) { // SWC1/SDC1
          #ifdef DESTRUCTIVE_SHIFT
          addr=temp;
-@@ -6947,13 +8053,11 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
+@@ -6947,13 +8061,11 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
  #endif
  
    if (opcode[i]==0x31) { // LWC1 (write float)
@@ -4984,7 +5154,18 @@ index 1e8f261..9ee54bc 100644
    }
  }
  
-@@ -8768,8 +9872,15 @@ void new_dynarec_init(void)
+@@ -8710,6 +9822,10 @@ void new_dynarec_init(void)
+ {
+   DebugMessage(M64MSG_INFO, "Init new dynarec");
+   ensure_dynarec_cache_alignment();
++#if defined(__3DS__)
++  ctr64_fr_dynamic=0;
++  ctr64_fr_toggles=0;
++#endif
+ 
+ #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
+   recomp_dbg_init();
+@@ -8768,8 +9884,15 @@ void new_dynarec_init(void)
    base_addr_rx = base_addr;
  #endif
  #elif NEW_DYNAREC == NEW_DYNAREC_ARM
@@ -5000,7 +5181,7 @@ index 1e8f261..9ee54bc 100644
    base_addr = g_dev.r4300.extra_memory;
    base_addr_rx = base_addr;
  #else
-@@ -8810,8 +9921,14 @@ void new_dynarec_init(void)
+@@ -8810,8 +9933,14 @@ void new_dynarec_init(void)
    // Copy this into local area so we don't have to put it in every literal pool
    g_dev.r4300.new_dynarec_hot_state.invc_ptr=g_dev.r4300.cached_interp.invalid_code;
  #endif
@@ -5016,7 +5197,7 @@ index 1e8f261..9ee54bc 100644
  #else
    stop_after_jal=1;
  #endif
-@@ -8835,6 +9952,9 @@ void new_dynarec_cleanup(void)
+@@ -8835,6 +9964,9 @@ void new_dynarec_cleanup(void)
  #endif
  
    int n;
@@ -5026,7 +5207,7 @@ index 1e8f261..9ee54bc 100644
    for(n=0;n<4096;n++) ll_clear(jump_in+n);
    for(n=0;n<4096;n++) ll_clear(jump_out+n);
    for(n=0;n<4096;n++) ll_clear(jump_dirty+n);
-@@ -8844,6 +9964,8 @@ void new_dynarec_cleanup(void)
+@@ -8844,6 +9976,8 @@ void new_dynarec_cleanup(void)
      VirtualFree(base_addr, 0, MEM_RELEASE);
    #elif NEW_DYNAREC == NEW_DYNAREC_ARM64 && CACHE_ADDR!=FIXED_CACHE_ADDR
      if (munmap (base_addr_rx, 1<<TARGET_SIZE_2) < 0) {DebugMessage(M64MSG_ERROR, "munmap() failed");}
@@ -5035,7 +5216,7 @@ index 1e8f261..9ee54bc 100644
    #else
      mprotect(base_addr, 1<<TARGET_SIZE_2, PROT_READ | PROT_WRITE);
    #endif
-@@ -8853,6 +9975,444 @@ void new_dynarec_cleanup(void)
+@@ -8853,6 +9987,444 @@ void new_dynarec_cleanup(void)
  #endif
  }
  
@@ -5480,7 +5661,7 @@ index 1e8f261..9ee54bc 100644
  int new_recompile_block(int addr)
  {
  #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
-@@ -8925,6 +10485,7 @@ int new_recompile_block(int addr)
+@@ -8925,6 +10497,7 @@ int new_recompile_block(int addr)
    //DebugMessage(M64MSG_VERBOSE, "addr = %x source = %x %x", addr,source,source[0]);
  
    /* Pass 1 disassembly */
@@ -5488,7 +5669,7 @@ index 1e8f261..9ee54bc 100644
  
    for(i=0;!done;i++) {
      bt[i]=0;likely[i]=0;ooo[i]=0;op2=0;
-@@ -9429,7 +10990,7 @@ int new_recompile_block(int addr)
+@@ -9429,7 +11002,7 @@ int new_recompile_block(int addr)
          // Stop if we're compiling junk
          if(type==UJUMP||type==CJUMP||type==SJUMP||type==RJUMP||type==FJUMP)
          {
@@ -5497,7 +5678,7 @@ index 1e8f261..9ee54bc 100644
            itype[i]=NOP;
            DebugMessage(M64MSG_VERBOSE, "Disabled speculative precompilation");
          }
-@@ -9440,7 +11001,15 @@ int new_recompile_block(int addr)
+@@ -9440,7 +11013,15 @@ int new_recompile_block(int addr)
          if((source[i+1]&0xfc00003f)==0x0d) done=1;
        }
        // Don't recompile stuff that's already compiled
@@ -5513,7 +5694,7 @@ index 1e8f261..9ee54bc 100644
        // Don't get too close to the limit
        if(i>MAXBLOCK/2) done=1;
      }
-@@ -9451,11 +11020,19 @@ int new_recompile_block(int addr)
+@@ -9451,11 +11032,19 @@ int new_recompile_block(int addr)
      if (i==MAXBLOCK-1) done=1;
      // Stop if we're compiling junk
      if(itype[i]==NI&&opcode[i]==0x11) {
@@ -5534,7 +5715,7 @@ index 1e8f261..9ee54bc 100644
    if(itype[i-1]==UJUMP||itype[i-1]==CJUMP||itype[i-1]==SJUMP||itype[i-1]==RJUMP||itype[i-1]==FJUMP) {
      if(start+i*4==pagelimit) {
        itype[i-1]=SPAN;
-@@ -9464,10 +11041,12 @@ int new_recompile_block(int addr)
+@@ -9464,10 +11053,12 @@ int new_recompile_block(int addr)
    assert(slen>0);
  
    /* Pass 2 - Register dependencies and branch targets */
@@ -5547,7 +5728,7 @@ index 1e8f261..9ee54bc 100644
  
    struct regstat current; // Current register allocations/status
    current.is32=1;
-@@ -9828,7 +11407,11 @@ int new_recompile_block(int addr)
+@@ -9828,7 +11419,11 @@ int new_recompile_block(int addr)
                  if(rs2[i]) alloc_reg64(&current,i,rs2[i]);
                }
              }
@@ -5560,7 +5741,7 @@ index 1e8f261..9ee54bc 100644
              {
                ooo[i]=1;
                delayslot_alloc(&current,i+1);
-@@ -10051,7 +11634,11 @@ int new_recompile_block(int addr)
+@@ -10051,7 +11646,11 @@ int new_recompile_block(int addr)
        }
  
        // Make sure the allocator didn't do anything bad
@@ -5572,7 +5753,7 @@ index 1e8f261..9ee54bc 100644
        {
          int r;
          r=current.regmap[hr];
-@@ -10063,7 +11650,7 @@ int new_recompile_block(int addr)
+@@ -10063,7 +11662,7 @@ int new_recompile_block(int addr)
                {
                  //FIXME: delayslot_alloc realloc registers removed from cache by jump instruction, thus the missing dirty flag
                  assert(itype[i]==CJUMP);
@@ -5581,7 +5762,7 @@ index 1e8f261..9ee54bc 100644
                }
                //assert (((current.dirty>>hr)&1)!=0);
              }
-@@ -10086,7 +11673,21 @@ int new_recompile_block(int addr)
+@@ -10086,7 +11685,21 @@ int new_recompile_block(int addr)
        }
  
        // Create entry (branch target) regmap
@@ -5603,7 +5784,7 @@ index 1e8f261..9ee54bc 100644
        {
          int r,or;
          r=current.regmap[hr];
-@@ -10445,6 +12046,10 @@ int new_recompile_block(int addr)
+@@ -10445,6 +12058,10 @@ int new_recompile_block(int addr)
        regs[i].isconst=current.isconst;
        memcpy(constmap[i],current.constmap,sizeof(current.constmap));
      }
@@ -5614,7 +5795,7 @@ index 1e8f261..9ee54bc 100644
      for(hr=0;hr<HOST_REGS;hr++) {
        if(hr!=EXCLUDE_REG&&regs[i].regmap[hr]>=0) {
          if(regmap_pre[i][hr]!=regs[i].regmap[hr]) {
-@@ -10452,12 +12057,14 @@ int new_recompile_block(int addr)
+@@ -10452,12 +12069,14 @@ int new_recompile_block(int addr)
          }
        }
      }
@@ -5630,7 +5811,7 @@ index 1e8f261..9ee54bc 100644
  
    for (i=slen-1;i>=0;i--)
    {
-@@ -10467,18 +12074,18 @@ int new_recompile_block(int addr)
+@@ -10467,18 +12086,18 @@ int new_recompile_block(int addr)
        if(ba[i]<start || ba[i]>=(start+slen*4))
        {
          // Branch out of this block, don't need anything
@@ -5652,7 +5833,7 @@ index 1e8f261..9ee54bc 100644
            }
          }
        }
-@@ -10487,95 +12094,149 @@ int new_recompile_block(int addr)
+@@ -10487,95 +12106,149 @@ int new_recompile_block(int addr)
        {
          if(i<slen-2) {
            nr|=needed_reg[i+2];
@@ -5845,7 +6026,7 @@ index 1e8f261..9ee54bc 100644
        }
        // Don't store a register immediately after writing it,
        // may prevent dual-issue.
-@@ -10584,25 +12245,87 @@ int new_recompile_block(int addr)
+@@ -10584,25 +12257,87 @@ int new_recompile_block(int addr)
        if(i>0&&!bt[i]&&((regs[i].wasdirty>>hr)&1)) {
          if((regmap_pre[i][hr]>0&&regmap_pre[i][hr]<64&&!((unneeded_reg[i]>>regmap_pre[i][hr])&1)) ||
             (regmap_pre[i][hr]>64&&!((unneeded_reg_upper[i]>>(regmap_pre[i][hr]&63))&1)) ) {
@@ -5939,7 +6120,7 @@ index 1e8f261..9ee54bc 100644
      for(hr=0;hr<HOST_REGS;hr++)
      {
        if(!((nr>>hr)&1)) {
-@@ -10685,7 +12408,8 @@ int new_recompile_block(int addr)
+@@ -10685,7 +12420,8 @@ int new_recompile_block(int addr)
            if(i>0)
            {
              int d1=0,d2=0,map=-1,temp=-1;
@@ -5949,7 +6130,7 @@ index 1e8f261..9ee54bc 100644
              {
                d1=dep1[i];
                d2=dep2[i];
-@@ -10730,6 +12454,13 @@ int new_recompile_block(int addr)
+@@ -10730,6 +12466,13 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 5 - Pre-allocate registers */
@@ -5963,7 +6144,7 @@ index 1e8f261..9ee54bc 100644
  
    // If a register is allocated during a loop, try to allocate it for the
    // entire loop, if possible.  This avoids loading/storing registers
-@@ -10762,10 +12493,15 @@ int new_recompile_block(int addr)
+@@ -10762,10 +12505,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -5979,7 +6160,7 @@ index 1e8f261..9ee54bc 100644
                // and alloc new one
                f_regmap[hr]=regs[i].regmap[hr];
              }
-@@ -10779,10 +12515,15 @@ int new_recompile_block(int addr)
+@@ -10779,10 +12527,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=branch_regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -5995,7 +6176,7 @@ index 1e8f261..9ee54bc 100644
                // and alloc new one
                f_regmap[hr]=branch_regs[i].regmap[hr];
              }
-@@ -10872,10 +12613,10 @@ int new_recompile_block(int addr)
+@@ -10872,10 +12625,10 @@ int new_recompile_block(int addr)
                          regs[k].regmap_entry[hr]=f_regmap[hr];
                          regs[k].regmap[hr]=f_regmap[hr];
                          regmap_pre[k+1][hr]=f_regmap[hr];
@@ -6010,7 +6191,7 @@ index 1e8f261..9ee54bc 100644
                          regs[k].wasconst&=~(1LL<<hr);
                          regs[k].isconst&=~(1LL<<hr);
                          k++;
-@@ -10890,24 +12631,24 @@ int new_recompile_block(int addr)
+@@ -10890,24 +12643,24 @@ int new_recompile_block(int addr)
                        //DebugMessage(M64MSG_VERBOSE, "OK fill %x (r%d)",start+i*4,hr);
                        regs[i].regmap_entry[hr]=f_regmap[hr];
                        regs[i].regmap[hr]=f_regmap[hr];
@@ -6045,7 +6226,7 @@ index 1e8f261..9ee54bc 100644
                          assert((branch_regs[i].is32&(1LL<<(f_regmap[hr]&63)))==
                            (regs[i+2].was32&(1LL<<(f_regmap[hr]&63))));
                        }
-@@ -10918,18 +12659,18 @@ int new_recompile_block(int addr)
+@@ -10918,18 +12671,18 @@ int new_recompile_block(int addr)
                      // but may dirty it in pass 6
                      regs[k].regmap_entry[hr]=f_regmap[hr];
                      regs[k].regmap[hr]=f_regmap[hr];
@@ -6067,7 +6248,7 @@ index 1e8f261..9ee54bc 100644
                          assert((branch_regs[k].is32&(1LL<<(f_regmap[hr]&63)))==
                            (regs[k+2].was32&(1LL<<(f_regmap[hr]&63))));//DebugMessage(M64MSG_VERBOSE, "Extend CC, %x -> %x",start+k*4,start+j*4);
                        }
-@@ -10937,7 +12678,7 @@ int new_recompile_block(int addr)
+@@ -10937,7 +12690,7 @@ int new_recompile_block(int addr)
                      else
                      {
                        regmap_pre[k+1][hr]=f_regmap[hr];
@@ -6076,7 +6257,7 @@ index 1e8f261..9ee54bc 100644
                      }
                    }
                    if(regs[j].regmap[hr]==f_regmap[hr])
-@@ -10998,7 +12739,11 @@ int new_recompile_block(int addr)
+@@ -10998,7 +12751,11 @@ int new_recompile_block(int addr)
        }
      }else{
        // Non branch or undetermined branch target
@@ -6088,7 +6269,7 @@ index 1e8f261..9ee54bc 100644
        {
          if(hr!=EXCLUDE_REG) {
            if(regs[i].regmap[hr]>64) {
-@@ -11009,10 +12754,15 @@ int new_recompile_block(int addr)
+@@ -11009,10 +12766,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -6104,7 +6285,7 @@ index 1e8f261..9ee54bc 100644
                // and alloc new one
                f_regmap[hr]=regs[i].regmap[hr];
              }
-@@ -11035,8 +12785,8 @@ int new_recompile_block(int addr)
+@@ -11035,8 +12797,8 @@ int new_recompile_block(int addr)
              regs[k].regmap_entry[HOST_CCREG]=CCREG;
              regs[k].regmap[HOST_CCREG]=CCREG;
              regmap_pre[k+1][HOST_CCREG]=CCREG;
@@ -6115,7 +6296,7 @@ index 1e8f261..9ee54bc 100644
              regs[k].wasconst&=~(1<<HOST_CCREG);
              regs[k].isconst&=~(1<<HOST_CCREG);
              k++;
-@@ -11062,8 +12812,8 @@ int new_recompile_block(int addr)
+@@ -11062,8 +12824,8 @@ int new_recompile_block(int addr)
                regs[k].regmap_entry[HOST_CCREG]=CCREG;
                regs[k].regmap[HOST_CCREG]=CCREG;
                regmap_pre[k+1][HOST_CCREG]=CCREG;
@@ -6126,7 +6307,7 @@ index 1e8f261..9ee54bc 100644
                regs[k].wasconst&=~(1<<HOST_CCREG);
                regs[k].isconst&=~(1<<HOST_CCREG);
                k++;
-@@ -11084,6 +12834,10 @@ int new_recompile_block(int addr)
+@@ -11084,6 +12846,10 @@ int new_recompile_block(int addr)
      }
    }
  
@@ -6137,7 +6318,7 @@ index 1e8f261..9ee54bc 100644
    // Cache memory offset or tlb map pointer if a register is available
    #ifndef HOST_IMM_ADDR32
    #ifndef RAM_OFFSET
-@@ -11224,18 +12978,18 @@ int new_recompile_block(int addr)
+@@ -11224,18 +12990,18 @@ int new_recompile_block(int addr)
              assert(regs[j].regmap[maxscore]<0);
              if(j>loop_start[maxscore]) regs[j].regmap_entry[maxscore]=reg;
              regs[j].regmap[maxscore]=reg;
@@ -6160,7 +6341,7 @@ index 1e8f261..9ee54bc 100644
                }
                // loop optimization (loop_preload)
                int t=(ba[j]-start)>>2;
-@@ -11248,7 +13002,7 @@ int new_recompile_block(int addr)
+@@ -11248,7 +13014,7 @@ int new_recompile_block(int addr)
              {
                if(j<1||(itype[j-1]!=RJUMP&&itype[j-1]!=UJUMP&&itype[j-1]!=CJUMP&&itype[j-1]!=SJUMP&&itype[j-1]!=FJUMP)) {
                  regmap_pre[j+1][maxscore]=reg;
@@ -6169,7 +6350,7 @@ index 1e8f261..9ee54bc 100644
                }
              }
            }
-@@ -11264,6 +13018,10 @@ int new_recompile_block(int addr)
+@@ -11264,6 +13030,10 @@ int new_recompile_block(int addr)
    }
    #endif
  
@@ -6180,7 +6361,7 @@ index 1e8f261..9ee54bc 100644
    // This allocates registers (if possible) one instruction prior
    // to use, which can avoid a load-use penalty on certain CPUs.
    for(i=0;i<slen-1;i++)
-@@ -11288,8 +13046,8 @@ int new_recompile_block(int addr)
+@@ -11288,8 +13058,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6191,7 +6372,7 @@ index 1e8f261..9ee54bc 100644
                  free_regs--;
                }
              }
-@@ -11305,8 +13063,8 @@ int new_recompile_block(int addr)
+@@ -11305,8 +13075,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6202,7 +6383,7 @@ index 1e8f261..9ee54bc 100644
                  free_regs--;
                }
              }
-@@ -11323,8 +13081,8 @@ int new_recompile_block(int addr)
+@@ -11323,8 +13093,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6213,7 +6394,7 @@ index 1e8f261..9ee54bc 100644
                  free_regs--;
                }
              }
-@@ -11345,8 +13103,8 @@ int new_recompile_block(int addr)
+@@ -11345,8 +13115,8 @@ int new_recompile_block(int addr)
                    regs[i].isconst&=~(1<<hr);
                    regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                    constmap[i][hr]=constmap[i+1][hr];
@@ -6224,7 +6405,7 @@ index 1e8f261..9ee54bc 100644
                    free_regs--;
                  }
                  else if((nr=get_reg2(regs[i].regmap,regs[i+1].regmap,-1))>=0&&free_regs>0)
-@@ -11361,10 +13119,10 @@ int new_recompile_block(int addr)
+@@ -11361,10 +13131,10 @@ int new_recompile_block(int addr)
                    regs[i+1].regmap_entry[nr]=MGEN1+((i+1)&1);
                    regs[i].isconst&=~(1<<nr);
                    regs[i+1].isconst&=~(1<<nr);
@@ -6239,7 +6420,7 @@ index 1e8f261..9ee54bc 100644
                    free_regs--;
                  }
                }
-@@ -11386,8 +13144,8 @@ int new_recompile_block(int addr)
+@@ -11386,8 +13156,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6250,7 +6431,7 @@ index 1e8f261..9ee54bc 100644
                  free_regs--;
                }
              }
-@@ -11405,8 +13163,8 @@ int new_recompile_block(int addr)
+@@ -11405,8 +13175,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6261,7 +6442,7 @@ index 1e8f261..9ee54bc 100644
                  free_regs--;
                }
                else if((nr=get_reg2(regs[i].regmap,regs[i+1].regmap,-1))>=0&&free_regs>0)
-@@ -11421,10 +13179,10 @@ int new_recompile_block(int addr)
+@@ -11421,10 +13191,10 @@ int new_recompile_block(int addr)
                  regs[i+1].regmap_entry[nr]=rs1[i+1];
                  regs[i].isconst&=~(1<<nr);
                  regs[i+1].isconst&=~(1<<nr);
@@ -6276,7 +6457,7 @@ index 1e8f261..9ee54bc 100644
                  free_regs--;
                }
              }
-@@ -11443,8 +13201,8 @@ int new_recompile_block(int addr)
+@@ -11443,8 +13213,8 @@ int new_recompile_block(int addr)
                  regmap_pre[i+1][hr]=AGEN1+((i+1)&1);
                  regs[i+1].regmap_entry[hr]=AGEN1+((i+1)&1);
                  regs[i].isconst&=~(1<<hr);
@@ -6287,7 +6468,7 @@ index 1e8f261..9ee54bc 100644
                }
              }
            }
-@@ -11453,10 +13211,18 @@ int new_recompile_block(int addr)
+@@ -11453,10 +13223,18 @@ int new_recompile_block(int addr)
      }
    }
  
@@ -6306,7 +6487,7 @@ index 1e8f261..9ee54bc 100644
  
    provisional_r32();
  
-@@ -11560,7 +13326,11 @@ int new_recompile_block(int addr)
+@@ -11560,7 +13338,11 @@ int new_recompile_block(int addr)
  
      // Dirty registers which are 32-bit, require 32-bit input
      // as they will be written as 32-bit values
@@ -6318,7 +6499,7 @@ index 1e8f261..9ee54bc 100644
      {
        if(regs[i].regmap_entry[hr]>0&&regs[i].regmap_entry[hr]<64) {
          if((regs[i].was32>>regs[i].regmap_entry[hr])&(regs[i].wasdirty>>hr)&1) {
-@@ -11577,6 +13347,7 @@ int new_recompile_block(int addr)
+@@ -11577,6 +13359,7 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 8 - Assembly */
@@ -6326,7 +6507,7 @@ index 1e8f261..9ee54bc 100644
    linkcount=0;stubcount=0;
    ds=0;is_delayslot=0;
    cop1_usable=0;
-@@ -11800,6 +13571,7 @@ int new_recompile_block(int addr)
+@@ -11800,6 +13583,7 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 9 - Linker */
@@ -6334,7 +6515,7 @@ index 1e8f261..9ee54bc 100644
    for(i=0;i<linkcount;i++)
    {
      assem_debug("%8x -> %8x",link_addr[i][0],link_addr[i][1]);
-@@ -11867,12 +13639,17 @@ int new_recompile_block(int addr)
+@@ -11867,12 +13651,17 @@ int new_recompile_block(int addr)
            // Don't add new entries.  We'll insert the
            // ones that actually get used in check_addr().
            struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
@@ -6352,7 +6533,7 @@ index 1e8f261..9ee54bc 100644
          }
          else
          {
-@@ -11933,8 +13710,28 @@ int new_recompile_block(int addr)
+@@ -11933,8 +13722,28 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 10 - Free memory by expiring oldest blocks */
@@ -6381,7 +6562,7 @@ index 1e8f261..9ee54bc 100644
    while(expirep!=end)
    {
      int shift=TARGET_SIZE_2-3; // Divide into 8 blocks
-@@ -11983,5 +13780,7 @@ int new_recompile_block(int addr)
+@@ -11983,5 +13792,7 @@ int new_recompile_block(int addr)
      }
      expirep=(expirep+1)&65535;
    }

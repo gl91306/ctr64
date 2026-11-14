@@ -101,6 +101,8 @@ extern "C" unsigned ctr64_fb_copies;
 bool g_ctr64ReadRgba16; /* ColorBufferToRDRAM: read 16-bit RGBA5551 (GLideN64's converter) instead of RGBA8 bytes */
 bool g_ctr64ReadPmBlue; /* with it: Paper Mario's subscreen fix, blue 1..0xFB raised by 4 first */
 extern "C" const char *ctr64_allocfail_where; /* last failed allocation, for stats.log */
+extern "C" unsigned ctr64_tex_evict(unsigned bytes); /* GLideN64 Textures.cpp: frees cached textures */
+extern "C" unsigned ctr64_gfx_evicted; /* gpuAlloc calls that evicted textures (gln64_ctr.c) */
 extern "C" unsigned ctr64_allocfail_bytes;
 
 using namespace graphics;
@@ -1323,6 +1325,7 @@ void ContextImplPica::deleteTexture(ObjectHandle name)
     for (auto &u : m_unit)
         if (u == id)
             u = 0;
+    storageChanged(id); /* a frame buffer it was attached to drops the freed storage */
 }
 
 /* ---- GPU memory lifetime ---------------------------------------------------------------------
@@ -1400,8 +1403,8 @@ void *ContextImplPica::gpuAlloc(u32 bytes, bool vram_first, bool &is_vram)
     /* a size that failed after a full GPU drain this frame fails again without another drain
      * (a game that asks again every draw would otherwise wait for the GPU hundreds of times) */
     static u32 fail_frame = ~0u, fail_bytes = ~0u;
-    const bool drained = fail_frame == pica_frame_number() && bytes >= fail_bytes;
-    for (int attempt = 0; attempt < (drained ? 1 : 2); attempt++) {
+    bool drained = fail_frame == pica_frame_number() && bytes >= fail_bytes;
+    for (int attempt = 0; attempt < 8; attempt++) {
         void *p = vram_first ? vramAlloc(bytes) : nullptr;
         is_vram = p != nullptr;
         if (!p)
@@ -1416,19 +1419,43 @@ void *ContextImplPica::gpuAlloc(u32 bytes, bool vram_first, bool &is_vram)
                 fail_frame = ~0u; /* memory came back */
             return p;
         }
-        if (drained)
-            break;
-        /* out of memory: let the GPU finish and release everything pending */
+        /* out of memory: drop least recently used textures from GLideN64's cache (Textures.cpp),
+         * then let the GPU finish and release everything pending */
+        const bool evicted = ctr64_tex_evict(bytes) != 0;
+        if (evicted)
+            ctr64_gfx_evicted++;
+        if (drained && !evicted)
+            break; /* nothing new to free: one GPU drain per attempt that can help */
+        drained = true;
         CTR64_PROF(29);
         pica_flush();
         pica_wait_idle();
         collectPending(true);
     }
-    if (!drained || bytes < fail_bytes) {
+    if (bytes < fail_bytes || fail_frame != pica_frame_number()) {
         fail_frame = pica_frame_number();
         fail_bytes = bytes;
     }
     ctr64_gfx_stats[ST_ALLOC_FAIL]++;
+    { /* development aid: with memlog.txt, the GPU memory held at the first failure -> memlog.log */
+        static bool done;
+        FILE *ml;
+        if (!done && (ml = fopen("sdmc:/3ds/ctr64/memlog.txt", "r"))) {
+            fclose(ml);
+            done = true;
+            if ((ml = fopen("sdmc:/3ds/ctr64/memlog.log", "w"))) {
+                fprintf(ml, "fail %u bytes at %s, linear free %u\n", bytes, where, (unsigned)linearSpaceFree());
+                for (auto &kv : m_tex)
+                    if (kv.second.data)
+                        fprintf(ml, "tex %u %ux%u store %ux%u bpp %u depth %d vram %d rt %d lazy %d used %u drawn_frame %u bytes %u\n",
+                                kv.first, kv.second.w, kv.second.h, kv.second.tw, kv.second.th, kv.second.bpp, kv.second.depth,
+                                kv.second.vram, kv.second.rt, kv.second.lazy, kv.second.used_frame, kv.second.draw_frame, storageBytes(kv.second));
+                for (auto &p : m_pending)
+                    fprintf(ml, "pending %u vram %d frame %u\n", p.bytes, p.vram, p.frame);
+                fclose(ml);
+            }
+        }
+    }
     ctr64_allocfail_where = where;
     ctr64_allocfail_bytes = bytes;
     return nullptr;
@@ -2333,7 +2360,18 @@ void log_draw(const char *what, const CombinerProgram *prog, int kind, const GVt
  * its skybox covers the screen; Paper Mario's name entry only redraws what changes. */
 void ContextImplPica::noteCoverage(const GVtx *v, u32 n)
 {
-    if (ctr64_frame_cleared || m_drawFbo == 0)
+    if (m_drawFbo == 0)
+        return;
+    /* a draw sampling a frame buffer (Jet Force Gemini's round view, motion blur) composes an
+     * image drawn earlier: skipping the next frame would leave that source empty */
+    if (!ctr64_frame_fbtex && m_program && m_kind == Kind::Combiner) {
+        TextureCache &cache = textureCache();
+        for (u32 t = 0; t < 2; t++)
+            if (m_program->usesTile(t) && cache.current[t] &&
+                cache.current[t]->frameBufferTexture != CachedTexture::fbNone)
+                ctr64_frame_fbtex = true;
+    }
+    if (ctr64_frame_cleared)
         return;
     const Tex *c = tex(drawFbo().color);
     if (!c || !c->w || !c->h)
@@ -3371,6 +3409,12 @@ void presentWindow()
 }
 
 } // namespace pica
+
+/* the frame number GLideN64 code ages things by (DepthBuffer.cpp evictOld) */
+extern "C" unsigned ctr64_frame_now(void)
+{
+    return pica_frame_number();
+}
 
 extern "C" void ctr64_gfx_end_vi(void)
 {

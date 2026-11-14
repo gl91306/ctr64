@@ -43,3 +43,4 @@ unsigned int ctr64_gfx_mem[4];
 /* last failed GPU allocation (pica_ContextImpl.cpp), printed to stats.log */
 const char *ctr64_allocfail_where;
 unsigned ctr64_allocfail_bytes;
+unsigned ctr64_gfx_evicted; /* allocations that dropped cached textures (pica_ContextImpl.cpp gpuAlloc) */
