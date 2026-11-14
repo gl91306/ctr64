@@ -4,6 +4,8 @@ ctr64 runs Nintendo 64 games pretty fast on a 3DS. It is built on the **Mupen64P
 dynamic recompiler, RSP HLE, and **GLideN64** with a new PICA200 GPU backend written directly
 against libctru's GPU commands.
 
+Basically this project is mupen64plus-next + gliden64 ported to the 3ds with a custom low level graphics backend, dynarec, precompiled lists and multi core processing and a few fun optimizations. It has framebuffer emulation :)
+
 <p align="center"><img src="docs/screenshots/hero.png" alt="Super Mario 64 on the top screen, the pause menu on the bottom screen" width="400"></p>
 
 - **New 3DS / New 2DS XL**: what ive tested on. The CPU emulation, video and audio run on the separate
@@ -142,12 +144,13 @@ tools/ui/             generators for the menu icons and the controller picture (
   `sdmc:/3ds/ctr64/jit/` and compiles it ahead of time on later runs.
 - **Graphics problems in a game**: try Video → Frame buffer emulation and Frame buffer copy.
 - **A crash**: `sdmc:/3ds/ctr64/crash.txt` and `core.log` help to report it.
+- Additionally, if you have a crash or visual bug you want to report, set the profiler to "Detailed" and set the resulting game profile from /profile/game-name-timestamp along with your crash core and settings files, it would be really helpful :)
 
 Debug info in the Video menu shows the internal counters.
 
 ## Credits
 
-ctr64 stands on the work of many people. Thank you to:
+Thank you to:
 
 - **[Mupen64Plus-Next](https://github.com/libretro/mupen64plus-libretro-nx)** (the libretro team
   and the [Mupen64Plus](https://github.com/mupen64plus) authors): the N64 emulation itself, used
@@ -160,12 +163,12 @@ ctr64 stands on the work of many people. Thank you to:
   cache, frame buffer emulation and per-game settings, and replaces the OpenGL part with a new
   PICA200 backend (`ctr64/src/gfx/`).
 - **[DaedalusX64-3DS](https://github.com/masterfeizz/DaedalusX64-3DS)** by **MasterFeizz**: the
-  N64 emulator that showed what a 3DS can do, and the yardstick ctr64 was measured against.
+  N64 emulator that showed me the 3DS could actually emulate the N64, and what i measured against when developing.
   Ideas taken from it: interpreting code until it is hot before compiling it (from its trace
   dynarec), running audio HLE on a second core of the New 3DS, and counting game frames by
   new VI origins.
 - **[PCSX-ReARMed](https://github.com/notaz/pcsx_rearmed)** by **notaz** and **Lightrec**: their
-  work on compiling on another thread, the model for ctr64's compile thread (a developer switch).
+  work on compiling on another thread was the reference for ctr64's compile thread.
 - **[devkitPro](https://devkitpro.org/)** (devkitARM, libctru, picasso, 3dsxtool) and
   **[3dbrew](https://www.3dbrew.org/)**: the toolchain and the hardware documentation the
   PICA200 backend is written against.
@@ -179,5 +182,4 @@ ctr64 stands on the work of many people. Thank you to:
 
 ctr64 links Mupen64Plus-Next (GPL-2.0 or later; GLideN64 is GPL-2.0 or later), so the 3DS app
 as a whole is distributed under the **GPL-2.0-or-later**: share the source (this repository and the
-patch) with any binaries. libctru is zlib-licensed; libretro.h is MIT. No ROMs, BIOS files or
-console firmware are included.
+patch) with any binaries. libctru is zlib-licensed; libretro.h is MIT.
