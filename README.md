@@ -183,3 +183,5 @@ Thank you to:
 ctr64 links Mupen64Plus-Next (GPL-2.0 or later; GLideN64 is GPL-2.0 or later), so the 3DS app
 as a whole is distributed under the **GPL-2.0-or-later**: share the source (this repository and the
 patch) with any binaries. libctru is zlib-licensed; libretro.h is MIT.
+
+This repository does not host any copyrighted material: no games, BIOS files or console firmware.
