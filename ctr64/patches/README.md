@@ -1,0 +1,83 @@
+# ctr64 patches to Mupen64Plus-Next
+
+`third_party/mupen64plus-libretro-nx` is a git clone of
+https://github.com/libretro/mupen64plus-libretro-nx at the commit in `BASE_COMMIT`, with
+`mupen64plus-libretro-nx.patch` applied. To recreate it:
+
+    git clone https://github.com/libretro/mupen64plus-libretro-nx third_party/mupen64plus-libretro-nx
+    cd third_party/mupen64plus-libretro-nx
+    git checkout <BASE_COMMIT>
+    git apply ../../ctr64/patches/mupen64plus-libretro-nx.patch
+
+Every change is behind `#if defined(__3DS__)` except two portable ones with identical behaviour:
+the `generic_jump_to` type fix and the inlined pixel converter in `RDRAMtoColorBuffer.cpp`.
+
+| File | Change |
+|---|---|
+| `new_dynarec/new_dynarec.h`, `arm/assem_arm.h` | 16 MB code cache on 3DS |
+| `new_dynarec/new_dynarec.c` | JIT setup through `ctr_jit_init` (no mmap/mprotect), 4 KB pages, block-compile counter |
+| `new_dynarec/arm/assem_arm.c` | cache maintenance through `ctr_jit_flush` (D-cache clean + svc 0x93) |
+| `device/memory/memory.c/.h`, `main/rom.c` | compact mem base; the ROM buffer is adopted and byte-swapped in place (one copy of a 32-64 MB ROM) |
+| `libretro/libretro.c` | ROM buffer ownership handed to the core instead of copied |
+| `libretro/libretro.c` | emulation coroutine stack 1 MB instead of 4 MB (measured peak 17 KB with GLideN64 inline; 3 MB more heap, which an Old 3DS needs) |
+| `audio_libretro/audio_backend_libretro.c` | native-rate samples straight to the 3DS DSP (no float sinc resampling) |
+| `rcp/mi/mi_controller.c`, `rcp/rsp/rsp_core.c` | per-second interrupt / RSP task counters for the profiling overlay |
+| `main/savestates.c` | `GETDATA` reads through memcpy: unaligned 64-bit fields became LDRD, which faults on the ARM11 (every state load crashed on hardware) |
+| `main/savestates.c` | in-flight second-core work finished before a state is saved or loaded; state saving without the 16 MB staging copies: RDRAM and the TLB LUTs are streamed out through `ctr64_state_put` in file order (`core_host_save_state`), the file is the same as the buffered path's |
+| `main/savestates.c` | state loading without the 16 MB staging copy: `retro_unserialize` takes the state with RDRAM and the TLB LUTs cut out, and the frontend streams those in through `ctr64_state_fill` (see `load_test_state` in `ctr64/src/core_host.c`) |
+| `plugin/plugin.c` | GLideN64's register and RSP memory pointers redirected to a shadow, and its plugin calls wrapped, for the second-core worker (`ctr64/src/gfx_async.c`) |
+| `rcp/rsp/rsp_core.c`, `rcp/rdp/rdp_core.c` | threaded display lists: SP done as usual, the RDP interrupt from a check event that waits for the worker (`ctr64_gfx_dlist_ready`); audio tasks on the second core reported done from the SP event (`ctr64/src/audio_async.c`, optional); SP DMA rows copied as words when aligned and not wrapping |
+| `mupen64plus-rsp-hle/src/plugin.c` | a second HLE instance for audio tasks on the second core |
+| `mupen64plus-rsp-hle/src/alist.c`, `audio.c` | `alist_resample` with dual 16-bit MACs (`SMUADX/SMLADX/PKHBT`), `alist_clear`/`alist_move` as word copies when aligned (all checked bit-exact on target against the original) |
+| `r4300/r4300_core.h` | `generic_jump_to` prototype uses `uint32_t` like its definition (portable fix) |
+| `GLideN64/src/Graphics/Context.cpp` | selects the PICA200 backend (`ctr64/src/gfx`) instead of `opengl::ContextImpl` |
+| `GLideN64/src/CommonPluginAPI.cpp` | display-list timing for the profiling log; per-VI hook `ctr64_gfx_end_vi` (frame counting, dumps) |
+| `custom/GLideN64/mupenplus/Config_mupenplus.cpp`, `GLideN64/src/VI.cpp` | present only VIs with new content (color-image change, VI origin change or CPU frame buffer write) instead of every VI |
+| `GLideN64/src/Graphics/ColorBufferReader.cpp` | no pixel buffers per frame buffer: the PICA reader reads into one shared buffer (two per frame buffer fragmented the heap until the OoT pause menu crashed with `bad_alloc`) |
+| `GLideN64/src/CRC_OPT.cpp` | texture/palette cache keys from two independent XXH32 lanes (XXH3-64 is slow on 32-bit ARM; one 32-bit hash collided in SSB); palettes hashed in one call |
+| `GLideN64/src/convert.cpp` | word-at-a-time RDRAM→TMEM copies when aligned |
+| `GLideN64/src/gDP.cpp` | `gDPLoadBlock` with DXT: line-interleave swap per qword instead of per word (bit-exact with the original, kept under `#else`) |
+| `GLideN64/src/BufferCopy/RDRAMtoColorBuffer.cpp` | two-pixels-per-word conversion of 16-bit frame buffers (inlined converter elsewhere) |
+| `GLideN64/src/Ctr64Prof.h` + `CTR64_PROF` scopes in `gSP/gDP/GraphicsDrawer/Textures/FrameBuffer/Combiner/BufferCopy/SoftwareRender` | inclusive-time profiling scopes written to `stats.log` |
+| `mupen64plus-rsp-hle/src/arithmetics.h` | `clamp_s16` as one ARMv6 `SSAT` |
+| `mupen64plus-rsp-hle/src/alist.c` | `alist_envmix_nead` two samples at a time with `SMULWB/SMULWT` (bit-exact) |
+| `mupen64plus-rsp-hle/src/audio.c` | `adpcm_compute_residuals` unrolled over the 8-sample frame (bit-exact) |
+| `mupen64plus-rsp-hle/src/alist.c`, `rcp/rsp/rsp_core.c` | audio-list command timing and RSP task timing for `stats.log` |
+| `custom/GLideN64/mupenplus/CommonAPIImpl_mupenplus.cpp` | skips the OpenGL headers (no GL on 3DS) |
+| `r4300/r4300_core.h`, `r4300_core.c`, `cached_interp.c`, `mips_instructions.def` | the cached interpreter's 4 MB block table is allocated only by that mode (new_dynarec only needs `invalid_code`); `TLBWrite` checks for it (GoldenEye's TLB writes crashed without) |
+| `device/memory/memory.c` | no 4 MB 64DD IPL ROM area in the compact mem base (no 64DD support); with the above, 8 MB more heap (Paper Mario's 40 MB ROM did not fit) |
+| `GLideN64/src/BufferCopy/ColorBufferToRDRAM.cpp`, `WriteToRDRAM.h` | frame buffer → RDRAM copies (Paper Mario every frame, MK64's title) with an inlined RGBA16 converter (`writeToRdramInline`) when not dithering |
+| `GLideN64/src/GraphicsDrawer.cpp` | in a frame the backend skips (frameskip), triangles are dropped before render state / texture updates, CPU clipping and vertex copies; the backend is told (`ctr64_gfx_draw_skipped`) so it marks the frame buffer as missing draws |
+| `GLideN64/src/BufferCopy/ColorBufferToRDRAM.cpp` | 16-bit copies without dithering read back already converted to RGBA5551 (`g_ctr64ReadRgba16`, PICA backend), Paper Mario included (its subscreen blue fix via `g_ctr64ReadPmBlue`) |
+| `custom/GLideN64/mupenplus/Config_mupenplus.cpp` | ctr64 video settings override the per-game ini: frame buffer copy mode (`ctr64_setting_fb_copy`, also changed live via `ctr64_apply_fb_copy`) and frame buffer emulation (`ctr64_setting_fb_emulation`); async copy mode is served by the PICA reader without waiting for the GPU |
+| `GLideN64/src/gDP.cpp`, `convert.cpp` | 32-bit TMEM loads two texels per word store (same TMEM contents); RDRAM->TMEM word copy unrolled |
+| `GLideN64/src/SoftwareRender.cpp` | `renderAndDrawTriangles`: one reused vertex buffer; screen coordinates of unclipped triangles once per vertex with one reciprocal (`ScreenCache`), same cull test |
+| `GLideN64/src/RSP.cpp/.h`, `gSP.cpp`, `GraphicsDrawer.cpp/.h` | triangle batching: where GLideN64 would draw (the next command is not a triangle), the batch is set aside with copies of its vertices (`stashTriangles`; the batch is the RSP vertex buffer, which G_VTX overwrites), and the display-list loop draws it before the first command that may change render state (anything but vertex/matrix loads, display-list calls/returns, syncs, no-ops) or at the end of the list; SM64 castle grounds 9256 -> 6436 draws/s |
+| `new_dynarec/new_dynarec.c` | block compiles timed (total; per pass with Debug info) and counted for `stats.log`; dev switch `jitstress.txt` compiles each block 20 more times (profiling); `get_reg` and pass 4's per-register loop byte-parallel (`hr_eq`), checked against the loops over all inputs |
+| `new_dynarec/new_dynarec.c` | pass 4's register masks 32-bit (13 host registers; portable, same result) |
+| `api/callbacks.c` | `DebugMessage` calls counted (stats.log) |
+| `new_dynarec/new_dynarec.c`, `arm/linkage_arm.S`, `pure_interp.c`, `r4300_core.c` | interpret-first tier (`ctr64_interp_tier`, off by default, dev switch `tier.txt`): cold KSEG0 code run by the pure interpreter until hot; stores from it invalidate compiled code (off because it measured slower overall) |
+| `GLideN64/src/Ctr64Prof.h`, `mupen64plus-rsp-hle/src/alist.c` | the profiling scopes and audio-command timers run only with `ctr64_prof_on` (Debug info / `prof.txt`): each tick read is a kernel call |
+| `new_dynarec/new_dynarec.c`, `pure_interp.c`, `r4300_core.c` | compile thread (`ctr64_ct_*`, with `ctr64/src/platform/ctr_jit.c`): missing blocks compiled on core 1 while compiled code runs on and new code is interpreted; the compile in flight stays invisible until flushed (`CTR64_CT_INFLIGHT` in `get_clean`/`get_dirty`), list adds locked, expiry and every removal (invalidation, TLB writes, resets) on the CPU thread after waiting for it; interrupts under the interpreter taken at block ends in dynarec mode |
+| `GLideN64/src/gDP.cpp` | `gDPLoadTLUT`: two entries per RDRAM word; each 16-entry palette's hash kept with its entries and reused when they are unchanged (same values) |
+| `GLideN64/src/Textures.cpp` | texture cache key: palette hash, LOD level and params hashed in one call |
+| `GLideN64/src/FrameBuffer.cpp` | `fillRDRAM` 8 words a step |
+| `GLideN64/src/gSP.cpp` | `gSPLightVertexStandard`: sums in registers (same operations) |
+| `r4300/cp1.c`, `new_dynarec/new_dynarec.h`, `arm/assem_arm.c`, `new_dynarec.c` | FPU registers stored in the dynarec hot state (`cp1_fgr`, near fp); compiled FPU code addresses them `[fp, #offset]` instead of loading a pointer per access (`emit_fpr_addr/load/store/readword/writeword`); `MTC0_new` recompiles everything when Status.FR changes |
+| `new_dynarec/new_dynarec.c` | dev switch `blockmap.txt`: every compiled block (host range, MIPS and ARM code) to `blockmap.log` |
+| `new_dynarec/new_dynarec.c`, `arm/assem_arm.c` | compile speed (2026-11-06, generated code identical, checked block by block on 6 games): `regstat.dirty/wasdirty` 32-bit; byte-parallel register-map helpers (`hr_ne`, `hr_nonneg`, `hr_acc`/`hra_*`, `regset128`) and `CTR_FOR_HR` loops over set bits only (`#define CTR_SWAR13`) in passes 3/4/5/8, `load_regs`, `wb_invalidate`, `clean_registers`, `wb_*`, `load_consts`, `alloc_reg`; -27% compile time |
+| `new_dynarec/new_dynarec.c` | `get_clean` lookup cache (`ctr64_gc`, per-page generations `ctr64_ji_gen` bumped on every `jump_in` change): jumps to blocks restored from `jump_dirty` are never linked and each walked the page's list |
+| `new_dynarec/new_dynarec.c` | remembered blocks (`ctr64_rb_*`, with `ctr64/src/core_host.c`, `main.c`): blocks compiled from KSEG0 RDRAM are listed per game (`<data dir>/jit/<ROM>.blk`: address, length, first word, hash); between frames, in the speed limiter's spare time, listed blocks whose code is in RDRAM again are compiled ahead of need (list order), without expiring old blocks (pass 10 skips it; stops while less than 1/16 of the cache stays free); RDRAM page write generations `ctr64_pgen` (DMA, interpreted stores, state loads) say when to look again |
+| `new_dynarec/new_dynarec.c` | final compile-speed pass: remaining per-host-register loops on masks or set bits (`dirty_reg`, `flush_dirty_uppers`, 32-bit-input loops, `clean_registers` wont_dirty, pass 3 entry map and wasconst, pass 5 loops, pass 4 lane OR), `needed_again` forward scan with early exit; generated code identical (6 games) |
+| `new_dynarec/new_dynarec.c` | fast compile (`ctr64_fast_compile` bits, menu "Fast compile"): skips pass 5's loop allocation, RAM-offset caching and early allocation, and pass 6 `clean_registers`; never for compiles between frames |
+| `GLideN64/src/FrameBuffer.cpp` | `FrameBuffer::isValid` on cleared buffers: 8 words per test, stops at the threshold (same answer) |
+| `new_dynarec/new_dynarec.c` | remembered blocks also for TLB-mapped code whose source is cartridge ROM (GoldenEye missions; `ctr64_pgen[2048]` = ROM); `ctr64_rb_why` counters (stats.log "block recording") |
+| `GLideN64/src/Textures.cpp` | `_calcTextureSize` load-block path: tile width/height wrapped to 10 bits as elsewhere; a tile with lrs < uls (Majora's Mask, Swordsman's School) gave a 64544-texel texture, whose 8 MB allocation aborted on the 3DS |
+| `GLideN64/src/GraphicsDrawer.cpp` | CPU clipping (`renderAndDrawTriangles`) also without frame buffer emulation: the PICA does not clip triangles crossing w <= 0 (OoT pause menu with "Frame buffer emu" off) |
+| `custom/GLideN64/mupenplus/Config_mupenplus.cpp` | menu "Anti-aliasing" (`nativeResFactor` 2 when `ctr64_aa_ready()`: the New 3DS memory reserve went to the GPU, `ctr64/src/main.c`) and "Screen" (4:3, stretch, `aAdjust43` widescreen); `ctr64_aa_applied`, `ctr64_aspect_applied` |
+| `GLideN64/src/BufferCopy/ColorBufferToRDRAM.cpp` | OoT pause opened ~4.5 s late: hack_subscreen answers the pause's coverage copy with a white buffer (`copyWhiteToRDRAM`), but only after reading the frame back, which never happens with copy-to-RDRAM off (3DS default) or on an async first frame; the game's CPU anti-alias filter then ran over every pixel. The white is now written in `copyToRDRAM` before any read, in every mode. With the copy off the menu is drawn over white instead of the last gameplay frame (as it already was); Sync copy shows the frame (it needs every gameplay frame in RDRAM) |
+| `new_dynarec/new_dynarec.c` | `ctr64_dirty_stat` counters in `get_dirty` (stats.log "overwritten code: reused / changed / expiring / never compiled") |
+| `GLideN64/src/TexrectDrawer.cpp`, `BufferCopy/RDRAMtoColorBuffer.cpp`, `BufferCopy/DepthBufferToRDRAM.cpp` | 3DS: the fixed 640x580 helper textures are 640x512. PICA textures are power-of-two sized, so 580 rows padded to 1024x1024 (4 MB each); with anti-aliasing the Mario Kart 64 title screen then ran out of GPU memory (logo and background missing, then a hang on hardware). Copies are clamped to the texture height; only PAL interlaced images are taller than 512 |
+| `device/memory/memory.{c,h}`, `device/cart/cart_rom.c`, `main/rom.c`, `new_dynarec/new_dynarec.c` | ROM streaming (Old 3DS, ROMs over 16 MB; `ctr64/src/rom_stream.c`): while `ctr64_rs_active`, the ROM pointer holds only the first 64 KB page (`borrow_mem_rom`, never freed by the core) and every other byte comes through `ctr64_rs_ptr`: CPU reads and PI DMA in `cart_rom.c`, pointers from `mem_base_u32`. `open_rom` takes the header from that page and the MD5 from the frontend (whole file, cached in `jit/*.md5`), and skips the byte swap (pages are already in the core's order). GoldenEye's TLB-to-ROM mapping hack is skipped (it needs a flat copy; GoldenEye is 12 MB and never streamed) |
+
+Regenerate the patch after editing the core: `git diff HEAD > ../../ctr64/patches/mupen64plus-libretro-nx.patch`.

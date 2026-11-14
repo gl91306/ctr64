@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="756" height="704" viewBox="150 150 1200 1120">
+<defs><radialGradient id="cap" cx="0.45" cy="0.4" r="0.7"><stop offset="0" stop-color="#E6E6EE"/><stop offset="1" stop-color="#B8B8C6"/></radialGradient><linearGradient id="house" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#70727B"/><stop offset="1" stop-color="#60626A"/></linearGradient><linearGradient id="cross" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6A6D76"/><stop offset="1" stop-color="#5A5D66"/></linearGradient><radialGradient id="red" cx="0.4" cy="0.35" r="0.7"><stop offset="0" stop-color="#EE5A60"/><stop offset="1" stop-color="#D23A40"/></radialGradient><radialGradient id="grn" cx="0.4" cy="0.35" r="0.7"><stop offset="0" stop-color="#1FA46A"/><stop offset="1" stop-color="#0E8650"/></radialGradient><radialGradient id="blu" cx="0.4" cy="0.35" r="0.7"><stop offset="0" stop-color="#2858BC"/><stop offset="1" stop-color="#163C98"/></radialGradient><radialGradient id="yel" cx="0.4" cy="0.35" r="0.7"><stop offset="0" stop-color="#FFD43A"/><stop offset="1" stop-color="#EAB50E"/></radialGradient><linearGradient id="rec" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8C8E98"/><stop offset="0.5" stop-color="#B4B6C0"/><stop offset="1" stop-color="#D6D8E0"/></linearGradient></defs>
+<rect x="360" y="425" width="66" height="190" rx="9" fill="#33363E"/>
+<rect x="298" y="487" width="190" height="66" rx="9" fill="#33363E"/>
+<rect x="365" y="430" width="56" height="180" rx="6" fill="url(#cross)"/>
+<rect x="303" y="492" width="180" height="56" rx="6" fill="url(#cross)"/>
+<circle cx="393" cy="520" r="16" fill="#5C5F68" stroke="#4E5159" stroke-width="2"/>
+<polygon points="393.0,445.0 380.0,465.8 406.0,465.8" fill="#545760"/>
+<polygon points="393.0,595.0 380.0,574.2 406.0,574.2" fill="#545760"/>
+<polygon points="318.0,520.0 338.8,507.0 338.8,533.0" fill="#545760"/>
+<polygon points="468.0,520.0 447.2,507.0 447.2,533.0" fill="#545760"/>
+<circle cx="750" cy="555" r="58" fill="url(#rec)"/>
+<circle cx="750" cy="555" r="44" fill="#8E2026"/>
+<circle cx="750" cy="555" r="42" fill="url(#red)"/>
+<text x="750" y="565" font-size="28" fill="#BC2C32" font-family="Bahnschrift, Segoe UI, sans-serif" font-weight="bold" text-anchor="middle">START</text>
+<circle cx="970" cy="548" r="46" fill="#14161C"/>
+<circle cx="970" cy="548" r="43" fill="url(#grn)"/>
+<text x="970" y="567" font-size="54" fill="#0B7646" font-family="Bahnschrift, Segoe UI, sans-serif" font-weight="bold" text-anchor="middle">B</text>
+<circle cx="1050" cy="633" r="46" fill="#14161C"/>
+<circle cx="1050" cy="633" r="43" fill="url(#blu)"/>
+<text x="1050" y="652" font-size="54" fill="#163C92" font-family="Bahnschrift, Segoe UI, sans-serif" font-weight="bold" text-anchor="middle">A</text>
+<circle cx="1140" cy="416" r="33" fill="#4A3A08"/>
+<circle cx="1140" cy="416" r="30.5" fill="url(#yel)"/>
+<polygon points="1140.0,404.0 1128.0,423.2 1152.0,423.2" fill="#E0AA08"/>
+<circle cx="1140" cy="549" r="33" fill="#4A3A08"/>
+<circle cx="1140" cy="549" r="30.5" fill="url(#yel)"/>
+<polygon points="1140.0,561.0 1128.0,541.8 1152.0,541.8" fill="#E0AA08"/>
+<circle cx="1072" cy="483" r="33" fill="#4A3A08"/>
+<circle cx="1072" cy="483" r="30.5" fill="url(#yel)"/>
+<polygon points="1060.0,483.0 1079.2,471.0 1079.2,495.0" fill="#E0AA08"/>
+<circle cx="1207" cy="483" r="33" fill="#4A3A08"/>
+<circle cx="1207" cy="483" r="30.5" fill="url(#yel)"/>
+<polygon points="1219.0,483.0 1199.8,471.0 1199.8,495.0" fill="#E0AA08"/>
+<text x="1140" y="498" font-size="44" fill="#A9ACB8" font-family="Bahnschrift, Segoe UI, sans-serif" font-weight="bold" text-anchor="middle">C</text>
+<circle cx="750" cy="784" r="126" fill="#A8AAB4"/>
+<circle cx="750" cy="785" r="119" fill="url(#house)"/>
+<polygon points="750.0,700.0 803.7,722.3 826.0,776.0 803.7,829.7 750.0,852.0 696.3,829.7 674.0,776.0 696.3,722.3" fill="#7A7C85" stroke="#5C5E66" stroke-width="3" stroke-linejoin="round"/>
+<ellipse cx="750" cy="784" rx="56" ry="50" fill="#A6A8B6"/>
+<circle cx="750" cy="780" r="47" fill="url(#cap)"/>
+<circle cx="750" cy="780" r="36" fill="none" stroke="#ADADBD" stroke-width="3.5"/>
+<circle cx="750" cy="780" r="25" fill="none" stroke="#ADADBD" stroke-width="3.5"/>
+<circle cx="750" cy="780" r="14" fill="none" stroke="#ADADBD" stroke-width="3.5"/>
+<circle cx="750" cy="780" r="5" fill="#ADADBD"/>
+<rect x="434" y="845" width="88" height="120" rx="18" fill="#A0A2AC" stroke="#D8DAE2" stroke-width="5"/>
+<text x="478" y="927" font-size="66" fill="#F2F2F6" font-family="Bahnschrift, Segoe UI, sans-serif" font-weight="bold" text-anchor="middle">Z</text>
+</svg>

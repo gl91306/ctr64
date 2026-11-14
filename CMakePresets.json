@@ -1,0 +1,22 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "3ds-release",
+      "displayName": "Nintendo 3DS (devkitARM) Release - ctr64. Run from devkitPro's msys2 cmake (scripts/build-3ds.ps1)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/3ds",
+      "toolchainFile": "/opt/devkitpro/cmake/3DS.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_DEPENDS_USE_COMPILER": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "3ds-release",
+      "configurePreset": "3ds-release"
+    }
+  ]
+}

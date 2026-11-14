@@ -1,0 +1,23 @@
+; ctr64 GLideN64 backend vertex shader.
+; Positions arrive in final PICA clip space: the CPU already applied GLideN64's vertex-shader
+; math (viewport, quarter-pixel snap, screen-space modes, depth remap), so this only passes
+; data through.
+;   v0 = position (float4), v1 = color (ubyte4, 0..255), v2 = texcoord0 (float2), v3 = texcoord1 (float2)
+
+.constf gconsts(0.00392156862745098, 0.0, 0.0, 0.0)
+.alias  inv255 gconsts.xxxx
+
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.out outtc1 texcoord1
+
+.entry gfx_main
+
+.proc gfx_main
+	mov outpos, v0
+	mul outclr, inv255, v1
+	mov outtc0, v2
+	mov outtc1, v3
+	end
+.end

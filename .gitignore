@@ -1,0 +1,35 @@
+# Only the sources below are part of the repository; everything else in the working folder
+# (games, save states, logs, builds, test setups, reference dumps, development notes) stays local.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/CMakeLists.txt
+!/CMakePresets.json
+!/common/
+!/docs/
+!/ctr64/
+!/scripts/
+!/tools/
+
+/ctr64/PLAN.md
+/scripts/*
+!/scripts/build-3ds.ps1
+!/scripts/package-release.ps1
+
+/tools/*
+!/tools/ui/
+
+# the controller picture was traced from a photo that is not ours to publish
+/tools/ui/ref/
+/tools/ui/n64pad_compare.png
+/tools/ui/n64pad_zoom.png
+
+# never: ROMs, saves, states, logs
+*.z64
+*.n64
+*.v64
+*.srm
+*.st
+*.state*
+*.log
