@@ -61,7 +61,7 @@ endif()
 
 # Release version: here, in the CIA's title version (makerom -ver, scripts/build-3ds.ps1) and
 # shown on the game list and in core.log.
-set(CTR64_VERSION "0.9.0")
+set(CTR64_VERSION "0.9.1")
 target_compile_definitions(ctr64 PRIVATE CTR64_VERSION="${CTR64_VERSION}")
 
 ctr_generate_smdh(ctr64.smdh
