@@ -24,6 +24,7 @@ static bool g_stats_dirty = true;
 static bool g_running_drawn;
 static int g_slot;
 static char g_status[80];
+static bool g_no_game; /* menu_settings: opened from the game list, no game loaded */
 
 int ctr64_game_fb_copy(void);         /* GLideN64: the running game's own copy mode */
 int ctr64_fb_emulation_applied(void); /* GLideN64: frame buffer emulation the game started with */
@@ -190,15 +191,15 @@ static int g_nfoot;
 
 static bool aa_excluded_here(void)
 {
-    return ctr64_aa_available() && g_settings.anti_aliasing && g_settings.fb_emulation && ctr64_aa_excluded();
+    return !g_no_game && ctr64_aa_available() && g_settings.anti_aliasing && g_settings.fb_emulation && ctr64_aa_excluded();
 }
 
 static bool fb_emulation_pending(void)
 {
-    return g_settings.fb_emulation != (ctr64_fb_emulation_applied() != 0) ||
+    return !g_no_game && (g_settings.fb_emulation != (ctr64_fb_emulation_applied() != 0) ||
            g_settings.aspect != ctr64_aspect_applied() ||
            (ctr64_aa_available() && g_settings.fb_emulation && !aa_excluded_here() &&
-            g_settings.anti_aliasing != (ctr64_aa_applied() != 0));
+            g_settings.anti_aliasing != (ctr64_aa_applied() != 0)));
 }
 
 static const char *game_title(void)
@@ -247,6 +248,17 @@ static void layout(void)
             for (int c = 0; c < 3; c++)
                 g_w[rows[r][c]] = (Rect){(s16)(x + c * (w3 + gap)), (s16)y, (s16)w3, (s16)th};
         g_nw = M_COUNT;
+        if (g_no_game) {
+            for (int i = 0; i < M_COUNT; i++)
+                g_w[i] = (Rect){0, 0, 0, 0};
+            y = UI_HEADER_H + 6;
+            g_w[M_RESUME] = (Rect){x, (s16)y, UI_W - 16, 34};
+            y += 34 + gap;
+            const int big = 70;
+            static const int ids[3] = {M_AUDIO, M_VIDEO, M_CONTROLS};
+            for (int c = 0; c < 3; c++)
+                g_w[ids[c]] = (Rect){(s16)(x + c * (w3 + gap)), (s16)y, (s16)w3, (s16)big};
+        }
     } else if (g_page == PAGE_CONTROLS) {
         for (int h = 0; h < PAD_N; h++) {
             const int r = k_n64pad_hot[h].r + 4;
@@ -309,13 +321,16 @@ static void list_item(int i, const char **label, char *v, size_t vn, bool *dim)
             snprintf(v, vn, "%s -", onoff(g_settings.anti_aliasing));
         } else {
             snprintf(v, vn, "%s%s", onoff(g_settings.anti_aliasing),
-                     g_settings.fb_emulation && g_settings.anti_aliasing != (ctr64_aa_applied() != 0) ? " *" : "");
+                     !g_no_game && g_settings.fb_emulation && g_settings.anti_aliasing != (ctr64_aa_applied() != 0)
+                         ? " *"
+                         : "");
         }
         break;
     case V_ASPECT: {
         static const char *const as[] = {"4:3", "Stretch", "Widescreen"};
         *label = "Screen";
-        snprintf(v, vn, "%s%s", as[g_settings.aspect], g_settings.aspect != ctr64_aspect_applied() ? " *" : "");
+        snprintf(v, vn, "%s%s", as[g_settings.aspect],
+                 !g_no_game && g_settings.aspect != ctr64_aspect_applied() ? " *" : "");
         break;
     }
     case V_DARK:
@@ -325,12 +340,14 @@ static void list_item(int i, const char **label, char *v, size_t vn, bool *dim)
     case V_FB_EMU:
         *label = "Frame buffer emulation";
         snprintf(v, vn, "%s%s", onoff(g_settings.fb_emulation),
-                 g_settings.fb_emulation != (ctr64_fb_emulation_applied() != 0) ? " *" : "");
+                 !g_no_game && g_settings.fb_emulation != (ctr64_fb_emulation_applied() != 0) ? " *" : "");
         break;
     case V_FB_COPY: {
         static const char *const modes[] = {"Off", "Sync", "Async", "Async"};
         *label = "FB copy to RDRAM";
-        if (g_settings.fb_copy == FB_COPY_GAME)
+        if (g_settings.fb_copy == FB_COPY_GAME && g_no_game)
+            snprintf(v, vn, "Game");
+        else if (g_settings.fb_copy == FB_COPY_GAME)
             snprintf(v, vn, "Game (%s)", modes[ctr64_game_fb_copy() & 3]);
         else
             snprintf(v, vn, "%s", modes[g_settings.fb_copy]);
@@ -356,7 +373,8 @@ static void list_item(int i, const char **label, char *v, size_t vn, bool *dim)
         static const char *const pr[] = {"Off", "On", "Detailed"};
         extern int ctr64_profiler;
         *label = "Profiler";
-        snprintf(v, vn, "%s%s", pr[g_settings.profiler], g_settings.profiler != ctr64_profiler ? " *" : "");
+        snprintf(v, vn, "%s%s", pr[g_settings.profiler],
+                 !g_no_game && g_settings.profiler != ctr64_profiler ? " *" : "");
         break;
     }
     default:
@@ -421,8 +439,24 @@ static void draw_main_tile(int i, bool sel)
     static const char *const names[M_COUNT] = {"Resume",   "Save",  "Load",      "",     "Audio",
                                                "Video",    "Controls", "Reset", "Game list", "Exit"};
     const Rect r = g_w[i];
+    if (!r.w)
+        return; /* not on this page (no game loaded) */
     const int cy = r.y + r.h / 2;
     card(r.x, r.y, r.w, r.h, 8, sel);
+    if (i == M_RESUME && g_no_game) {
+        const char *t = "Back to the game list";
+        const int tw = ui_text_width(UI_TITLE, t), gw = 22 + 8 + tw, x0 = r.x + (r.w - gw) / 2;
+        ui_mask(&k_icon_games, x0 + 11 - k_icon_games.w / 2, cy - k_icon_games.h / 2, UI_SEL);
+        ui_text(x0 + 30, ui_text_y(UI_TITLE, cy), UI_TITLE, UI_TEXT, UI_LEFT, t);
+        return;
+    }
+    if (g_no_game) { /* a tall tile: the icon above its name */
+        UiCol top, bot;
+        const UiMask *m = tile_icon(i, &top, &bot);
+        ui_mask(m, r.x + r.w / 2 - m->w / 2, cy - 6 - m->h, UI_SEL);
+        ui_text_fit(r.x + r.w / 2, ui_text_y(UI_BODY, cy + 12), UI_BODY, UI_TEXT, UI_CENTER, r.w - 8, names[i]);
+        return;
+    }
     if (i == M_RESUME) {
         const char *t = "Resume game";
         const int tw = ui_text_width(UI_TITLE, t), gw = 22 + 8 + tw, x0 = r.x + (r.w - gw) / 2;
@@ -613,7 +647,10 @@ static void draw_footer(void)
         x = ui_footer_button(x, glyph, label, false);                                                 \
         g_foot[g_nfoot++] = (typeof(g_foot[0])){{(s16)(x0 - 6), UI_H - UI_FOOTER_H, (s16)(x - x0), UI_FOOTER_H}, key}; \
     } while (0)
-    if (g_page == PAGE_MAIN) {
+    if (g_page == PAGE_MAIN && g_no_game) {
+        FOOT(UI_GLYPH_A, "OK", KEY_A);
+        FOOT(UI_GLYPH_B, "Game list", KEY_B);
+    } else if (g_page == PAGE_MAIN) {
         FOOT(UI_GLYPH_A, "OK", KEY_A);
         FOOT(UI_GLYPH_B, "Resume", KEY_B);
         if (!g_status[0])
@@ -718,9 +755,12 @@ static void draw_page(void)
         ui_background(UI_HEADER_H, UI_H - UI_HEADER_H - UI_FOOTER_H);
         for (int i = 0; i < M_COUNT; i++)
             draw_main_tile(i, i == g_sel);
-        ui_header(game_title(), "Paused");
+        if (g_no_game)
+            ui_header("Settings", "ctr64 " CTR64_VERSION);
+        else
+            ui_header(game_title(), "Paused");
     } else {
-        ui_header(titles[g_page], game_title());
+        ui_header(titles[g_page], g_no_game ? "Settings" : game_title());
         if (g_page == PAGE_CONTROLS)
             draw_pad();
         else
@@ -847,7 +887,7 @@ static int spatial(int from, int dx, int dy)
     const int ax = a.x + a.w / 2, ay = a.y + a.h / 2;
     int best = -1, best_score = 1 << 30;
     for (int i = 0; i < g_nw; i++) {
-        if (i == from)
+        if (i == from || !g_w[i].w)
             continue;
         const int bx = g_w[i].x + g_w[i].w / 2, by = g_w[i].y + g_w[i].h / 2;
         const int along = dx ? (bx - ax) * dx : (by - ay) * dy;
@@ -989,10 +1029,20 @@ static int widget_at(int x, int y)
                 return i;
             continue;
         }
-        if (ui_hit(x, y, r.x, r.y, r.w, r.h))
+        if (r.w && ui_hit(x, y, r.x, r.y, r.w, r.h))
             return i;
     }
     return -1;
+}
+
+/* The settings pages from the game list, without a game: Audio, Video, Controls. Saved to
+ * `settings_path` when changed; they apply to the next game started. */
+void menu_settings(const char *settings_path)
+{
+    snprintf(g_settings_path, sizeof(g_settings_path), "%s", settings_path);
+    g_no_game = true;
+    menu_run();
+    g_no_game = false;
 }
 
 MenuResult menu_run(void)
@@ -1006,7 +1056,7 @@ MenuResult menu_run(void)
     hidSetRepeatParameters(18, 5);
     console_window();
     consoleSetWindow(ui_console(), 0, 29, 40, 1);
-    go_page(PAGE_MAIN, M_RESUME);
+    go_page(PAGE_MAIN, g_no_game ? M_VIDEO : M_RESUME);
 
     bool alive;
     while ((alive = aptMainLoop())) {
@@ -1037,7 +1087,7 @@ MenuResult menu_run(void)
             continue;
         }
 
-        if (down & KEY_SELECT)
+        if ((down & KEY_SELECT) && !g_no_game)
             break;
 
         /* controls: the Circle Pad range has focus */
@@ -1119,7 +1169,7 @@ MenuResult menu_run(void)
         /* keys */
         int dy = (rep & (KEY_DUP | KEY_CPAD_UP)) ? -1 : (rep & (KEY_DDOWN | KEY_CPAD_DOWN)) ? 1 : 0;
         int dx = (rep & (KEY_DLEFT | KEY_CPAD_LEFT)) ? -1 : (rep & (KEY_DRIGHT | KEY_CPAD_RIGHT)) ? 1 : 0;
-        if (g_page == PAGE_MAIN && (down & (KEY_L | KEY_R))) {
+        if (g_page == PAGE_MAIN && !g_no_game && (down & (KEY_L | KEY_R))) {
             change(M_SLOT, (down & KEY_L) ? -1 : 1);
             after_change();
         }
@@ -1263,7 +1313,7 @@ done:
     g_status[0] = 0;
     g_running_drawn = false;
     g_stats_dirty = true;
-    if (result == MENU_CONTINUE)
+    if (result == MENU_CONTINUE && !g_no_game)
         draw_running();
     core_host_block_input(false);
     audio_ndsp_pause(false);

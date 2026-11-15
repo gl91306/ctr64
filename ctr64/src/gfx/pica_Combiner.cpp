@@ -6,6 +6,7 @@
 #include <GBI.h>
 #include <gDP.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -169,6 +170,18 @@ void emit_cycle(u32 A, u32 B, u32 C, u32 D, Chain &ch)
             ch.push(F_MODULATE, 2, b, c);
             ch.push(F_SUBTRACT, 2, d, simple(K_PREV));
         }
+    } else if (!varying(B) && !varying(D)) {
+        /* (A - B)*C + D = lerp(B, A, C) + (D - B): the lerp stays in [0, 1] (exact), and the
+         * signed constant D - B is added as its positive part, then subtracted as its negative
+         * part (per channel only one is nonzero). No combiner buffer: COMBINED, which cycle 2
+         * reads from the buffer, stays intact (Conker's characters: (SHADE - ENV)*COMBINED +
+         * PRIM lost the texture and drew flat red) */
+        KRef kp, kn;
+        kp.op = KRef::K_POSDIFF; kp.g1 = (u8)D; kp.g2 = (u8)B;
+        kn.op = KRef::K_NEGDIFF; kn.g1 = (u8)D; kn.g2 = (u8)B;
+        ch.push(F_INTERPOLATE, 3, a, b, c);
+        ch.push(F_ADD, 2, simple(K_PREV), karg(kp));
+        ch.push(F_SUBTRACT, 2, simple(K_PREV), karg(kn));
     } else if (!varying(B) && !varying(C)) {
         /* X = A*C + D - B*C with B*C folded: compute (X + 1) / 2, then expand */
         KRef k1, k2;
@@ -329,6 +342,8 @@ f32 kvalue(const KRef &k, int c)
     case KRef::K_IN: return input_value(k.g1, c);
     case KRef::K_HALF: return 0.5f * input_value(k.g1, c);
     case KRef::K_HALF_1M_PROD: return 0.5f * (1.0f - input_value(k.g1, c) * input_value(k.g2, c));
+    case KRef::K_POSDIFF: return std::max(input_value(k.g1, c) - input_value(k.g2, c), 0.0f);
+    case KRef::K_NEGDIFF: return std::max(input_value(k.g2, c) - input_value(k.g1, c), 0.0f);
     default: return 0.0f;
     }
 }

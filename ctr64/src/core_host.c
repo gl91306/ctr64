@@ -81,6 +81,14 @@ static struct {
 
 /* ---- logging ------------------------------------------------------------------------------ */
 
+static void RETRO_CALLCONV core_log(enum retro_log_level level, const char *fmt, ...);
+
+/* a line in core.log from the frontend (gfx_async.c: the video thread's start) */
+void ctr64_log_line(const char *line)
+{
+    core_log(RETRO_LOG_INFO, "%s\n", line);
+}
+
 static void RETRO_CALLCONV core_log(enum retro_log_level level, const char *fmt, ...)
 {
     va_list ap;
@@ -587,8 +595,9 @@ bool core_host_load(const char *rom_path)
     fseek(f, 0, SEEK_END);
     size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    /* N64 cartridges hold 4 KB (header and boot code) to 64 MB */
-    if (size < 0x1000 || size > 64 * 1024 * 1024) {
+    /* N64 cartridges hold 4 KB (header and boot code) to 64 MB; ROM hacks go up to the end of
+     * the cartridge address range (0x10000000-0x1FBFFFFF: 252 MB; Smash Remix Extra is 77 MB) */
+    if (size < 0x1000 || size > 0xFC00000) {
         if (H.log)
             fprintf(H.log, "ROM %s: size %ld is not an N64 ROM\n", rom_path, size);
         fclose(f);

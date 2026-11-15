@@ -14,6 +14,8 @@ dkp_add_embedded_binary_library(ctr64_shaders_bin ctr64_shaders)
 add_executable(ctr64
   src/main.c
   src/prof.c
+  src/bench.c
+  src/memcpy_prof.c
   src/crash.c
   src/frameskip.c
   src/gfx_async.c
@@ -50,6 +52,12 @@ endif()
 # The core uses int-sized enums (see core.cmake); libctru's structs shared with ctr64 code
 # do not depend on enum storage size, so the mixed-enum-size link is intentional.
 target_link_options(ctr64 PRIVATE -Wl,--no-enum-size-warning -Wl,--wrap=abort -Wl,--wrap=__system_allocateHeaps -Wl,--wrap=_sbrk_r)
+# development: bytes copied by memcpy per caller (src/memcpy_prof.c, sdmc:/3ds/ctr64/memcpy.log)
+option(CTR64_MEMCPY_PROF "count memcpy bytes per caller" OFF)
+if(CTR64_MEMCPY_PROF)
+  target_compile_definitions(ctr64 PRIVATE CTR64_MEMCPY_PROF=1)
+  target_link_options(ctr64 PRIVATE -Wl,--wrap=memcpy)
+endif()
 
 # Release version: here, in the CIA's title version (makerom -ver, scripts/build-3ds.ps1) and
 # shown on the game list and in core.log.
@@ -59,6 +67,7 @@ target_compile_definitions(ctr64 PRIVATE CTR64_VERSION="${CTR64_VERSION}")
 ctr_generate_smdh(ctr64.smdh
   NAME "ctr64"
   DESCRIPTION "N64 emulator ${CTR64_VERSION}"
-  AUTHOR "ctr64")
+  AUTHOR "ctr64"
+  ICON "${CMAKE_CURRENT_SOURCE_DIR}/cia/icon.png")  # 48x48, from tools/icon/make_final.py
 
 ctr_create_3dsx(ctr64 SMDH ctr64.smdh)

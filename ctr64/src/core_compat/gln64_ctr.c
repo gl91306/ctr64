@@ -24,18 +24,18 @@ unsigned long long ctr64_gfx_ticks[3];
 /* frames presented by the PICA backend so far (input scripts count in these) */
 unsigned int ctr64_video_frames;
 /* GLideN64 profiling scopes (GLideN64/src/Ctr64Prof.h), written to stats.log by main.c */
-unsigned long long ctr64_prof_ticks[40];
-unsigned int ctr64_prof_calls[40];
-unsigned long long ctr64_prof_total[40];
+unsigned long long ctr64_prof_ticks[48];
+unsigned int ctr64_prof_calls[48];
+unsigned long long ctr64_prof_total[48];
 /* dev switch nocrcmemo.txt (read in pica_ContextImpl.cpp): GLideN64 texture hashes never reused */
 _Bool ctr64_crc_nomemo;
 /* scope names, Ctr64Prof.h ids (stats.log "prof" line, profiler "s" rows) */
-const char *const ctr64_prof_names[40] = {
+const char *const ctr64_prof_names[48] = {
     "vtx", "procvtx", "tris", "texrect", "rect", "texupd", "texload", "tmem", "fbsave", "fbfromrdram",
     "fbrender", "gdptexrect", "states", "combiner", "fbtordram", "upload", "fbtexchk", "tmemcopy",
     "swrender", "rb_read", "rb_gx", "rb_conv", "rb_prep", "texcrc", "texconv", "texinit", "texalloc",
     "texswz", "texdel", "gpudrain", "texfetch", "texflush", "trstate", "trvtx", "subdiv", "trdraw",
-    "upfetch", "upstage", "upwait", "upwrite"};
+    "upfetch", "upstage", "upwait", "upwrite", "swclip", "stash", "", "prep", "", "", "", ""};
 
 /* backend storage accounting (pica_ContextImpl.cpp) */
 unsigned int ctr64_gfx_mem[4];

@@ -12,40 +12,44 @@
 static const struct {
     char id[3];
     const char *title;
+    /* words of the game's own internal names (header 0x20, letters and digits only, any region),
+     * '|' between alternatives: a ROM with this id but none of them in its name is a hack (Smash
+     * Remix keeps Super Smash Bros.' id) and is listed under its own name */
+    const char *names;
 } k_games[] = {
-    {"SM", "Super Mario 64"},
-    {"ZL", "The Legend of Zelda: Ocarina of Time"},
-    {"ZS", "The Legend of Zelda: Majora's Mask"},
-    {"KT", "Mario Kart 64"},
-    {"AL", "Super Smash Bros."},
-    {"MQ", "Paper Mario"},
-    {"GE", "GoldenEye 007"},
-    {"PD", "Perfect Dark"},
-    {"BK", "Banjo-Kazooie"},
-    {"B7", "Banjo-Tooie"},
-    {"DY", "Diddy Kong Racing"},
-    {"DO", "Donkey Kong 64"},
-    {"FZ", "F-Zero X"},
-    {"YS", "Yoshi's Story"},
-    {"K4", "Kirby 64: The Crystal Shards"},
-    {"FU", "Conker's Bad Fur Day"},
-    {"WR", "Wave Race 64"},
-    {"FX", "Star Fox 64"},
-    {"TE", "1080\xC2\xB0 Snowboarding"},
-    {"PF", "Pok\xC3\xA9mon Snap"},
-    {"PO", "Pok\xC3\xA9mon Stadium"},
-    {"P3", "Pok\xC3\xA9mon Stadium 2"},
-    {"M8", "Mario Tennis"},
-    {"MF", "Mario Golf"},
-    {"MW", "Mario Party 2"},
-    {"MV", "Mario Party 3"},
-    {"PW", "Pilotwings 64"},
-    {"MX", "Excitebike 64"},
-    {"JF", "Jet Force Gemini"},
-    {"BC", "Blast Corps"},
-    {"N6", "Dr. Mario 64"},
-    {"SW", "Star Wars: Shadows of the Empire"},
-    {"RS", "Star Wars: Rogue Squadron"},
+    {"SM", "Super Mario 64", "MARIO64"},
+    {"ZL", "The Legend of Zelda: Ocarina of Time", "ZELDA"},
+    {"ZS", "The Legend of Zelda: Majora's Mask", "ZELDA|MUJURA"},
+    {"KT", "Mario Kart 64", "MARIOKART"},
+    {"AL", "Super Smash Bros.", "SMASHBROTHERS|DAIRANTOU"},
+    {"MQ", "Paper Mario", "PAPERMARIO|MARIOSTORY"},
+    {"GE", "GoldenEye 007", "GOLDENEYE"},
+    {"PD", "Perfect Dark", "PERFECTDARK"},
+    {"BK", "Banjo-Kazooie", "BANJO"},
+    {"B7", "Banjo-Tooie", "BANJO"},
+    {"DY", "Diddy Kong Racing", "DIDDY"},
+    {"DO", "Donkey Kong 64", "DONKEYKONG"},
+    {"FZ", "F-Zero X", "FZERO"},
+    {"YS", "Yoshi's Story", "YOSHI"},
+    {"K4", "Kirby 64: The Crystal Shards", "KIRBY"},
+    {"FU", "Conker's Bad Fur Day", "CONKER"},
+    {"WR", "Wave Race 64", "WAVERACE"},
+    {"FX", "Star Fox 64", "STARFOX|LYLATWARS"},
+    {"TE", "1080\xC2\xB0 Snowboarding", "1080"},
+    {"PF", "Pok\xC3\xA9mon Snap", "SNAP"},
+    {"PO", "Pok\xC3\xA9mon Stadium", "STADIUM"},
+    {"P3", "Pok\xC3\xA9mon Stadium 2", "STADIUM"},
+    {"M8", "Mario Tennis", "TENNIS"},
+    {"MF", "Mario Golf", "GOLF"},
+    {"MW", "Mario Party 2", "MARIOPARTY"},
+    {"MV", "Mario Party 3", "MARIOPARTY"},
+    {"PW", "Pilotwings 64", "PILOTWINGS"},
+    {"MX", "Excitebike 64", "EXCITEBIKE"},
+    {"JF", "Jet Force Gemini", "JETFORCE"},
+    {"BC", "Blast Corps", "BLASTCORPS|BLASTDOZER"},
+    {"N6", "Dr. Mario 64", "DRMARIO"},
+    {"SW", "Star Wars: Shadows of the Empire", "SHADOW"},
+    {"RS", "Star Wars: Rogue Squadron", "ROGUE"},
 };
 
 static const char *region_name(char c)
@@ -142,6 +146,29 @@ static void from_header(const unsigned char *h, char *title, size_t tn)
     title[n] = 0;
 }
 
+/* the header's internal name (letters and digits, upper case) contains one of names */
+static bool internal_name_matches(const unsigned char *h, const char *names)
+{
+    char n[24];
+    size_t k = 0;
+    for (int i = 0x20; i < 0x34 && k + 1 < sizeof(n); i++)
+        if (isalnum(h[i]))
+            n[k++] = (char)toupper(h[i]);
+    n[k] = 0;
+    if (!k)
+        return true; /* no name to go by */
+    for (const char *p = names; *p;) {
+        const char *e = strchr(p, '|');
+        const size_t l = e ? (size_t)(e - p) : strlen(p);
+        char w[24];
+        snprintf(w, sizeof(w), "%.*s", (int)l, p);
+        if (strstr(n, w))
+            return true;
+        p += l + (e ? 1 : 0);
+    }
+    return false;
+}
+
 void rom_title_from_header(const unsigned char hdr[64], const char *file, char *title, size_t tn, char *tags, size_t gn)
 {
     unsigned char h[64];
@@ -157,6 +184,13 @@ void rom_title_from_header(const unsigned char hdr[64], const char *file, char *
     const char id[3] = {(char)h[0x3C], (char)h[0x3D], 0};
     for (unsigned i = 0; i < sizeof(k_games) / sizeof(k_games[0]); i++)
         if (!strcmp(id, k_games[i].id)) {
+            if (!internal_name_matches(h, k_games[i].names)) { /* a hack: listed by its own name */
+                from_header(h, title, tn);
+                if (title[0]) {
+                    snprintf(tags, gn, "%s hack", k_games[i].title);
+                    return;
+                }
+            }
             snprintf(title, tn, "%s", k_games[i].title);
             const char *r = region_name((char)h[0x3E]);
             if (h[0x3F] && r)

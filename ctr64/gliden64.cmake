@@ -75,4 +75,8 @@ target_include_directories(ctr64_gliden64 PRIVATE
   ${GLN}/xxHash)
 target_compile_options(ctr64_gliden64 PRIVATE
   -std=gnu++17 -O2 -fsigned-char -ffast-math -fno-strict-aliasing -fomit-frame-pointer
-  -fno-short-enums -fpermissive -w)
+  -fno-short-enums -fpermissive -w
+  # function-local statics (TextureCache::get, FrameBufferList::get, DisplayWindow::get, ...) are
+  # read for every vertex/draw; thread-safe init puts a CP15 barrier in each call. They are first
+  # used on the graphics thread during start-up, before any other thread calls in.
+  -fno-threadsafe-statics)

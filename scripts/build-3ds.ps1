@@ -42,7 +42,8 @@ if ($makerom) {
     $g = $m.Matches[0].Groups
     $ver = ([int]$g[1].Value -shl 10) -bor ([int]$g[2].Value -shl 4) -bor [int]$g[3].Value
     & $makerom -f cia -o (Join-Path $out 'ctr64.cia') -elf (Join-Path $bld 'ctr64.elf') `
-        -rsf (Join-Path $root 'ctr64\cia\ctr64.rsf') -icon (Join-Path $bld 'ctr64.smdh') -target t -exefslogo -ver $ver
+        -rsf (Join-Path $root 'ctr64\cia\ctr64.rsf') -icon (Join-Path $bld 'ctr64.smdh') `
+        -banner (Join-Path $root 'ctr64\cia\banner.bnr') -target t -exefslogo -ver $ver
     if ($LASTEXITCODE) { throw 'makerom failed' }
     Write-Host "Done: $out\ctr64.3dsx, $out\ctr64.cia"
 } else {

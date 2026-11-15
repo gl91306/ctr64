@@ -22,6 +22,7 @@ static struct {
     u16 stride;
     u32 vbo_offset;
     bool layout_dirty, buffer_dirty;
+    bool buffers_set; /* buffers 1-11 written (zero) since the reset: only buffer 0 changes */
 
     u32 tev[6][5];
     bool tev_valid[6];
@@ -250,14 +251,20 @@ void pica_state_prepare_draw(void)
         S.layout_dirty = false;
     }
     if (S.buffer_dirty) {
-        /* Buffer 0 holds all attributes interleaved; buffers 1-11 are unused. */
+        /* Buffer 0 holds all attributes interleaved; buffers 1-11 are unused. Each draw has its
+         * own vertex memory, so buffer 0 changes per draw: the rest is written once per reset. */
         u32 cfg[12 * 3];
         memset(cfg, 0, sizeof(cfg));
         cfg[0] = S.vbo_offset;
         cfg[1] = (u32)S.attr_perm;
         cfg[2] = (u32)(S.attr_perm >> 32) | ((u32)S.stride << 16) | ((u32)S.attr_count << 28);
-        GPUCMD_AddWrite(GPUREG_ATTRIBBUFFERS_LOC, PICA_BUFFER_BASE_PADDR >> 3);
-        GPUCMD_AddIncrementalWrites(GPUREG_ATTRIBBUFFER0_OFFSET, cfg, 12 * 3);
+        if (S.buffers_set) {
+            GPUCMD_AddIncrementalWrites(GPUREG_ATTRIBBUFFER0_OFFSET, cfg, 3);
+        } else {
+            GPUCMD_AddWrite(GPUREG_ATTRIBBUFFERS_LOC, PICA_BUFFER_BASE_PADDR >> 3);
+            GPUCMD_AddIncrementalWrites(GPUREG_ATTRIBBUFFER0_OFFSET, cfg, 12 * 3);
+            S.buffers_set = true;
+        }
         S.buffer_dirty = false;
     }
     S.drawn = true;

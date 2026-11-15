@@ -22,6 +22,8 @@ void menu_set_stats(const MenuStats *s);
 void menu_draw_running(void);
 /* the menu, with the game paused; returns when the player resumes or exits */
 MenuResult menu_run(void);
+/* from the game list: the settings pages without a game (saved to settings_path) */
+void menu_settings(const char *settings_path);
 /* while the game runs: a touch that opens the menu (down: this frame's keys) */
 bool menu_running_touched(unsigned long down);
 /* first console row (inside the debug window) for the developer counters (settings: debug info) */

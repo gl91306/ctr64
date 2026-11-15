@@ -19,6 +19,7 @@
  * Save states, the HOME menu and shutdown drain the queue first (ctr64_gfx_drain). */
 int ctr64_core1_ready(void); /* platform/ctr_jit.c */
 #include <3ds.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -154,6 +155,12 @@ static void worker(void *arg)
     }
 }
 
+static void probe_main(void *arg)
+{
+    (void)arg;
+    svcExitThread();
+}
+
 static bool start_worker(void)
 {
     bool new3ds = false;
@@ -173,16 +180,49 @@ static bool start_worker(void)
     g_put = g_got = g_dlists_put = g_dlists_got = g_dlists_taken = 0;
     g_thread = threadCreate(worker, NULL, 256 * 1024, prio - 1, core, false);
     g_running = g_thread != NULL;
+    {   /* core.log: whether the video thread runs (Smash Remix on a New 3DS once ran without it,
+         * with nothing to say why) */
+        extern void ctr64_log_line(const char *line);
+        struct mallinfo mi = mallinfo();
+        char line[160];
+        snprintf(line, sizeof(line), "video thread: %s on core %d at VI %u (priority %ld, heap free %u KB)",
+                 g_running ? "started" : "COULD NOT START", core, ctr64_vi_count, (long)(prio - 1),
+                 (unsigned)(mi.fordblks / 1024));
+        ctr64_log_line(line);
+        if (!g_running) {
+            /* why: the kernel's answer for a small thread on that core, and the system's CPU time
+             * limit for core 1 (a New 3DS app gets its extra cores from the system) */
+            static u8 probe_stack[4096] __attribute__((aligned(8)));
+            Handle h = 0;
+            const Result rc = svcCreateThread(&h, probe_main, 0, (u32 *)(probe_stack + sizeof(probe_stack)),
+                                              prio - 1, core);
+            if (R_SUCCEEDED(rc)) {
+                svcWaitSynchronization(h, U64_MAX);
+                svcCloseHandle(h);
+            }
+            u32 limit = 0;
+            const Result rl = APT_GetAppCpuTimeLimit(&limit);
+            s64 cores = 0;
+            svcGetSystemInfo(&cores, 26, 0); /* number of cores the kernel runs */
+            snprintf(line, sizeof(line), "video thread: probe thread on core %d -> %08lX; core 1 limit %lu%% (%08lX); "
+                     "cores %lld", core, (unsigned long)rc, (unsigned long)limit, (unsigned long)rl, (long long)cores);
+            ctr64_log_line(line);
+        }
+    }
     return g_running;
 }
 
 static bool threaded(void)
 {
-    static bool tried;
+    /* a start that fails is tried again a second later, a few times (until then the graphics
+     * run on the CPU thread, as with the setting off) */
+    static int tries;
+    static unsigned next_vi;
     if (!g_settings.threaded_video)
         return false;
-    if (!g_running && !tried) {
-        tried = true;
+    if (!g_running && tries < 5 && (int)(ctr64_vi_count - next_vi) >= 0) {
+        tries++;
+        next_vi = ctr64_vi_count + 60;
         start_worker();
     }
     return g_running;

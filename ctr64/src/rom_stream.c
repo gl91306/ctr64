@@ -23,7 +23,7 @@
 
 #define RS_SHIFT 16
 #define RS_PAGE (1u << RS_SHIFT)
-#define RS_MAX_PAGES (64u * 1024 * 1024 / RS_PAGE)
+#define RS_MAX_PAGES (0xFC00000u / RS_PAGE) /* the cartridge address range (memory.h CTR64_RS_PAGES) */
 #define RS_MIN_SLOTS 48                     /* 3 MB: always kept */
 #define RS_HEADROOM (12u * 1024 * 1024)     /* heap left free for the rest of the emulator */
 #define RS_LOW (8u * 1024 * 1024)           /* below this, rom_stream_trim gives pages back */

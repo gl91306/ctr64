@@ -27,6 +27,10 @@ void prof_vi_begin(void);
 void prof_vi_end(unsigned vi, bool behind);
 void prof_vi_run(unsigned long long ticks); /* the CPU thread's emulation time of this VI */
 void prof_vi_resync(void);                  /* after a pause (the menu) */
+/* Detailed profiler: a screenshot of the top screen (pica_ContextImpl endVI); rgba is the
+ * untiled window texture from the image's top row, rows top-down, `pitch` texels apart */
+bool prof_shot_ready(void);
+void prof_shot(unsigned vi, const unsigned char *rgba, unsigned pitch);
 /* an event at the next VI ("m <vi> <text>" in the file): state loads, saves, resets */
 void prof_mark(const char *fmt, ...);
 /* the speed limiter's sleep and precompile time (main.c limit_speed) */

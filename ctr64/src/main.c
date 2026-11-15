@@ -41,9 +41,9 @@ extern unsigned int ctr64_gfx_mem[4];
 extern const char *ctr64_allocfail_where;
 extern unsigned ctr64_allocfail_bytes;
 extern unsigned long long ctr64_sp_ticks[3];
-extern unsigned long long ctr64_prof_ticks[40];
-extern unsigned int ctr64_prof_calls[40];
-extern const char *const ctr64_prof_names[40];
+extern unsigned long long ctr64_prof_ticks[48];
+extern unsigned int ctr64_prof_calls[48];
+extern const char *const ctr64_prof_names[48];
 
 /* audio-list command time by opcode (mupen64plus-rsp-hle alist.c) */
 unsigned long long ctr64_alist_ticks[32];
@@ -697,9 +697,14 @@ static void run_game(void)
             menu_set_stats(&ms);
             menu_draw_running();
             extern unsigned ctr64_frames_drawskip; /* frameskip.c */
-            if (g_stats)
+            if (g_stats) {
+                extern unsigned ctr64_crc_long[2]; /* GLideN64 CRC_OPT.cpp */
                 fprintf(g_stats, "  frameskip: %u frames drawn skipped, %u presents dropped\n",
                         ctr64_frames_drawskip, ctr64_frames_skipped);
+                fprintf(g_stats, "  texture hashes over 256 bytes: %u, %u KB\n", ctr64_crc_long[0],
+                        ctr64_crc_long[1]);
+                ctr64_crc_long[0] = ctr64_crc_long[1] = 0;
+            }
             ctr64_frames_drawskip = 0;
             ctr64_frames_skipped = 0;
             ctr64_prof_on = g_settings.debug_info || g_prof_file || ctr64_profiler == 2;
@@ -784,7 +789,7 @@ static void run_game(void)
                     /* GLideN64 scopes (Ctr64Prof.h ids), ms per frame and calls per frame */
                     const char *const *names = ctr64_prof_names;
                     fprintf(g_stats, "  prof");
-                    for (int i = 0; i < 40; i++)
+                    for (int i = 0; i < 48; i++)
                         if (ctr64_prof_calls[i])
                             fprintf(g_stats, " %s %.2f/%u", names[i],
                                     (float)ctr64_prof_ticks[i] * 1000.0f / SYSCLOCK_ARM11 / 60,

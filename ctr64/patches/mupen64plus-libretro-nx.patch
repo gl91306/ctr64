@@ -272,7 +272,7 @@ index 745218c..795f78b 100644
 +
  #endif // WriteToRDRAM_H
 diff --git a/GLideN64/src/CRC_OPT.cpp b/GLideN64/src/CRC_OPT.cpp
-index 05a62e5..761c4ae 100644
+index 05a62e5..479b6c8 100644
 --- a/GLideN64/src/CRC_OPT.cpp
 +++ b/GLideN64/src/CRC_OPT.cpp
 @@ -1,4 +1,5 @@
@@ -281,7 +281,7 @@ index 05a62e5..761c4ae 100644
  #define XXH_INLINE_ALL
  #include "xxHash/xxhash.h"
  
-@@ -46,6 +47,80 @@ u32 CRC_Calculate_Strict( u32 crc, const void * buffer, u32 count )
+@@ -46,6 +47,84 @@ u32 CRC_Calculate_Strict( u32 crc, const void * buffer, u32 count )
  	return crc ^ orig;
  }
  
@@ -301,13 +301,17 @@ index 05a62e5..761c4ae 100644
 + * XXH32 widened to 64 bits collided in SSB (a half-loaded texture was reused). Both lanes are
 + * XXH32 (bit for bit, see XXH32 in xxHash/xxhash.h), computed in one pass over the data: each
 + * word is loaded once for both. */
++extern "C" { unsigned ctr64_crc_long[2]; } /* calls >= 256 bytes, KB hashed (stats.log) */
 +u64 CRC_Calculate( u64 crc, const void * buffer, u32 count )
 +{
 +	/* long inputs (texture data): XXH3's main loop is one 32x32->64 multiply (UMULL) per 8 bytes,
 +	 * about half the work of the two XXH32 lanes; only its short-input paths and final mixing
 +	 * use 64x64 multiplies, which are slow on the ARM11 */
-+	if (count >= 256)
++	if (count >= 256) {
++		ctr64_crc_long[0]++;
++		ctr64_crc_long[1] += count >> 10;
 +		return XXH3_64bits_withSeed(buffer, count, crc);
++	}
 +	const u32 P1 = 0x9E3779B1U, P2 = 0x85EBCA77U, P3 = 0xC2B2AE3DU, P4 = 0x27D4EB2FU, P5 = 0x165667B1U;
 +	const u32 sa = static_cast<u32>(crc), sb = static_cast<u32>(crc >> 32) ^ 0x9E3779B1U;
 +	const u8 *p = static_cast<const u8*>(buffer);
@@ -362,7 +366,7 @@ index 05a62e5..761c4ae 100644
  u64 CRC_Calculate( u64 crc, const void * buffer, u32 count )
  {
  	return XXH3_64bits_withSeed(buffer, count, crc);
-@@ -60,3 +135,4 @@ u64 CRC_CalculatePalette( u64 crc, const void * buffer, u32 count )
+@@ -60,3 +139,4 @@ u64 CRC_CalculatePalette( u64 crc, const void * buffer, u32 count )
  	}
  	return crc;
  }
@@ -429,7 +433,7 @@ index 5dd846b..38e2130 100644
  EXPORT void CALL gln64ViStatusChanged (void)
 diff --git a/GLideN64/src/Ctr64Prof.h b/GLideN64/src/Ctr64Prof.h
 new file mode 100644
-index 0000000..cc8e55c
+index 0000000..dc7562d
 --- /dev/null
 +++ b/GLideN64/src/Ctr64Prof.h
 @@ -0,0 +1,28 @@
@@ -437,9 +441,9 @@ index 0000000..cc8e55c
 +/* ctr64 profiling: inclusive time per scope, read by ctr64's stats.log (ctr64/src/main.c) */
 +#ifdef __3DS__
 +extern "C" unsigned long long svcGetSystemTick(void);
-+extern "C" unsigned long long ctr64_prof_ticks[40];
-+extern "C" unsigned int ctr64_prof_calls[40];
-+extern "C" unsigned long long ctr64_prof_total[40]; /* never reset: per-VI deltas (prof.c) */
++extern "C" unsigned long long ctr64_prof_ticks[48];
++extern "C" unsigned int ctr64_prof_calls[48];
++extern "C" unsigned long long ctr64_prof_total[48]; /* never reset: per-VI deltas (prof.c) */
 +extern "C" int ctr64_prof_on; /* timers on: each tick read is a kernel call, thousands per frame */
 +struct Ctr64ProfScope {
 +	int id;
@@ -560,7 +564,7 @@ index ac4e150..855667d 100644
  	void setCleared(bool _cleared);
  	DepthBuffer *findBuffer(u32 _address);
 diff --git a/GLideN64/src/FrameBuffer.cpp b/GLideN64/src/FrameBuffer.cpp
-index 68cf2bf..39a67b1 100644
+index 68cf2bf..dd6bc69 100644
 --- a/GLideN64/src/FrameBuffer.cpp
 +++ b/GLideN64/src/FrameBuffer.cpp
 @@ -1,3 +1,4 @@
@@ -568,7 +572,34 @@ index 68cf2bf..39a67b1 100644
  #include <assert.h>
  #include <math.h>
  #include <algorithm>
-@@ -272,6 +273,33 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -146,6 +147,10 @@ bool FrameBuffer::isAuxiliary() const
+ 	return m_width != VI.width || m_size < G_IM_SIZ_16b;
+ }
+ 
++#ifdef __3DS__
++bool ctr64_aa_too_wide;
++#endif
++
+ void FrameBuffer::init(u32 _address, u16 _format, u16 _size, u16 _width, bool _cfb)
+ {
+ 	m_startAddress = _address;
+@@ -161,6 +166,15 @@ void FrameBuffer::init(u32 _address, u16 _format, u16 _size, u16 _width, bool _c
+ 	} else {
+ 		m_scale = std::max(dwnd().getScaleX(), 1.0f);
+ 	}
++#ifdef __3DS__
++	/* PICA render targets are at most 1024 wide: a 640-wide (hi-res) buffer at 2x would be cut
++	 * off, so such a buffer stays at native size (texture sampling and the depth buffer follow
++	 * m_scale, as for the native-size aux buffers above) */
++	if (m_scale > 1.0f && static_cast<float>(_width) * m_scale > 1024.0f) {
++		m_scale = 1.0f;
++		ctr64_aa_too_wide = true; /* VI_UpdateScreen drops 2x for the rest of the game */
++	}
++#endif
+ 	m_cfb = _cfb;
+ 	m_cleared = false;
+ 	m_fingerprint = false;
+@@ -272,6 +286,33 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  		const u32 start = (m_startAddress >> 2) + static_cast<u32>(m_clearParams.uly) * ci_width_in_dwords;
  		const u32 * dst = pData + start;
  		u32 wrongPixels = 0;
@@ -602,7 +633,7 @@ index 68cf2bf..39a67b1 100644
  		for (s32 y = m_clearParams.uly; y < lry; ++y) {
  			for (s32 x = m_clearParams.ulx; x < m_clearParams.lrx; ++x) {
  				if ((dst[x] & 0xFFFEFFFE) != testColor)
-@@ -280,6 +308,7 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -280,6 +321,7 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  			dst += ci_width_in_dwords;
  		}
  		return wrongPixels < (m_endAddress - m_startAddress) / 400; // threshold level 1% of dwords
@@ -610,7 +641,7 @@ index 68cf2bf..39a67b1 100644
  	} else if (m_fingerprint) {
  			//check if our fingerprint is still there
  			u32 start = m_startAddress >> 2;
-@@ -293,11 +322,34 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -293,11 +335,34 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  		const u32 size_dwords = size >> 2;
  		u32 start = m_startAddress >> 2;
  		u32 wrongPixels = 0;
@@ -645,7 +676,7 @@ index 68cf2bf..39a67b1 100644
  	}
  	return true; // No data to decide
  }
-@@ -771,6 +823,7 @@ void FrameBufferList::_createScreenSizeBuffer()
+@@ -771,6 +836,7 @@ void FrameBufferList::_createScreenSizeBuffer()
  
  void FrameBufferList::saveBuffer(u32 _address, u16 _format, u16 _size, u16 _width, bool _cfb)
  {
@@ -653,7 +684,7 @@ index 68cf2bf..39a67b1 100644
  	if (_width > 640)
  		return;
  
-@@ -1464,6 +1517,7 @@ void FrameBufferList::OverscanBuffer::draw(u32 _fullHeight, bool _PAL)
+@@ -1464,6 +1530,7 @@ void FrameBufferList::OverscanBuffer::draw(u32 _fullHeight, bool _PAL)
  
  void FrameBufferList::renderBuffer()
  {
@@ -661,7 +692,7 @@ index 68cf2bf..39a67b1 100644
  	if (g_debugger.isDebugMode()) {
  		g_debugger.draw();
  		return;
-@@ -1711,12 +1765,27 @@ void FrameBufferList::fillRDRAM(s32 ulx, s32 uly, s32 lrx, s32 lry)
+@@ -1711,12 +1778,27 @@ void FrameBufferList::fillRDRAM(s32 ulx, s32 uly, s32 lrx, s32 lry)
  	dst += static_cast<u32>(uly) * ci_width_in_dwords;
  	if (!isMemoryWritable(dst, lowerBound - gDP.colorImage.address))
  		return;
@@ -733,8 +764,25 @@ index 9d268e9..3f37454 100644
  	m_impl->init();
  	m_fbTexFormats.reset(m_impl->getFramebufferTextureFormats());
  	Multisampling = m_impl->isSupported(SpecialFeatures::Multisampling);
+diff --git a/GLideN64/src/Graphics/Context.h b/GLideN64/src/Graphics/Context.h
+index 2041bac..35d026f 100644
+--- a/GLideN64/src/Graphics/Context.h
++++ b/GLideN64/src/Graphics/Context.h
+@@ -272,6 +272,12 @@ namespace graphics {
+ 			SPVertex * vertices = nullptr;
+ 			void * elements = nullptr;
+ 			const CombinerProgram * combiner = nullptr;
++#ifdef __3DS__
++			/* ctr64: vertices from verticesBase on are vertices2[i - verticesBase] (renderAndDrawTriangles:
++			 * its input vertices are used in place, only clipped ones are new) */
++			const SPVertex * vertices2 = nullptr;
++			u32 verticesBase = ~0u;
++#endif
+ 		};
+ 
+ 		void drawTriangles(const DrawTriangleParameters & _params);
 diff --git a/GLideN64/src/GraphicsDrawer.cpp b/GLideN64/src/GraphicsDrawer.cpp
-index a2fb0af..c7cce35 100644
+index a2fb0af..17b50aa 100644
 --- a/GLideN64/src/GraphicsDrawer.cpp
 +++ b/GLideN64/src/GraphicsDrawer.cpp
 @@ -1,3 +1,8 @@
@@ -746,6 +794,15 @@ index a2fb0af..c7cce35 100644
  #include <algorithm>
  #include <string>
  #include <thread>
+@@ -83,7 +88,7 @@ void GraphicsDrawer::addTriangle(u32 _v0, u32 _v1, u32 _v2)
+ 	if (gDP.otherMode.depthSource == G_ZS_PRIM) {
+ 		for (u32 i = firstIndex; i < triangles.num; ++i) {
+ 			SPVertex & vtx = triangles.vertices[triangles.elements[i]];
+-			vtx.z = gDP.primDepth.z * vtx.w;
++			vtx.z = gSPPrimDepthZ() * vtx.w;
+ 		}
+ 	}
+ }
 @@ -642,6 +647,7 @@ void GraphicsDrawer::_updateTextures() const
  
  void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
@@ -763,24 +820,64 @@ index a2fb0af..c7cce35 100644
  	} else if (m_depthCopyMode != BgDepthCopyMode::eCopyDone &&
  		isCurrentColorImageDepthImage() &&
  		config.generalEmulation.enableFragmentDepthWrite != 0 &&
-@@ -846,33 +852,113 @@ bool GraphicsDrawer::_canDraw() const
+@@ -819,6 +825,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
+ 
+ void GraphicsDrawer::_prepareDrawTriangle(DrawingState _drawingState)
+ {
++	CTR64_PROF(43);
+ 	m_texrectDrawer.draw();
+ 
+ 	if ((m_modifyVertices & MODIFY_XY) != 0)
+@@ -846,33 +853,145 @@ bool GraphicsDrawer::_canDraw() const
  	return config.frameBufferEmulation.enable == 0 || frameBufferList().getCurrent() != nullptr;
  }
  
 +#ifdef __3DS__
 +bool g_ctr64TrianglesStashed = false;
 +
++/* an 88-byte SPVertex in three load/store-multiple pairs: memcpy (what the compiler calls for
++ * it) costs a call and alignment checks per vertex */
++static inline void ctr64_copy_spvertex(SPVertex *d, const SPVertex *s)
++{
++	static_assert(sizeof(SPVertex) == 88, "SPVertex size");
++	u32 *dp = reinterpret_cast<u32 *>(d);
++	const u32 *sp = reinterpret_cast<const u32 *>(s);
++	asm volatile(
++		"ldmia %1!, {r2-r9}\n\t"
++		"stmia %0!, {r2-r9}\n\t"
++		"ldmia %1!, {r2-r9}\n\t"
++		"stmia %0!, {r2-r9}\n\t"
++		"ldmia %1!, {r2-r7}\n\t"
++		"stmia %0!, {r2-r7}\n\t"
++		: "+r"(dp), "+r"(sp)
++		:
++		: "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "memory");
++}
++
 +bool GraphicsDrawer::stashTriangles()
 +{
++	CTR64_PROF(41);
 +	if (triangles.num == 0)
 +		return true;
 +	const size_t nv = triangles.maxElement + 1;
-+	if (m_stashVertices.size() + nv > 1024 || m_stashElements.size() + triangles.num > 3072)
++	if (m_stashCount + nv > 1024 || m_stashElements.size() + triangles.num > 3072)
 +		return false;
-+	const u16 base = static_cast<u16>(m_stashVertices.size());
-+	m_stashVertices.insert(m_stashVertices.end(), triangles.vertices.begin(), triangles.vertices.begin() + nv);
-+	for (u32 i = 0; i < triangles.num; ++i)
-+		m_stashElements.push_back(static_cast<u16>(triangles.elements[i] + base));
++	/* only the vertices the triangles use (the vertex buffer is often much larger than a batch) */
++	static u32 gen, seen[VERTBUFF_SIZE];
++	static u16 at[VERTBUFF_SIZE];
++	if (++gen == 0) {
++		memset(seen, 0, sizeof(seen));
++		gen = 1;
++	}
++	for (u32 i = 0; i < triangles.num; ++i) {
++		const u32 e = triangles.elements[i];
++		if (seen[e] != gen) {
++			seen[e] = gen;
++			at[e] = static_cast<u16>(m_stashCount);
++			ctr64_copy_spvertex(&m_stashVertices[m_stashCount++], &triangles.vertices[e]);
++		}
++		m_stashElements.push_back(at[e]);
++	}
 +	triangles.num = 0;
 +	triangles.maxElement = 0;
 +	g_ctr64TrianglesStashed = true;
@@ -810,13 +907,13 @@ index a2fb0af..c7cce35 100644
 +		triVertices = m_stashVertices.data();
 +		triElements = m_stashElements.data();
 +		triNum = static_cast<u32>(m_stashElements.size());
-+		triMaxElement = static_cast<u32>(m_stashVertices.size()) - 1;
++		triMaxElement = m_stashCount - 1;
 +	}
 +	g_ctr64TrianglesStashed = false;
 +	if (triNum == 0 || !_canDraw()) {
 +		triangles.num = 0;
 +		triangles.maxElement = 0;
-+		m_stashVertices.clear();
++		m_stashCount = 0;
 +		m_stashElements.clear();
 +		return;
 +	}
@@ -849,7 +946,7 @@ index a2fb0af..c7cce35 100644
 +		frameBufferList().setBufferChanged(gDP.scissor.lry);
 +		triangles.num = 0;
 +		triangles.maxElement = 0;
-+		m_stashVertices.clear();
++		m_stashCount = 0;
 +		m_stashElements.clear();
 +		dropRenderState();
 +		return;
@@ -883,7 +980,7 @@ index a2fb0af..c7cce35 100644
  		}
  		frameBufferList().setBufferChanged(maxY);
  		if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender &&
-@@ -882,11 +968,22 @@ void GraphicsDrawer::drawTriangles()
+@@ -882,11 +1001,22 @@ void GraphicsDrawer::drawTriangles()
  				pCurrentDepthBuffer->setDirty();
  		}
  	} else {
@@ -900,13 +997,13 @@ index a2fb0af..c7cce35 100644
  	triangles.num = 0;
  	triangles.maxElement = 0;
 +#ifdef __3DS__
-+	m_stashVertices.clear();
++	m_stashCount = 0;
 +	m_stashElements.clear();
 +#endif
  	dropRenderState();
  }
  
-@@ -977,6 +1074,11 @@ void GraphicsDrawer::drawDMATriangles(u32 _numVtx)
+@@ -977,6 +1107,11 @@ void GraphicsDrawer::drawDMATriangles(u32 _numVtx)
  				pCurrentDepthBuffer->setDirty();
  		}
  	} else {
@@ -918,7 +1015,7 @@ index a2fb0af..c7cce35 100644
  		gfxContext.drawTriangles(triParams);
  	}
  	dropRenderState();
-@@ -1108,6 +1210,7 @@ void GraphicsDrawer::drawLine(u32 _v0, u32 _v1, float _width, u32 _flag)
+@@ -1108,6 +1243,7 @@ void GraphicsDrawer::drawLine(u32 _v0, u32 _v1, float _width, u32 _flag)
  
  void GraphicsDrawer::drawRect(int _ulx, int _uly, int _lrx, int _lry)
  {
@@ -926,7 +1023,16 @@ index a2fb0af..c7cce35 100644
  	m_texrectDrawer.draw();
  	m_statistics.fillRects++;
  
-@@ -1321,6 +1424,7 @@ static bool(*texturedRectSpecial)(const GraphicsDrawer::TexturedRectParams & _pa
+@@ -1125,7 +1261,7 @@ void GraphicsDrawer::drawRect(int _ulx, int _uly, int _lrx, int _lry)
+ 
+ 	gfxContext.enable(enable::CULL_FACE, false);
+ 
+-	const float Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : 0.0f;
++	const float Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : 0.0f;
+ 	const float W = 1.0f;
+ 	m_rect[0].x = static_cast<f32>(_ulx);
+ 	m_rect[0].y = static_cast<f32>(_uly);
+@@ -1321,6 +1457,7 @@ static bool(*texturedRectSpecial)(const GraphicsDrawer::TexturedRectParams & _pa
  
  void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  {
@@ -934,7 +1040,16 @@ index a2fb0af..c7cce35 100644
  	gSP.changed &= ~CHANGED_GEOMETRYMODE; // Don't update cull mode
  	m_drawingState = DrawingState::TexRect;
  	m_statistics.texRects++;
-@@ -1514,6 +1618,15 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
+@@ -1369,7 +1506,7 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
+ 		&& (cache.current[0] != nullptr)
+ 		//		&& (cache.current[0] == nullptr || cache.current[0]->format == G_IM_FMT_RGBA || cache.current[0]->format == G_IM_FMT_CI)
+ 		&& !bUseFbTexture && !bUseHdTexture);
+-	const float Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : 0.0f;
++	const float Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : 0.0f;
+ 	const float W = 1.0f;
+ 	const f32 ulx = _params.ulx;
+ 	const f32 uly = _params.uly;
+@@ -1514,6 +1651,15 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  	m_rect[3].bc1 = 1.0f;
  
  
@@ -951,7 +1066,7 @@ index a2fb0af..c7cce35 100644
  		if (m_bBGMode) {
  			m_texrectDrawer.addBackgroundRect();
 diff --git a/GLideN64/src/GraphicsDrawer.h b/GLideN64/src/GraphicsDrawer.h
-index 466620d..9c17e3a 100644
+index 466620d..c143f77 100644
 --- a/GLideN64/src/GraphicsDrawer.h
 +++ b/GLideN64/src/GraphicsDrawer.h
 @@ -18,6 +18,9 @@ struct CachedTexture;
@@ -975,12 +1090,13 @@ index 466620d..9c17e3a 100644
  
  	void drawScreenSpaceTriangle(u32 _numVtx, graphics::DrawModeParam _mode = graphics::drawmode::TRIANGLE_STRIP);
  
-@@ -226,6 +233,10 @@ private:
+@@ -226,6 +233,11 @@ private:
  		u32 num = 0;
  		u32 maxElement = 0;
  	} triangles;
 +#ifdef __3DS__
-+	std::vector<SPVertex> m_stashVertices;
++	std::array<SPVertex, 1024> m_stashVertices; /* the first m_stashCount are used */
++	u32 m_stashCount = 0;
 +	std::vector<u16> m_stashElements;
 +#endif
  
@@ -1077,7 +1193,7 @@ index d9c5801..76ccd88 100644
  	s32 count;
  	bool busy, halt, infloop;
 diff --git a/GLideN64/src/SoftwareRender.cpp b/GLideN64/src/SoftwareRender.cpp
-index ae6ada6..491de15 100644
+index ae6ada6..392fc29 100644
 --- a/GLideN64/src/SoftwareRender.cpp
 +++ b/GLideN64/src/SoftwareRender.cpp
 @@ -1,3 +1,4 @@
@@ -1164,21 +1280,30 @@ index ae6ada6..491de15 100644
  	if (gDP.scissor.ulx > gDP.scissor.lrx || gDP.scissor.uly > gDP.scissor.lry)
  		return 0.0f;
  
-@@ -362,7 +428,13 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
+@@ -362,7 +428,22 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
  		return 0.0f;
  
  	f32 maxY = 0.0f;
 +#ifdef __3DS__
-+	/* ctr64: one buffer reused by every draw (one graphics thread), not a heap block per draw */
++	Ctr64ProfScope swclip_scope(40); /* the CPU part: clipping, culling, vertex copies */
++	/* ctr64: indexed output without copies: unclipped triangles refer to the input vertices in
++	 * place (index < nIn), clipped ones to the vertices they make, kept in vResult (index nIn + k);
++	 * the backend converts only the vertices referred to, once each (SPVertex is 88 bytes: copying
++	 * them was most of this function's time). One buffer reused by every draw (one graphics
++	 * thread). bc0/bc1 are not used by the PICA backend. */
 +	static std::vector<SPVertex> vResult;
++	static std::vector<u16> iResult;
++	static std::vector<vertexclip> vclipBuf;
 +	vResult.clear();
++	iResult.clear();
++	u32 nIn = 0;
 +#else
  	std::vector<SPVertex> vResult;
 +#endif
  	vResult.reserve(_numElements * 3);
  
  	//Current depth buffer can be null if we are loading from a save state
-@@ -384,12 +456,32 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
+@@ -384,21 +465,60 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
  		Rasterize(vdraw, 3, dzdx);
  	};
  
@@ -1192,6 +1317,7 @@ index ae6ada6..491de15 100644
 +				n = std::max<u32>(n, _pElements[i] + 1u);
 +		}
 +		g_screenCache.begin(n);
++		nIn = n;
 +	}
 +#endif
  	for (u32 i = 0; i < _numElements; i += 3) {
@@ -1211,7 +1337,20 @@ index ae6ada6..491de15 100644
  			orbits |= vsrc[j]->clip;
  			modify |= vsrc[j]->modify & (MODIFY_XY | MODIFY_Z);
  		}
-@@ -398,7 +490,13 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
++#ifdef __3DS__
++		/* ctr64: a triangle wholly beyond the far plane is not drawn (the N64 microcode rejects
++		 * triangles outside one clip plane; PC GL clips it). With the z buffer off the backend
++		 * clamps depth instead of clipping, which pulled such triangles onto the far plane:
++		 * Pilotwings 64 drew far sea tiles above its horizon. */
++		if ((modify & MODIFY_Z) == 0 && vsrc[0]->z > vsrc[0]->w && vsrc[1]->z > vsrc[1]->w &&
++			vsrc[2]->z > vsrc[2]->w && vsrc[0]->w > 0.0f && vsrc[1]->w > 0.0f && vsrc[2]->w > 0.0f) {
++			_statistics.drawnTris--;
++			_statistics.culledTris++;
++			continue;
++		}
++#endif
+ 
+ 		if (orbits == 0) {
  			// No clipping is necessary.
  			vertexclip vclip[3];
  			bool clockwise = true;
@@ -1225,8 +1364,87 @@ index ae6ada6..491de15 100644
  				// Culled
  				_statistics.drawnTris--;
  				_statistics.culledTris++;
+@@ -406,12 +526,17 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
+ 			}
+ 
+ 			// Copy vertices to result
++#ifdef __3DS__
++			for (u32 k = 0; k < 3; ++k)
++				iResult.push_back(static_cast<u16>(vidx[k]));
++#else
+ 			for (u32 k = 0; k < 3; ++k) {
+ 				vResult.push_back(*vsrc[k]);
+ 				SPVertex& v = vResult.back();
+ 				v.bc0 = (k % 3 == 0) ? 1.0f : 0.0f;
+ 				v.bc1 = (k % 3 == 1) ? 1.0f : 0.0f;
+ 			}
++#endif
+ 
+ 			if (needResterise)
+ 				rasterise(vclip, clockwise);
+@@ -438,7 +563,12 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
+ 				continue;
+ 			}
+ 
++#ifdef __3DS__
++			std::vector<vertexclip> &vclip = vclipBuf;
++			vclip.resize(numVertex);
++#else
+ 			std::vector<vertexclip> vclip(numVertex);
++#endif
+ 			const bool cull = ((orbits & CLIP_W) == 0);
+ 			bool clockwise = true;
+ 			if (!calcScreenCoordinates(vResult.data() + prevNumVtx, vclip.data(), numVertex, cull, clockwise)) {
+@@ -448,6 +578,10 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
+ 				continue;
+ 			}
+ 
++#ifdef __3DS__
++			for (size_t l = 0; l < numVertex; ++l)
++				iResult.push_back(static_cast<u16>(nIn + prevNumVtx + l));
++#endif
+ 			if (needResterise) {
+ 				for (size_t l = 0; l < numVertex; l += 3)
+ 					rasterise(vclip.data() + l, clockwise);
+@@ -458,6 +592,24 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
+ 		}
+ 	}
+ 
++#ifdef __3DS__
++	swclip_scope.end();
++	if (!iResult.empty()) {
++		graphics::Context::DrawTriangleParameters triParams;
++		triParams.mode = graphics::drawmode::TRIANGLES;
++		triParams.flatColors = _flatColors;
++		triParams.combiner = currentCombiner();
++		triParams.verticesCount = nIn + static_cast<u32>(vResult.size());
++		triParams.vertices = const_cast<SPVertex *>(_pVertices);
++		triParams.vertices2 = vResult.data();
++		triParams.verticesBase = nIn;
++		triParams.elementsType = graphics::datatype::UNSIGNED_SHORT;
++		triParams.elementsCount = static_cast<u32>(iResult.size());
++		triParams.elements = iResult.data();
++		gfxContext.drawTriangles(triParams);
++	}
++	return maxY;
++#endif
+ 	if (!vResult.empty()) {
+ 		vResult[0].HWLight = _pVertices[0].HWLight;
+ 		graphics::Context::DrawTriangleParameters triParams;
+@@ -466,6 +618,11 @@ f32 renderAndDrawTriangles(const SPVertex *_pVertices,
+ 		triParams.combiner = currentCombiner();
+ 		triParams.verticesCount = static_cast<u32>(vResult.size());
+ 		triParams.vertices = vResult.data();
++#ifdef __3DS__
++		triParams.elementsType = graphics::datatype::UNSIGNED_SHORT;
++		triParams.elementsCount = static_cast<u32>(iResult.size());
++		triParams.elements = iResult.data();
++#endif
+ 		gfxContext.drawTriangles(triParams);
+ 	}
+ 
 diff --git a/GLideN64/src/TexrectDrawer.cpp b/GLideN64/src/TexrectDrawer.cpp
-index a7afe6b..f613dd0 100644
+index a7afe6b..b0715a8 100644
 --- a/GLideN64/src/TexrectDrawer.cpp
 +++ b/GLideN64/src/TexrectDrawer.cpp
 @@ -49,8 +49,18 @@ void TexrectDrawer::init()
@@ -1268,6 +1486,24 @@ index a7afe6b..f613dd0 100644
  bool TexrectDrawer::addRect()
  {
  	DisplayWindow & wnd = dwnd();
+@@ -226,7 +249,7 @@ bool TexrectDrawer::addRect()
+ 		m_pBuffer = frameBufferList().getCurrent();
+ 		m_otherMode = gDP.otherMode._u64;
+ 		m_mux = gDP.combine.mux;
+-		m_Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : 0.0f;
++		m_Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : 0.0f;
+ 		m_scissor = gDP.scissor;
+ 
+ 		m_ulx = pRect[0].x;
+@@ -299,7 +322,7 @@ void TexrectDrawer::addBackgroundRect()
+ 		m_pBuffer = frameBufferList().getCurrent();
+ 		m_otherMode = gDP.otherMode._u64;
+ 		m_mux = gDP.combine.mux;
+-		m_Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : gSP.viewport.nearz;
++		m_Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : gSP.viewport.nearz;
+ 		m_scissor = gDP.scissor;
+ 
+ 		m_ulx = pRect[0].x;
 @@ -451,7 +474,7 @@ bool TexrectDrawer::draw()
  	rect[3].x = lrx;
  
@@ -1615,6 +1851,30 @@ index 9a2b8ab..338a90a 100644
  
  private:
  	TextureCache()
+diff --git a/GLideN64/src/VI.cpp b/GLideN64/src/VI.cpp
+index cc9f988..49c754a 100644
+--- a/GLideN64/src/VI.cpp
++++ b/GLideN64/src/VI.cpp
+@@ -263,6 +263,19 @@ void VI_UpdateScreen()
+ 
+ 	checkHotkeys();
+ 
++#ifdef __3DS__
++	/* a hi-res (640-wide) frame buffer cannot be 2x on the PICA (1024 max): the game continues
++	 * at native size; all buffers are rebuilt so no 2x buffer is mixed with native ones */
++	extern bool ctr64_aa_too_wide;
++	if (ctr64_aa_too_wide && config.frameBufferEmulation.nativeResFactor > 1) {
++		config.frameBufferEmulation.nativeResFactor = 1;
++		frameBufferList().destroy();
++		frameBufferList().init();
++		depthBufferList().destroy();
++		depthBufferList().init();
++	}
++#endif
++
+ 	bool bVIUpdated = false;
+ 	if (*REG.VI_ORIGIN != VI.lastOrigin) {
+ 		VI_UpdateSize();
 diff --git a/GLideN64/src/convert.cpp b/GLideN64/src/convert.cpp
 index 137c33d..9294bbb 100644
 --- a/GLideN64/src/convert.cpp
@@ -1951,7 +2211,7 @@ index adf9d4a..636f110 100644
  		dsdx /= 4.0f;
  		lrx += 1.0f;
 diff --git a/GLideN64/src/gSP.cpp b/GLideN64/src/gSP.cpp
-index d6662d9..4e05421 100644
+index d6662d9..9e2166a 100644
 --- a/GLideN64/src/gSP.cpp
 +++ b/GLideN64/src/gSP.cpp
 @@ -1,3 +1,4 @@
@@ -2064,10 +2324,109 @@ index d6662d9..4e05421 100644
  		}
  	}
  }
+@@ -2065,7 +2102,7 @@ void gSPSprite2DBase(u32 _base)
+ 	gSPTexture( 1.0f, 1.0f, 0, 0, TRUE );
+ 	gDP.otherMode.texturePersp = 1;
+ 
+-	const f32 z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : gSP.viewport.nearz;
++	const f32 z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : gSP.viewport.nearz;
+ 	const f32 w = 1.0f;
+ 
+ 	f32 scaleX = 1.0f, scaleY = 1.0f;
+diff --git a/GLideN64/src/gSP.h b/GLideN64/src/gSP.h
+index 84e50b2..61b2b08 100644
+--- a/GLideN64/src/gSP.h
++++ b/GLideN64/src/gSP.h
+@@ -150,6 +150,23 @@ struct gSPInfo
+ 
+ extern gSPInfo gSP;
+ 
++/* The prim depth (gDPSetPrimDepth: an N64 screen z) as the clip-space z of a vertex with w = 1.
++ * ctr64: through the inverse of the viewport's z transform, as triangle depths are; GLideN64 used
++ * the screen value as clip z, which for the usual viewport puts prim-depth geometry further away
++ * (screen z 0.9 -> clip 0.9 instead of 0.8): Conker's title logo sank behind the carpet drawn before
++ * it (Angrylion and GLideN64 with N64 depth compare show it whole). */
++inline f32 gSPPrimDepthZ()
++{
++#ifdef __3DS__
++	const f32 s = gSP.viewport.vscale[2];
++	if (s > 0.0f) {
++		const f32 z = (gDP.primDepth.z - gSP.viewport.vtrans[2]) / s;
++		return z < -1.0f ? -1.0f : (z > 1.0f ? 1.0f : z);
++	}
++#endif
++	return gDP.primDepth.z;
++}
++
+ void gSPLoadUcodeEx( u32 uc_start, u32 uc_dstart, u16 uc_dsize );
+ void gSPNoOp();
+ void gSPMatrix( u32 matrix, u8 param );
+diff --git a/GLideN64/src/uCodes/F5Indi_Naboo.cpp b/GLideN64/src/uCodes/F5Indi_Naboo.cpp
+index b661ea9..3aefc08 100644
+--- a/GLideN64/src/uCodes/F5Indi_Naboo.cpp
++++ b/GLideN64/src/uCodes/F5Indi_Naboo.cpp
+@@ -721,7 +721,7 @@ bool F5INDI_AddVertices(const u32 _vert[3], GraphicsDrawer & _drawer)
+ 		}
+ 
+ 		if (gDP.otherMode.depthSource == G_ZS_PRIM)
+-			vtx.z = gDP.primDepth.z * vtx.w;
++			vtx.z = gSPPrimDepthZ() * vtx.w;
+ 
+ 		_drawer.getCurrentDMAVertex() = vtx;
+ 	}
+@@ -1011,7 +1011,7 @@ u32 F5INDI_TexrectGenVertexMask(u32 _mask, u32 _limAddr, u32 _vtxAddr)
+ static
+ void F5INDI_AddParticle(f32 _ulx, f32 _uly, f32 _lrx, f32 _lry, s16 _s0, s16 _t0, f32 _dsdx, f32 _dtdy)
+ {
+-	const f32 Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : 0.0f;
++	const f32 Z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : 0.0f;
+ 	const f32 W = 1.0f;
+ 
+ 	const f32 offsetX = (_lrx - _ulx) * _dsdx;
+diff --git a/GLideN64/src/uCodes/F5Rogue.cpp b/GLideN64/src/uCodes/F5Rogue.cpp
+index 3648c05..562c161 100644
+--- a/GLideN64/src/uCodes/F5Rogue.cpp
++++ b/GLideN64/src/uCodes/F5Rogue.cpp
+@@ -1061,7 +1061,7 @@ void _addVertices(const u32 _vert[3], GraphicsDrawer & _drawer)
+ 		}
+ 
+ 		if (gDP.otherMode.depthSource == G_ZS_PRIM)
+-			vtx.z = gDP.primDepth.z * vtx.w;
++			vtx.z = gSPPrimDepthZ() * vtx.w;
+ 
+ 		_drawer.getCurrentDMAVertex() = vtx;
+ 	}
 diff --git a/GLideN64/src/uCodes/S2DEX.cpp b/GLideN64/src/uCodes/S2DEX.cpp
-index 013f13d..114c26a 100644
+index 013f13d..487a7b0 100644
 --- a/GLideN64/src/uCodes/S2DEX.cpp
 +++ b/GLideN64/src/uCodes/S2DEX.cpp
+@@ -455,7 +455,7 @@ struct ObjCoordinates
+ 		if ((_pObjSprite->imageFlags & G_BG_FLAG_FLIPT) != 0)
+ 			std::swap(ult, lrt);
+ 
+-		z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : gSP.viewport.nearz;
++		z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : gSP.viewport.nearz;
+ 		w = 1.0f;
+ 	}
+ 
+@@ -543,7 +543,7 @@ struct ObjCoordinates
+ 			std::swap(ulx, lrx);
+ 		}
+ 
+-		z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : gSP.viewport.nearz;
++		z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : gSP.viewport.nearz;
+ 		w = 1.0f;
+ 	}
+ };
+@@ -774,7 +774,7 @@ void gSPObjSprite(u32 _sp)
+ 	if (pObjSprite->imageFlags & G_BG_FLAG_FLIPT)
+ 		std::swap(ult, lrt);
+ 
+-	const float z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gDP.primDepth.z : gSP.viewport.nearz;
++	const float z = (gDP.otherMode.depthSource == G_ZS_PRIM) ? gSPPrimDepthZ() : gSP.viewport.nearz;
+ 
+ 	GraphicsDrawer & drawer = dwnd().getDrawer();
+ 	drawer.setDMAVerticesSize(4);
 @@ -866,7 +866,7 @@ void _loadBGImage(const uObjScaleBg * _pBgInfo, bool _loadScale, bool _fbImage)
  		gDP.tiles[0].frameBufferAddress = pBuffer->m_startAddress;
  		gDP.tiles[0].textureMode = TEXTUREMODE_FRAMEBUFFER_BG;
@@ -2077,6 +2436,21 @@ index 013f13d..114c26a 100644
  
  		if ((config.generalEmulation.hacks & hack_ZeldaMM) != 0) {
  			if (gDP.colorImage.address == gDP.depthImageAddress)
+diff --git a/custom/GLideN64/GLideN64.custom.ini.h b/custom/GLideN64/GLideN64.custom.ini.h
+index bc377cf..1d16d1e 100644
+--- a/custom/GLideN64/GLideN64.custom.ini.h
++++ b/custom/GLideN64/GLideN64.custom.ini.h
+@@ -244,6 +244,10 @@ char customini[] =
+ "Good_Name=Jikkyou J.League Perfect Striker (J)\n"
+ "frameBufferEmulation\\N64DepthCompare=1\n"
+ "\n"
++"[PILOT%20WINGS64]\n"
++"Good_Name=Pilotwings 64 (E)(J)(U)\n"
++"frameBufferEmulation\\copyToRDRAM=2\n"
++"\n"
+ "[POKEMON%20SNAP]\n"
+ "Good_Name=Pokemon Snap (U)\n"
+ "generalEmulation\\rdramImageDitheringMode=1\n"
 diff --git a/custom/GLideN64/mupenplus/CommonAPIImpl_mupenplus.cpp b/custom/GLideN64/mupenplus/CommonAPIImpl_mupenplus.cpp
 index 8e3d81e..5631e74 100644
 --- a/custom/GLideN64/mupenplus/CommonAPIImpl_mupenplus.cpp
@@ -2093,7 +2467,7 @@ index 8e3d81e..5631e74 100644
  
  #ifdef ANDROID
 diff --git a/custom/GLideN64/mupenplus/Config_mupenplus.cpp b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
-index fb51f34..d835186 100644
+index fb51f34..575dc55 100644
 --- a/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 +++ b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 @@ -19,6 +19,16 @@ extern "C" {
@@ -2127,7 +2501,17 @@ index fb51f34..d835186 100644
  
  #ifdef HAVE_OPENGLES2
  	config.generalEmulation.enableFragmentDepthWrite = 0;
-@@ -230,5 +246,55 @@ extern "C" void Config_LoadConfig()
+@@ -220,6 +236,9 @@ extern "C" void Config_LoadConfig()
+ 	config.textureFilter.txHiresTextureFileStorage = EnableEnhancedHighResStorage;
+ 	config.textureFilter.txHiresVramLimit = MaxHiResTxVramLimit;
+ 	config.frameBufferEmulation.nativeResFactor = EnableNativeResFactor;
++#ifdef __3DS__
++	{ extern bool ctr64_aa_too_wide; ctr64_aa_too_wide = false; } /* FrameBuffer.cpp */
++#endif
+ 
+ 	config.generalEmulation.hacks = hacks;
+ 
+@@ -230,5 +249,55 @@ extern "C" void Config_LoadConfig()
  		LoadCustomSettings(false);
  	}
  
@@ -2418,7 +2802,7 @@ index 6625d19..a4989e6 100644
              }
          }
 diff --git a/mupen64plus-core/src/device/memory/memory.h b/mupen64plus-core/src/device/memory/memory.h
-index 6115ed7..6de3ad5 100644
+index 6115ed7..8164409 100644
 --- a/mupen64plus-core/src/device/memory/memory.h
 +++ b/mupen64plus-core/src/device/memory/memory.h
 @@ -98,6 +98,36 @@ void apply_mem_mapping(struct memory* mem, const struct mem_mapping* mapping);
@@ -2433,7 +2817,7 @@ index 6115ed7..6de3ad5 100644
 + * ctr64_rs_active, only the first 64 KB page is at the ROM pointer; every other byte is read
 + * through ctr64_rs_ptr. */
 +#define CTR64_RS_SHIFT 16
-+#define CTR64_RS_PAGES 1024 /* 64 MB */
++#define CTR64_RS_PAGES 4032 /* 252 MB: the cartridge address range (ROM hacks over 64 MB) */
 +extern int ctr64_rs_active;
 +extern uint8_t* ctr64_rs_map[];
 +extern uint32_t ctr64_rs_stamp[];

@@ -28,6 +28,7 @@
 #include <time.h>
 
 #include "prof.h"
+#include "bench.h"
 
 int ctr64_profiler;
 unsigned long long ctr64_prof_sleep_ticks, ctr64_prof_rbidle_ticks, ctr64_prof_audio_wait_ticks;
@@ -45,6 +46,12 @@ static Thread g_thread;
 static volatile bool g_quit;
 static LightEvent g_wake;
 static bool g_stats_only; /* prof_stats_begin: stats.log, no per-VI lines */
+/* Detailed profiler: screenshots of the top screen, "<profile name> vi<N>.tga" */
+static char g_shot_prefix[256];
+static u8 *g_shot;              /* BGR, top-down rows, SHOT_W x SHOT_H */
+static volatile unsigned g_shot_vi; /* nonzero: g_shot waits to be written */
+#define SHOT_W 400
+#define SHOT_H 240
 
 /* ---- the writer ---------------------------------------------------------------------------- */
 
@@ -87,14 +94,55 @@ static void write_out(void)
     fflush(g_file);
 }
 
+static void write_shot(void)
+{
+    const unsigned vi = g_shot_vi;
+    if (!vi || !g_shot)
+        return;
+    char path[300];
+    snprintf(path, sizeof(path), "%s vi%u.tga", g_shot_prefix, vi);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        const u8 hdr[18] = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, SHOT_W & 0xFF, SHOT_W >> 8, SHOT_H & 0xFF, SHOT_H >> 8, 24, 0x20}; /* top-down */
+        fwrite(hdr, 1, sizeof(hdr), f);
+        fwrite(g_shot, 1, SHOT_W * SHOT_H * 3, f);
+        fclose(f);
+    }
+    g_shot_vi = 0;
+}
+
 static void writer(void *arg)
 {
     (void)arg;
     while (!g_quit) {
         LightEvent_WaitTimeout(&g_wake, 500000000LL);
         write_out();
+        write_shot();
     }
     write_out();
+    write_shot();
+}
+
+bool prof_shot_ready(void)
+{
+    return g_shot && !g_shot_vi && !g_quit;
+}
+
+/* rgba: the image's top row of the untiled window texture (PICA RGBA8: bytes A,B,G,R), rows
+ * top-down `pitch` texels apart; copied, then written by the writer thread */
+void prof_shot(unsigned vi, const u8 *rgba, unsigned pitch)
+{
+    if (!prof_shot_ready() || !vi)
+        return;
+    for (unsigned y = 0; y < SHOT_H; y++) {
+        const u8 *s = rgba + (size_t)y * pitch * 4;
+        u8 *d = g_shot + (size_t)y * SHOT_W * 3;
+        for (unsigned x = 0; x < SHOT_W; x++, s += 4, d += 3) {
+            d[0] = s[1]; d[1] = s[2]; d[2] = s[3];
+        }
+    }
+    g_shot_vi = vi;
+    LightEvent_Signal(&g_wake);
 }
 
 static int stats_write(void *cookie, const char *buf, size_t n)
@@ -205,6 +253,13 @@ bool prof_begin(const char *rom_path)
     copy_file("settings.txt", "sdmc:/3ds/ctr64/settings.txt");
     copy_file("core.log", "sdmc:/3ds/ctr64/core.log");
     fflush(g_file);
+    if (ctr64_profiler >= 2) {
+        /* calibration benchmark (bench.c) and screenshots next to the profile */
+        bench_run(g_file);
+        snprintf(g_shot_prefix, sizeof(g_shot_prefix), "%.*s", (int)(strlen(path) - 5), path);
+        g_shot = malloc(SHOT_W * SHOT_H * 3);
+        g_shot_vi = 0;
+    }
 
     start_writer();
     g_stats_stream = fwopen(NULL, stats_write);
@@ -247,6 +302,9 @@ void prof_end(void)
     free(g_buf[0]);
     free(g_buf[1]);
     g_buf[0] = g_buf[1] = NULL;
+    free(g_shot);
+    g_shot = NULL;
+    g_shot_vi = 0;
 }
 
 /* ---- per VI -------------------------------------------------------------------------------- */
@@ -357,13 +415,13 @@ void prof_vi_end(unsigned vi, bool behind)
     {
         /* where the video thread's time went in a slow VI: "s <vi> <scope> <us> ..." (scopes over
          * 0.5 ms; nested scopes overlap: texrect > texupd > texload > texconv ...) */
-        extern unsigned long long ctr64_prof_total[40];
-        extern const char *const ctr64_prof_names[40];
-        static unsigned long long scope0[40];
+        extern unsigned long long ctr64_prof_total[48];
+        extern const char *const ctr64_prof_names[48];
+        static unsigned long long scope0[48];
         if (wall > SYSCLOCK_ARM11 / 40) { /* > 25 ms */
             char line[512];
             int n = snprintf(line, sizeof(line), "s %u", vi);
-            for (int i = 0; i < 40 && n < (int)sizeof(line) - 24; i++) {
+            for (int i = 0; i < 48 && n < (int)sizeof(line) - 24; i++) {
                 const unsigned long long t = ctr64_prof_total[i] - scope0[i];
                 if (t > SYSCLOCK_ARM11 / 2000)
                     n += snprintf(line + n, sizeof(line) - n, " %s %u", ctr64_prof_names[i], us(t));

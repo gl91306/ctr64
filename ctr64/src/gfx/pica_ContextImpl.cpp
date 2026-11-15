@@ -55,6 +55,9 @@ extern "C" {
 }
 #include "ctru_abi.h"
 #include "Ctr64Prof.h"
+extern "C" {
+#include "prof.h"
+}
 #undef u8
 #undef u16
 #undef u32
@@ -1035,9 +1038,22 @@ public:
 private:
     Tex *tex(u32 id)
     {
+        /* a few lookups per draw, mostly of the same ids: the last two found are kept (map nodes
+         * do not move; m_tex.erase/clear forget them) */
+        if (id == m_texHit[0].id && id)
+            return m_texHit[0].t;
+        if (id == m_texHit[1].id && id)
+            return m_texHit[1].t;
         auto it = m_tex.find(id);
-        return it == m_tex.end() ? nullptr : &it->second;
+        if (it == m_tex.end())
+            return nullptr;
+        m_texHit[1] = m_texHit[0];
+        m_texHit[0] = TexHit{id, &it->second};
+        return &it->second;
     }
+    struct TexHit { u32 id; Tex *t; };
+    TexHit m_texHit[2] = {{0, nullptr}, {0, nullptr}};
+    void forgetTexHits() { m_texHit[0] = m_texHit[1] = TexHit{0, nullptr}; }
     Fbo &drawFbo() { return m_drawFbo == 0 ? m_window : m_fbo[m_drawFbo]; }
     void allocStorage(Tex &t, bool vram, bool reuse = false, bool zero = true);
     void moveToVram(u32 id, bool copy = true);
@@ -1053,6 +1069,10 @@ private:
     bool stagedUpdate(Tex &t, const u32 *px, u32 x0, u32 y0, u32 w, u32 h);
     void rebuildFbo(Fbo &f);
     bool applyState(bool depth_allowed);
+    /* drawTriangles: the render mode (othermode low word) of triangles drawn into the N64 Z
+     * buffer's address, and the VIs since; 0 = none (Pilotwings 64 shadow) */
+    u32 m_zPassMode = 0;
+    u32 m_zPassAge = 0;
     void bindUnit(int unit, bool n64_filter = false);
     bool setupCombiner(bool rect);
     enum { USE_DRAW, USE_COLOR_CLEARED, USE_DEPTH_ONLY }; /* how materialize's caller uses the FBO */
@@ -1061,10 +1081,10 @@ private:
     GVtx *linearizeShade(GVtx *v, u32 &n, bool fog_alpha);
     const char *stateString()
     {
-        static char b[160];
+        static char b[200];
         const Tex *t0 = tex(m_unit[0]), *t1 = tex(m_unit[1]);
-        snprintf(b, sizeof(b), "depth %d func %u write %d poff %d blend %d %u/%u fbo %u t0 %u:%ux%u%s fmt%d t1 %u:%ux%u%s",
-                 m_enDepth, m_depthFunc, m_depthWrite, m_enPolyOffset, m_enBlend, m_blend[0], m_blend[1], m_drawFbo,
+        snprintf(b, sizeof(b), "depth %d func %u write %d poff %d blend %d %u/%u fbo %u(%ux%u) t0 %u:%ux%u%s fmt%d t1 %u:%ux%u%s",
+                 m_enDepth, m_depthFunc, m_depthWrite, m_enPolyOffset, m_enBlend, m_blend[0], m_blend[1], m_drawFbo, (unsigned)drawFbo().rt.width, (unsigned)drawFbo().rt.height,
                  m_unit[0], t0 ? t0->w : 0, t0 ? t0->h : 0, t0 && t0->data ? "" : "(null)", t0 ? (int)t0->fmt : -1,
                  m_unit[1], t1 ? t1->w : 0, t1 ? t1->h : 0, t1 && t1->data ? "" : "(null)");
         return b;
@@ -1094,6 +1114,9 @@ private:
     std::unordered_map<u32, Tex> m_tex;
     std::vector<u32> m_scratch; /* upload staging, reused (0xRRGGBBAA texels) */
     std::vector<GVtx> m_shadeScratch; /* linearizeShade() output, reused */
+    std::vector<GVtx> m_idxScratch;   /* drawTriangles: indexed vertices before the expansion */
+    std::vector<u32> m_idxUsed;       /* drawTriangles: m_idxGen = vertex referred to by this draw */
+    u32 m_idxGen = 0;
     std::unordered_map<u32, Fbo> m_fbo;
     u32 m_nextTex = 1, m_nextFbo = 1;
     Fbo m_window;
@@ -1216,6 +1239,7 @@ void ContextImplPica::destroy()
             freeNow(t.data, t.vram, storageBytes(t));
     }
     m_tex.clear();
+    forgetTexHits();
     m_fbo.clear();
     if (m_half)
         linearFree(m_half);
@@ -1322,6 +1346,7 @@ void ContextImplPica::deleteTexture(ObjectHandle name)
         return;
     releaseStorage(*t);
     m_tex.erase(id);
+    forgetTexHits();
     for (auto &u : m_unit)
         if (u == id)
             u = 0;
@@ -2353,6 +2378,10 @@ void log_draw(const char *what, const CombinerProgram *prog, int kind, const GVt
             what, kind, mux, (unsigned)gDP.otherMode.cycleType, (unsigned)n, x0, y0, x1, y1, fog_usage(),
             (unsigned)gDP.otherMode.l, state, gDP.primColor.r, gDP.primColor.g, gDP.primColor.b, gDP.primColor.a,
             gDP.envColor.r, gDP.envColor.g, gDP.envColor.b, gDP.envColor.a);
+    /* addresses: color image, depth image, and texture 0 (fb: a frame buffer texture) */
+    const CachedTexture *t0 = textureCache().current[0];
+    fprintf(f, "  ci %08x zi %08x t0 %08x fb %d\n", (unsigned)gDP.colorImage.address, (unsigned)gDP.depthImageAddress,
+            t0 ? (unsigned)t0->address : 0u, t0 ? (int)t0->frameBufferTexture : -1);
 }
 
 /* Adds a draw's screen bounding box to the area drawn this frame; once that reaches 90% of the
@@ -2589,6 +2618,7 @@ bool ContextImplPica::setupCombiner(bool rect)
     return true;
 }
 
+
 void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
 {
     DrawTimer timer;
@@ -2598,6 +2628,25 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
         return;
     {
         CTR64_PROF(32);
+        /* Triangles drawn into the game's own Z buffer (color image = depth image address).
+         * Pilotwings 64 draws the glider's shadow there (blended black: the Z values under the
+         * shadow move nearer), then the shadow mesh into the frame in the same render mode,
+         * with a depth test against that Z buffer which then fails over the ground. Without N64
+         * depth compare GLideN64 gives the Z address a separate color buffer, the Z buffer
+         * never changes, and the second pass drew a large dark shape over the ground and out to
+         * the horizon over the sea. Both passes are dropped (the second: triangles in the same
+         * depth-tested, non-writing render mode in that game frame), as the PC build shows the
+         * scene with N64 depth compare. */
+        if (config.frameBufferEmulation.N64DepthCompare == 0 && gDP.otherMode.depthCompare &&
+            !gDP.otherMode.depthUpdate) {
+            if (gDP.colorImage.address == gDP.depthImageAddress && gDP.depthImageAddress != 0) {
+                m_zPassMode = gDP.otherMode.l;
+                m_zPassAge = 0;
+                return;
+            }
+            if (m_zPassMode && gDP.otherMode.l == m_zPassMode)
+                return;
+        }
         if (!applyState(true)) {
             ctr64_gfx_stats[ST_DROP]++;
             return;
@@ -2612,11 +2661,33 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
         if (c && !c->vram) ctr64_gfx_fcram[0]++;
         if (f.rt.depth && d && !d->vram) ctr64_gfx_fcram[1]++;
     }
-    pica_reserve(4096, p.verticesCount * sizeof(GVtx) + p.elementsCount * 2 + 256);
-
-    GVtx *v = static_cast<GVtx *>(pica_frame_alloc(p.verticesCount * sizeof(GVtx), 16));
-    if (!v)
-        return;
+    /* Indexed triangle lists (renderAndDrawTriangles: each kept vertex once) are converted once
+     * per vertex into m_idxScratch, then expanded into a plain list in the pool (below), so the GPU
+     * gets the same non-indexed draws as before. */
+    const bool expand = p.elementsCount && p.elements && u32(p.elementsType) == DT_UNSIGNED_SHORT &&
+                        mode == DM_TRIANGLES;
+    GVtx *v;
+    if (expand) {
+        pica_reserve(4096, p.elementsCount * sizeof(GVtx) + 256);
+        if (m_idxScratch.size() < p.verticesCount) {
+            m_idxScratch.resize(p.verticesCount);
+            m_idxUsed.resize(p.verticesCount, 0u);
+        }
+        v = m_idxScratch.data();
+        /* only the vertices the elements refer to are converted (the others: culled triangles) */
+        if (++m_idxGen == 0) {
+            std::fill(m_idxUsed.begin(), m_idxUsed.end(), 0u);
+            m_idxGen = 1;
+        }
+        const u16 *e = static_cast<const u16 *>(p.elements);
+        for (u32 i = 0; i < p.elementsCount; i++)
+            m_idxUsed[e[i]] = m_idxGen;
+    } else {
+        pica_reserve(4096, p.verticesCount * sizeof(GVtx) + p.elementsCount * 2 + 256);
+        v = static_cast<GVtx *>(pica_frame_alloc(p.verticesCount * sizeof(GVtx), 16));
+        if (!v)
+            return;
+    }
 
     /* GLideN64 vertex shader math (VertexShaderTriangle + VertexShaderEnd), per vertex */
     const float vs0 = gSP.viewport.vscale[0], vs1 = -gSP.viewport.vscale[1];
@@ -2633,7 +2704,9 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
 
     Ctr64ProfScope vtx_scope(33);
     for (u32 i = 0; i < p.verticesCount; i++) {
-        const SPVertex &s = p.vertices[i];
+        if (expand && m_idxUsed[i] != m_idxGen)
+            continue;
+        const SPVertex &s = i < p.verticesBase ? p.vertices[i] : p.vertices2[i - p.verticesBase];
         GVtx &o = v[i];
         float x = s.x, y = s.y, z = s.z, w = s.w;
         const u32 mod = s.modify;
@@ -2682,7 +2755,21 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
 
     vtx_scope.end();
     u32 count = p.verticesCount;
-    if (!(p.elementsCount && p.elements) && mode == DM_TRIANGLES && m_kind == Kind::Combiner && m_program &&
+    const void *elements = p.elements;
+    u32 elementsCount = p.elementsCount;
+    if (expand) { /* room reserved above (no pica_reserve between: it may restart the pool) */
+        const u16 *e = static_cast<const u16 *>(elements);
+        GVtx *flat = static_cast<GVtx *>(pica_frame_alloc(elementsCount * sizeof(GVtx), 16));
+        if (!flat)
+            return;
+        for (u32 i = 0; i < elementsCount; i++)
+            flat[i] = v[e[i]];
+        v = flat;
+        count = elementsCount;
+        elements = nullptr;
+        elementsCount = 0;
+    }
+    if (!(elementsCount && elements) && mode == DM_TRIANGLES && m_kind == Kind::Combiner && m_program &&
         m_program->usesShade()) {
         CTR64_PROF(34);
         v = linearizeShade(v, count, fogUsage == 1 && config.generalEmulation.enableLegacyBlending != 0);
@@ -2696,22 +2783,22 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
 
     GPU_Primitive_t prim_type = mode == DM_TRIANGLE_STRIP ? GPU_TRIANGLE_STRIP : mode == DM_TRIANGLE_FAN ? GPU_TRIANGLE_FAN : GPU_TRIANGLES;
     u16 *idx = nullptr;
-    if (p.elementsCount && p.elements) {
-        idx = static_cast<u16 *>(pica_frame_alloc(p.elementsCount * 2, 16));
+    if (elementsCount && elements) {
+        idx = static_cast<u16 *>(pica_frame_alloc(elementsCount * 2, 16));
         if (!idx)
             return;
         if (u32(p.elementsType) == DT_UNSIGNED_BYTE) {
-            const u8 *e = static_cast<const u8 *>(p.elements);
-            for (u32 i = 0; i < p.elementsCount; i++)
+            const u8 *e = static_cast<const u8 *>(elements);
+            for (u32 i = 0; i < elementsCount; i++)
                 idx[i] = e[i];
         } else {
-            memcpy(idx, p.elements, p.elementsCount * 2);
+            memcpy(idx, elements, elementsCount * 2);
         }
     }
     if (m_enPolyOffset && m_enDepth)
-        pica_depth_map(-1.0f, poly_offset_for_draw(v, idx, idx ? p.elementsCount : count, prim_type));
+        pica_depth_map(-1.0f, poly_offset_for_draw(v, idx, idx ? elementsCount : count, prim_type));
     if (idx)
-        pica_draw_elements(prim_type, idx, p.elementsCount);
+        pica_draw_elements(prim_type, idx, elementsCount);
     else
         pica_draw_arrays(prim_type, 0, count);
 }
@@ -3060,13 +3147,32 @@ static bool dump_wanted(u32 swap)
     return false;
 }
 
-static void write_tga(const Tex &t, const char *path)
+static void write_tga(const Tex &t0, const char *path)
 {
-    if (!t.data || t.depth)
+    if (!t0.data || t0.depth)
         return;
+    /* a VRAM target goes through a GPU copy into linear memory first: Azahar does not keep its
+     * emulated VRAM up to date for CPU reads (frames dumped from VRAM came out all zero) */
+    Tex t = t0;
+    void *lin = nullptr;
+    if (t0.vram) {
+        const u32 bytes = (u32)t0.tw * t0.th * 4;
+        lin = linearAlloc(bytes);
+        if (!lin)
+            return;
+        pica_copy_from_vram(lin, t0.data, bytes);
+        pica_flush();
+        pica_wait_idle();
+        GSPGPU_InvalidateDataCache(lin, bytes);
+        t.data = lin;
+        t.vram = false;
+    }
     FILE *f = fopen(path, "wb");
-    if (!f)
+    if (!f) {
+        if (lin)
+            linearFree(lin);
         return;
+    }
     const u8 hdr[18] = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, (u8)t.w, (u8)(t.w >> 8), (u8)t.h, (u8)(t.h >> 8), 32, 8};
     fwrite(hdr, 1, sizeof(hdr), f);
     /* TGA rows are bottom-up like GL rows */
@@ -3080,6 +3186,8 @@ static void write_tga(const Tex &t, const char *path)
         fwrite(row.data(), 1, row.size(), f);
     }
     fclose(f);
+    if (lin)
+        linearFree(lin);
 }
 
 void ContextImplPica::present()
@@ -3134,6 +3242,8 @@ void ContextImplPica::endVI()
 {
     const u32 vi = ++ctr64_video_frames;
     g_swap_count = vi + 1;
+    if (m_zPassMode && ++m_zPassAge > 4) /* the second pass comes in the same game frame */
+        m_zPassMode = 0;
     Tex *c = tex(TEX_WINDOW_COLOR);
     if (dump_wanted(vi)) {
         ensureFrame();
@@ -3155,6 +3265,33 @@ void ContextImplPica::endVI()
                          (unsigned)kv.first, (unsigned)t->w, (unsigned)t->h);
                 write_tga(*t, path);
             }
+    }
+
+    /* Detailed profiler: a screenshot of the top screen every SHOT_EVERY VIs, next to the
+     * profile (prof.c writes it). The GPU untiles the window into linear memory at one VI and
+     * the copy is handed over at the next, so no VI waits for the GPU. */
+    if (ctr64_profiler >= 2) {
+        enum { SHOT_EVERY = 180 };
+        static u8 *lin;
+        static u64 fence;
+        static u32 lin_bytes;
+        if (lin) {
+            pica_wait_fence(fence); /* queued a VI ago: done by now */
+            pica_cache_invalidate(lin, lin_bytes);
+            /* tiled row 0 is the top (gl_index): the image's top row is tiled row th - h */
+            prof_shot(vi - 1, lin + (size_t)(c->th - c->h) * c->tw * 4, c->tw);
+            linearFree(lin);
+            lin = nullptr;
+        }
+        if (vi % SHOT_EVERY == 0 && c->data && c->w == 400 && c->h == 240 && prof_shot_ready()) {
+            lin_bytes = (u32)c->tw * c->th * 4;
+            lin = (u8 *)linearAlloc(lin_bytes);
+            if (lin) {
+                ensureFrame();
+                pica_untile_rgba8_async(c->data, c->tw, c->th, lin);
+                fence = pica_fence();
+            }
+        }
     }
 
     /* Development aid: sdmc:/3ds/ctr64/freezeframe.txt holds a VI number at which the

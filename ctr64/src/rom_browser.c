@@ -7,6 +7,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "menu.h"
 #include "rom_title.h"
 #include "settings.h"
 #include "ui/icons_img.h"
@@ -97,14 +98,19 @@ static void draw_list(int sel, int scroll)
     }
 }
 
+/* footer buttons (x ranges, for touch): Start, Settings, Light/Dark; Quit at the right */
+static int g_foot_x[4];
+
 static void draw_frame(void)
 {
     char right[32];
     snprintf(right, sizeof(right), g_count == 1 ? "1 game" : "%d games", g_count);
     ui_header("ctr64 " CTR64_VERSION, right);
     ui_footer_begin();
-    const int x = ui_footer_button(8, UI_GLYPH_A, "Start", false);
-    ui_footer_button(x, UI_GLYPH_Y, ui_is_dark() ? "Light" : "Dark", false);
+    g_foot_x[0] = 0;
+    g_foot_x[1] = ui_footer_button(8, UI_GLYPH_A, "Start", false);
+    g_foot_x[2] = ui_footer_button(g_foot_x[1], UI_GLYPH_X, "Settings", false);
+    g_foot_x[3] = ui_footer_button(g_foot_x[2], UI_GLYPH_Y, ui_is_dark() ? "Light" : "Dark", false);
     ui_footer_button(UI_W - 8, NULL, "START  Quit", true);
 }
 
@@ -144,7 +150,23 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
             return ROM_BROWSER_QUIT;
         if (down & KEY_SELECT)
             return ROM_BROWSER_GPU_TEST;
-        if (down & KEY_Y) { /* dark mode on / off (also in the menu: Video) */
+        bool tap_settings = false, tap_theme = false;
+        if (touch.tap && ui_hit(touch.x, touch.y, 0, UI_H - UI_FOOTER_H, UI_W, UI_FOOTER_H)) {
+            tap_settings = touch.x >= g_foot_x[1] && touch.x < g_foot_x[2];
+            tap_theme = touch.x >= g_foot_x[2] && touch.x < g_foot_x[3];
+            if (tap_settings || tap_theme)
+                touch.tap = false;
+        }
+        if ((down & KEY_X) || tap_settings) { /* the settings, without starting a game */
+            menu_settings(SETTINGS_PATH);
+            ui_set_dark(g_settings.dark_mode);
+            ui_background(0, UI_H);
+            draw_frame();
+            hidSetRepeatParameters(18, 5);
+            touch = (UiTouch){0};
+            redraw = true;
+        }
+        if ((down & KEY_Y) || tap_theme) { /* dark mode on / off (also in Settings: Video) */
             g_settings.dark_mode = !g_settings.dark_mode;
             ui_set_dark(g_settings.dark_mode);
             settings_save(SETTINGS_PATH);
@@ -170,7 +192,7 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
             redraw = true;
         }
         if (touch.tap && g_count) {
-            if (ui_hit(touch.x, touch.y, 0, UI_H - UI_FOOTER_H, UI_W / 2, UI_FOOTER_H)) {
+            if (ui_hit(touch.x, touch.y, 0, UI_H - UI_FOOTER_H, g_foot_x[1], UI_FOOTER_H)) {
                 snprintf(out, outsz, "%s/%s", dir, g_roms[sel].file);
                 return ROM_BROWSER_PICKED;
             }
