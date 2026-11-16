@@ -3689,7 +3689,7 @@ index adcae2d..4488d21 100644
      bl     dynamic_linker
      mov    pc, r0
 diff --git a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
-index 1e8f261..b991c93 100644
+index 1e8f261..6f02f04 100644
 --- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
 +++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
 @@ -55,7 +55,10 @@
@@ -3934,11 +3934,11 @@ index 1e8f261..b991c93 100644
 +static u_int ctr64_ji_gen[4096];
 +static int ctr64_rb_in_idle; /* compiling remembered blocks between frames (ctr64_rb_idle) */
 +int ctr64_fast_compile; /* optional compiler passes skipped (bits, see pass 5); dev switch fastcompile.txt */
-+/* ctr64: stores relative to the stack pointer ($sp, r29) skip the check whether they hit compiled
-+ * code (invalid_code: 3 instructions after every store; prologues save many registers there).
-+ * Stack writes never overwrite a game's code; the address range check stays (a $sp outside RDRAM
-+ * still takes the slow path). Dev switch spcheck.txt: checked as before. */
-+int ctr64_sp_nocheck=1;
++/* ctr64: dev switch spnocheck.txt: stores relative to the stack pointer ($sp, r29) skip the check
++ * whether they hit compiled code (invalid_code: 3 instructions after every store; ~1% emulation
++ * time in OoT). Off by default: Jet Force Gemini patches its own code through $sp-relative stores
++ * (0x80051F98 at the title), and the stale block then crashed the game (black screen). */
++int ctr64_sp_nocheck=0;
 +#if defined(__3DS__)
 +#define CTR64_SP_NOCHECK(i) (ctr64_sp_nocheck&&rs1[i]==29)
 +#else

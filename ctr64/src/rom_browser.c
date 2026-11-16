@@ -148,8 +148,6 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
         ui_touch_update(&touch, down, held, up);
         if (down & KEY_START)
             return ROM_BROWSER_QUIT;
-        if (down & KEY_SELECT)
-            return ROM_BROWSER_GPU_TEST;
         bool tap_settings = false, tap_theme = false;
         if (touch.tap && ui_hit(touch.x, touch.y, 0, UI_H - UI_FOOTER_H, UI_W, UI_FOOTER_H)) {
             tap_settings = touch.x >= g_foot_x[1] && touch.x < g_foot_x[2];

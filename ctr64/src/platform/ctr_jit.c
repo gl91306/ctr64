@@ -474,10 +474,10 @@ static bool line_flush_selftest(void *base)
 void ctr_jit_init(void *base, unsigned int size)
 {
     DebugMessage(M64MSG_INFO, "%s init: cache %p, %u bytes", JIT_BUILD, base, size);
-    {   /* dev switch spcheck.txt: stack-relative stores check for compiled code again */
+    {   /* dev switch spnocheck.txt: stack-relative stores skip the compiled-code check (new_dynarec.c) */
         extern int ctr64_sp_nocheck;
-        FILE *sc = fopen("sdmc:/3ds/ctr64/spcheck.txt", "r");
-        ctr64_sp_nocheck = sc == NULL;
+        FILE *sc = fopen("sdmc:/3ds/ctr64/spnocheck.txt", "r");
+        ctr64_sp_nocheck = sc != NULL;
         if (sc)
             fclose(sc);
     }
