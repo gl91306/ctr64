@@ -23,6 +23,22 @@ static struct {
 
 bool video_init(void)
 {
+    {   /* dev switch noclrdraw.txt: FCRAM color targets cleared by copies, not a quad (pica.c) */
+        extern bool pica_noclrdraw;
+        FILE *nc = fopen("sdmc:/3ds/ctr64/noclrdraw.txt", "r");
+        if (nc) {
+            pica_noclrdraw = true;
+            fclose(nc);
+        }
+    }
+    {   /* DEV ONLY: gputime.txt - every GX job timed alone (pica.c) */
+        extern bool pica_gputime;
+        FILE *gt = fopen("sdmc:/3ds/ctr64/gputime.txt", "r");
+        if (gt) {
+            pica_gputime = true;
+            fclose(gt);
+        }
+    }
     if (!pica_init())
         return false;
     /* The top screen image is drawn once per frame: in FCRAM, so its 375 KB of VRAM bank B
@@ -143,6 +159,42 @@ static void draw_screen_quad(const void *tex, u16 tw, u16 th, GPU_TEXCOLOR fmt, 
     float vt = top_is_t0 ? 0.0f : vh, vb = top_is_t0 ? vh : 0.0f;
     if (video_batch_begin(&b, 6)) {
         video_batch_quad4(&b, x0, 0, x1, 240, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0, vt, u1, vb);
+        video_batch_draw(&b);
+    }
+}
+
+/* A color target in FCRAM cleared by drawing: the fill engine does not reach FCRAM on hardware
+ * (pica_fill_selftest), and its fallback - a chain of transfer-engine copies that reads the target
+ * back as it goes - took ~6 ms per 640x480 clear (HW, MK64 with anti-aliasing: 12 ms of GPU time
+ * per frame). One quad over the whole target in a constant color, no blending, no depth: the GPU
+ * writes FCRAM fine while drawing. rgba as pica_rgba8. The backend sets all of its state again
+ * at its next draw (applyState, setupCombiner). */
+void video_clear_draw(const PicaTarget *t, u32 rgba)
+{
+    static const float ident[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    PicaTev tev;
+    VideoBatch b;
+    pica_bind_target(t);
+    pica_viewport(0, 0, t->width, t->height);
+    pica_scissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+    pica_depth_test(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+    pica_depth_map(-1.0f, 0.0f);
+    pica_cull(GPU_CULL_NONE);
+    pica_alpha_test(false, GPU_ALWAYS, 0);
+    pica_blend_off();
+    video_use_program(ident);
+    for (int unit = 0; unit < 3; unit++)
+        pica_texture(unit, NULL, 0, 0, GPU_RGBA8, 0);
+    pica_tev_default(&tev);
+    tev.src_rgb = GPU_TEVSOURCES(GPU_CONSTANT, 0, 0);
+    tev.src_alpha = GPU_TEVSOURCES(GPU_CONSTANT, 0, 0);
+    tev.color = pica_const_color(rgba >> 24, rgba >> 16, rgba >> 8, rgba);
+    pica_tev(0, &tev);
+    pica_tev_default(&tev);
+    for (int i = 1; i < 6; i++)
+        pica_tev(i, &tev);
+    if (video_batch_begin(&b, 6)) {
+        video_batch_quad(&b, -1.0f, -1.0f, 1.0f, 1.0f, 0xFFFFFF);
         video_batch_draw(&b);
     }
 }

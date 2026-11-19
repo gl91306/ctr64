@@ -272,7 +272,7 @@ index 745218c..795f78b 100644
 +
  #endif // WriteToRDRAM_H
 diff --git a/GLideN64/src/CRC_OPT.cpp b/GLideN64/src/CRC_OPT.cpp
-index 05a62e5..479b6c8 100644
+index 05a62e5..925a63e 100644
 --- a/GLideN64/src/CRC_OPT.cpp
 +++ b/GLideN64/src/CRC_OPT.cpp
 @@ -1,4 +1,5 @@
@@ -281,7 +281,7 @@ index 05a62e5..479b6c8 100644
  #define XXH_INLINE_ALL
  #include "xxHash/xxhash.h"
  
-@@ -46,6 +47,84 @@ u32 CRC_Calculate_Strict( u32 crc, const void * buffer, u32 count )
+@@ -46,6 +47,117 @@ u32 CRC_Calculate_Strict( u32 crc, const void * buffer, u32 count )
  	return crc ^ orig;
  }
  
@@ -302,6 +302,39 @@ index 05a62e5..479b6c8 100644
 + * XXH32 (bit for bit, see XXH32 in xxHash/xxhash.h), computed in one pass over the data: each
 + * word is loaded once for both. */
 +extern "C" { unsigned ctr64_crc_long[2]; } /* calls >= 256 bytes, KB hashed (stats.log) */
++
++/* XXH3's long-input accumulation, the same arithmetic in another order: xxhash's scalar loop goes
++ * stripe by stripe through all 8 lanes, so its 8 64-bit accumulators (16 words) live on the stack
++ * on the ARM11 (~20 instructions per 8 bytes, mostly loads/stores of them: XXH3 was 21% of
++ * Pilotwings' video thread). The lanes are independent within a block (lane i adds its data to
++ * acc[i^1] and its product to acc[i]), so here each lane pair runs down the whole block with its
++ * two accumulators in registers. Additions mod 2^64 commute: bit-identical to XXH3_64bits_withSeed
++ * (checked against it: 16164 sizes 241..66000 x seeds, host build). */
++static void ctr64_xxh3_accumulate(xxh_u64* XXH_RESTRICT acc, const xxh_u8* XXH_RESTRICT input,
++                                  const xxh_u8* XXH_RESTRICT secret, size_t nbStripes)
++{
++	for (size_t l = 0; l < XXH_ACC_NB; l += 2) {
++		xxh_u64 a0 = acc[l], a1 = acc[l + 1];
++		const xxh_u8 *in = input + l * 8, *sec = secret + l * 8;
++		for (size_t s = 0; s < nbStripes; ++s, in += XXH_STRIPE_LEN, sec += XXH_SECRET_CONSUME_RATE) {
++			const xxh_u64 d0 = XXH_readLE64(in), d1 = XXH_readLE64(in + 8);
++			const xxh_u64 k0 = d0 ^ XXH_readLE64(sec), k1 = d1 ^ XXH_readLE64(sec + 8);
++			a1 += d0;
++			a0 += d1;
++			a0 = XXH_mult32to64_add64(k0, k0 >> 32, a0);
++			a1 = XXH_mult32to64_add64(k1, k1 >> 32, a1);
++		}
++		acc[l] = a0;
++		acc[l + 1] = a1;
++	}
++}
++
++/* = XXH3_64bits_withSeed for count > 240 */
++static u64 ctr64_xxh3_long(const void *buffer, u32 count, u64 seed)
++{
++	return XXH3_hashLong_64b_withSeed_internal(buffer, count, seed, ctr64_xxh3_accumulate,
++	                                           XXH3_scrambleAcc, XXH3_initCustomSecret);
++}
 +u64 CRC_Calculate( u64 crc, const void * buffer, u32 count )
 +{
 +	/* long inputs (texture data): XXH3's main loop is one 32x32->64 multiply (UMULL) per 8 bytes,
@@ -310,7 +343,7 @@ index 05a62e5..479b6c8 100644
 +	if (count >= 256) {
 +		ctr64_crc_long[0]++;
 +		ctr64_crc_long[1] += count >> 10;
-+		return XXH3_64bits_withSeed(buffer, count, crc);
++		return ctr64_xxh3_long(buffer, count, crc);
 +	}
 +	const u32 P1 = 0x9E3779B1U, P2 = 0x85EBCA77U, P3 = 0xC2B2AE3DU, P4 = 0x27D4EB2FU, P5 = 0x165667B1U;
 +	const u32 sa = static_cast<u32>(crc), sb = static_cast<u32>(crc >> 32) ^ 0x9E3779B1U;
@@ -366,7 +399,7 @@ index 05a62e5..479b6c8 100644
  u64 CRC_Calculate( u64 crc, const void * buffer, u32 count )
  {
  	return XXH3_64bits_withSeed(buffer, count, crc);
-@@ -60,3 +139,4 @@ u64 CRC_CalculatePalette( u64 crc, const void * buffer, u32 count )
+@@ -60,3 +172,4 @@ u64 CRC_CalculatePalette( u64 crc, const void * buffer, u32 count )
  	}
  	return crc;
  }
@@ -433,10 +466,10 @@ index 5dd846b..38e2130 100644
  EXPORT void CALL gln64ViStatusChanged (void)
 diff --git a/GLideN64/src/Ctr64Prof.h b/GLideN64/src/Ctr64Prof.h
 new file mode 100644
-index 0000000..dc7562d
+index 0000000..7c0156a
 --- /dev/null
 +++ b/GLideN64/src/Ctr64Prof.h
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,42 @@
 +#pragma once
 +/* ctr64 profiling: inclusive time per scope, read by ctr64's stats.log (ctr64/src/main.c) */
 +#ifdef __3DS__
@@ -448,15 +481,29 @@ index 0000000..dc7562d
 +struct Ctr64ProfScope {
 +	int id;
 +	unsigned long long t0;
-+	explicit Ctr64ProfScope(int _id) : id(_id), t0(ctr64_prof_on ? svcGetSystemTick() : 0) {}
++	unsigned weight;
++	/* each tick read is a kernel call (~13 scopes per draw): past 240 calls in the stats window
++	 * (main.c resets the counts every 60 VIs) only every 4th call is timed, counted 4 times */
++	explicit Ctr64ProfScope(int _id) : id(_id), t0(0), weight(0)
++	{
++		if (!ctr64_prof_on)
++			return;
++		const unsigned c = ctr64_prof_calls[id]++;
++		if (c < 240)
++			weight = 1;
++		else if ((c & 3) == 0)
++			weight = 4;
++		else
++			return;
++		t0 = svcGetSystemTick();
++	}
 +	~Ctr64ProfScope() { end(); }
 +	void end()
 +	{
 +		if (t0) {
-+			const unsigned long long d = svcGetSystemTick() - t0;
++			const unsigned long long d = (svcGetSystemTick() - t0) * weight;
 +			ctr64_prof_ticks[id] += d;
 +			ctr64_prof_total[id] += d;
-+			ctr64_prof_calls[id]++;
 +			t0 = 0;
 +		}
 +	}
@@ -466,7 +513,7 @@ index 0000000..dc7562d
 +#define CTR64_PROF(id)
 +#endif
 diff --git a/GLideN64/src/DepthBuffer.cpp b/GLideN64/src/DepthBuffer.cpp
-index 05cc8fe..e284f46 100644
+index 05cc8fe..47dd49d 100644
 --- a/GLideN64/src/DepthBuffer.cpp
 +++ b/GLideN64/src/DepthBuffer.cpp
 @@ -11,6 +11,9 @@
@@ -505,7 +552,28 @@ index 05cc8fe..e284f46 100644
  		return;
  	}
  
-@@ -475,8 +489,33 @@ void DepthBufferList::saveBuffer(u32 _address)
+@@ -450,9 +464,20 @@ void DepthBufferList::saveBuffer(u32 _address)
+ 		pDepthBuffer = findBuffer(pFrameBuffer->m_startAddress);
+ 	else
+ 		pDepthBuffer = findBuffer(_address);
++#ifdef __3DS__
++	/* ctr64: a depth image inside a frame buffer (S.C.A.R.S.: depth at 0x1008, in the color buffer
++	 * at 0x280) was looked up at the buffer's start but created at its own address: a new 1.25 MB
++	 * depth buffer every frame, until GPU memory ran out (crash / hang). Find it where it was made. */
++	if (pDepthBuffer == nullptr && pFrameBuffer != nullptr && pFrameBuffer->m_startAddress != _address)
++		pDepthBuffer = findBuffer(_address);
++#endif
+ 
+ 	if (pDepthBuffer != nullptr && pFrameBuffer != nullptr && pDepthBuffer->m_width != pFrameBuffer->m_width) {
++#ifdef __3DS__
++		removeBuffer(pDepthBuffer->m_address); /* the one found (upstream removed _address's) */
++#else
+ 		removeBuffer(_address);
++#endif
+ 		pDepthBuffer = nullptr;
+ 	}
+ 
+@@ -475,8 +500,33 @@ void DepthBufferList::saveBuffer(u32 _address)
  		clearBuffer();
  	if (pDepthBuffer->m_address != gDP.depthImageAddress)
  		m_pCurrent = pCurrent;
@@ -564,7 +632,7 @@ index ac4e150..855667d 100644
  	void setCleared(bool _cleared);
  	DepthBuffer *findBuffer(u32 _address);
 diff --git a/GLideN64/src/FrameBuffer.cpp b/GLideN64/src/FrameBuffer.cpp
-index 68cf2bf..dd6bc69 100644
+index 68cf2bf..609edcb 100644
 --- a/GLideN64/src/FrameBuffer.cpp
 +++ b/GLideN64/src/FrameBuffer.cpp
 @@ -1,3 +1,4 @@
@@ -583,7 +651,7 @@ index 68cf2bf..dd6bc69 100644
  void FrameBuffer::init(u32 _address, u16 _format, u16 _size, u16 _width, bool _cfb)
  {
  	m_startAddress = _address;
-@@ -161,6 +166,15 @@ void FrameBuffer::init(u32 _address, u16 _format, u16 _size, u16 _width, bool _c
+@@ -161,6 +166,24 @@ void FrameBuffer::init(u32 _address, u16 _format, u16 _size, u16 _width, bool _c
  	} else {
  		m_scale = std::max(dwnd().getScaleX(), 1.0f);
  	}
@@ -591,7 +659,16 @@ index 68cf2bf..dd6bc69 100644
 +	/* PICA render targets are at most 1024 wide: a 640-wide (hi-res) buffer at 2x would be cut
 +	 * off, so such a buffer stays at native size (texture sampling and the depth buffer follow
 +	 * m_scale, as for the native-size aux buffers above) */
-+	if (m_scale > 1.0f && static_cast<float>(_width) * m_scale > 1024.0f) {
++	/* Same for a 480-line (interlaced) buffer: 320x480 at 2x is 640x960, stored 1024x1024, 4 MB
++	 * of color plus 4 MB of depth, more than the VRAM: it rendered in FCRAM at 60-80 ms a frame
++	 * (Star Wars Episode I Racer menus, HW 2026-11-17: 15-20% speed). */
++	/* The storage height counts, not the picture's: a buffer wider than 400 is allocated 480 lines
++	 * (VI_GetMaxBufferHeight). Gauntlet Legends' 416-wide buffers at 2x were 832x960 (832x1024
++	 * storage, 3.3 MB color + 3.3 MB depth): all in FCRAM plus a shadow copy per sampling, HW
++	 * 2026-11-18 ~3-30% speed; Azahar happened to drop to 1x through the VI rule (VI_UpdateScreen). */
++	if (m_scale > 1.0f && (static_cast<float>(_width) * m_scale > 1024.0f ||
++						   (_cfb && static_cast<float>(m_height) * m_scale > 512.0f) ||
++						   static_cast<float>(VI_GetMaxBufferHeight(_width)) * m_scale > 512.0f)) {
 +		m_scale = 1.0f;
 +		ctr64_aa_too_wide = true; /* VI_UpdateScreen drops 2x for the rest of the game */
 +	}
@@ -599,7 +676,17 @@ index 68cf2bf..dd6bc69 100644
  	m_cfb = _cfb;
  	m_cleared = false;
  	m_fingerprint = false;
-@@ -272,6 +286,33 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -251,6 +274,9 @@ void FrameBuffer::setDirty()
+ 	m_RdramCopy.clear();
+ }
+ 
++#ifdef __3DS__
++extern "C" bool ctr64_fbcheck_full; /* dev switch fbcheckfull.txt (pica_ContextImpl.cpp) */
++#endif
+ bool FrameBuffer::isValid(bool _forceCheck) const
+ {
+ 	if (!_forceCheck) {
+@@ -272,6 +298,54 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  		const u32 start = (m_startAddress >> 2) + static_cast<u32>(m_clearParams.uly) * ci_width_in_dwords;
  		const u32 * dst = pData + start;
  		u32 wrongPixels = 0;
@@ -607,6 +694,27 @@ index 68cf2bf..dd6bc69 100644
 +		/* ctr64: 8 words per test, pixels counted only in a group that differs, and done as soon
 +		 * as the threshold is reached (same answer) */
 +		const u32 limit = (m_endAddress - m_startAddress) / 400;
++		/* first a third of the 8-word groups (start shifted by row, so a column of groups cannot
++		 * hide between them): nothing changed there -> valid without reading the rest. Only for
++		 * frame-sized buffers (limit >= 40 words: a change that big touches sampled groups).
++		 * Anything changed -> the exact count below. VI_UpdateScreen checks the shown buffer
++		 * every VI: 20% of Pilotwings' video thread was these compares. */
++		if (limit >= 40 && !ctr64_fbcheck_full) {
++			const u32 *row = dst;
++			bool changed = false;
++			for (s32 y = m_clearParams.uly; y < lry && !changed; ++y, row += ci_width_in_dwords) {
++				for (s32 x = m_clearParams.ulx + 8 * (y % 3); x + 8 <= m_clearParams.lrx; x += 24) {
++					const u32 *p = row + x;
++					if ((((p[0] ^ testColor) | (p[1] ^ testColor) | (p[2] ^ testColor) | (p[3] ^ testColor) |
++						  (p[4] ^ testColor) | (p[5] ^ testColor) | (p[6] ^ testColor) | (p[7] ^ testColor)) & 0xFFFEFFFE) != 0) {
++						changed = true;
++						break;
++					}
++				}
++			}
++			if (!changed)
++				return true;
++		}
 +		for (s32 y = m_clearParams.uly; y < lry; ++y) {
 +			s32 x = m_clearParams.ulx;
 +			for (; x + 8 <= m_clearParams.lrx; x += 8) {
@@ -633,7 +741,7 @@ index 68cf2bf..dd6bc69 100644
  		for (s32 y = m_clearParams.uly; y < lry; ++y) {
  			for (s32 x = m_clearParams.ulx; x < m_clearParams.lrx; ++x) {
  				if ((dst[x] & 0xFFFEFFFE) != testColor)
-@@ -280,6 +321,7 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -280,6 +354,7 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  			dst += ci_width_in_dwords;
  		}
  		return wrongPixels < (m_endAddress - m_startAddress) / 400; // threshold level 1% of dwords
@@ -641,7 +749,7 @@ index 68cf2bf..dd6bc69 100644
  	} else if (m_fingerprint) {
  			//check if our fingerprint is still there
  			u32 start = m_startAddress >> 2;
-@@ -293,11 +335,34 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -293,11 +368,56 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  		const u32 size_dwords = size >> 2;
  		u32 start = m_startAddress >> 2;
  		u32 wrongPixels = 0;
@@ -651,6 +759,28 @@ index 68cf2bf..dd6bc69 100644
 +		const u32 limit = size / 400;
 +		const u32 *p = pData + start;
 +		u32 i = 0;
++		/* a third of the groups first, as above: the copy is row after row, each row's sampled
++		 * groups start one group further on */
++		const u32 wpr = (m_width << m_size >> 1) >> 2; /* words per row */
++		if (limit >= 40 && wpr >= 8 && !ctr64_fbcheck_full) {
++			bool changed = false;
++			for (u32 r = 0, base = 0; base + wpr <= size_dwords && !changed; ++r, base += wpr) {
++				for (u32 g = base + 8 * (r % 3); g + 8 <= base + wpr; g += 24) {
++					const u32 *c = pCopy + g, *d = p + g;
++					if ((((d[0] ^ c[0]) | (d[1] ^ c[1]) | (d[2] ^ c[2]) | (d[3] ^ c[3]) |
++						  (d[4] ^ c[4]) | (d[5] ^ c[5]) | (d[6] ^ c[6]) | (d[7] ^ c[7])) & 0xFFFEFFFE) != 0) {
++						changed = true;
++						break;
++					}
++				}
++			}
++			/* words after the last whole row: always compared */
++			const u32 rows_end = wpr ? (size_dwords / wpr) * wpr : 0;
++			for (u32 k = rows_end; k < size_dwords && !changed; ++k)
++				changed = ((p[k] ^ pCopy[k]) & 0xFFFEFFFE) != 0;
++			if (!changed)
++				return true;
++		}
 +		for (; i + 8 <= size_dwords; i += 8) {
 +			const u32 *c = pCopy + i, *d = p + i;
 +			if ((((d[0] ^ c[0]) | (d[1] ^ c[1]) | (d[2] ^ c[2]) | (d[3] ^ c[3]) |
@@ -676,7 +806,20 @@ index 68cf2bf..dd6bc69 100644
  	}
  	return true; // No data to decide
  }
-@@ -771,6 +836,7 @@ void FrameBufferList::_createScreenSizeBuffer()
+@@ -471,6 +591,12 @@ CachedTexture * FrameBuffer::getTexture(u32 _t)
+ 	const bool getDepthTexture = m_isDepthBuffer &&
+ 								 gDP.colorImage.address == gDP.depthImageAddress &&
+ 								 m_pDepthBuffer != nullptr &&
++#ifdef __3DS__
++								 /* ctr64: no depth frame buffer textures in the PICA backend
++								  * (renderbuffers only): the texture is null, the color one is used
++								  * (Mario Golf crashed here at the start of a course) */
++								 m_pDepthBuffer->m_pDepthBufferTexture != nullptr &&
++#endif
+ 								 (config.generalEmulation.hacks & hack_ZeldaMM) == 0;
+ 	CachedTexture *pTexture = getDepthTexture ? m_pDepthBuffer->m_pDepthBufferTexture : m_pTexture;
+ 
+@@ -771,6 +897,7 @@ void FrameBufferList::_createScreenSizeBuffer()
  
  void FrameBufferList::saveBuffer(u32 _address, u16 _format, u16 _size, u16 _width, bool _cfb)
  {
@@ -684,7 +827,7 @@ index 68cf2bf..dd6bc69 100644
  	if (_width > 640)
  		return;
  
-@@ -1464,6 +1530,7 @@ void FrameBufferList::OverscanBuffer::draw(u32 _fullHeight, bool _PAL)
+@@ -1464,6 +1591,7 @@ void FrameBufferList::OverscanBuffer::draw(u32 _fullHeight, bool _PAL)
  
  void FrameBufferList::renderBuffer()
  {
@@ -692,7 +835,7 @@ index 68cf2bf..dd6bc69 100644
  	if (g_debugger.isDebugMode()) {
  		g_debugger.draw();
  		return;
-@@ -1711,12 +1778,27 @@ void FrameBufferList::fillRDRAM(s32 ulx, s32 uly, s32 lrx, s32 lry)
+@@ -1711,12 +1839,27 @@ void FrameBufferList::fillRDRAM(s32 ulx, s32 uly, s32 lrx, s32 lry)
  	dst += static_cast<u32>(uly) * ci_width_in_dwords;
  	if (!isMemoryWritable(dst, lowerBound - gDP.colorImage.address))
  		return;
@@ -720,6 +863,30 @@ index 68cf2bf..dd6bc69 100644
  
  	m_pCurrent->setBufferClearParams(gDP.fillColor.color, ulx, uly, lrx, lry);
  }
+diff --git a/GLideN64/src/GBI.cpp b/GLideN64/src/GBI.cpp
+index 8f733d4..742e112 100644
+--- a/GLideN64/src/GBI.cpp
++++ b/GLideN64/src/GBI.cpp
+@@ -1,4 +1,7 @@
+ #include <algorithm>
++#ifdef __3DS__
++extern unsigned g_ctr64TriCmdLo, g_ctr64TriCmdHi; extern bool g_ctr64VertexOnlyMoves; /* GraphicsDrawer.cpp */
++#endif
+ #include <assert.h>
+ #include <cctype>
+ #include <stdlib.h>
+@@ -204,6 +207,11 @@ void GBIInfo::_makeCurrent(MicrocodeInfo * _pCurrent)
+ 		RDP_Init();
+ 
+ 		G_TRI1 = G_TRI2 = G_TRIX = G_QUAD = -1; // For correct work of gSPFlushTriangles()
++#ifdef __3DS__
++		g_ctr64TriCmdLo = 1; /* none, unless the microcode's init sets them */
++		g_ctr64TriCmdHi = 0;
++		g_ctr64VertexOnlyMoves = false;
++#endif
+ 		gSP.clipRatio = 1U;
+ 
+ 		switch (m_pCurrent->type) {
 diff --git a/GLideN64/src/Graphics/ColorBufferReader.cpp b/GLideN64/src/Graphics/ColorBufferReader.cpp
 index 372b242..b3ed8af 100644
 --- a/GLideN64/src/Graphics/ColorBufferReader.cpp
@@ -782,7 +949,7 @@ index 2041bac..35d026f 100644
  
  		void drawTriangles(const DrawTriangleParameters & _params);
 diff --git a/GLideN64/src/GraphicsDrawer.cpp b/GLideN64/src/GraphicsDrawer.cpp
-index a2fb0af..17b50aa 100644
+index a2fb0af..f84fa2f 100644
 --- a/GLideN64/src/GraphicsDrawer.cpp
 +++ b/GLideN64/src/GraphicsDrawer.cpp
 @@ -1,3 +1,8 @@
@@ -794,7 +961,19 @@ index a2fb0af..17b50aa 100644
  #include <algorithm>
  #include <string>
  #include <thread>
-@@ -83,7 +88,7 @@ void GraphicsDrawer::addTriangle(u32 _v0, u32 _v1, u32 _v2)
+@@ -38,6 +43,11 @@ GraphicsDrawer::~GraphicsDrawer()
+ void GraphicsDrawer::addTriangle(u32 _v0, u32 _v1, u32 _v2)
+ {
+ 	m_statistics.drawnTris++;
++#ifdef __3DS__
++	ctr64_cbfd_resolve(triangles.vertices[_v0]);
++	ctr64_cbfd_resolve(triangles.vertices[_v1]);
++	ctr64_cbfd_resolve(triangles.vertices[_v2]);
++#endif
+ 	const u32 firstIndex = triangles.num;
+ 	triangles.elements[triangles.num++] = static_cast<u16>(_v0);
+ 	triangles.elements[triangles.num++] = static_cast<u16>(_v1);
+@@ -83,7 +93,7 @@ void GraphicsDrawer::addTriangle(u32 _v0, u32 _v1, u32 _v2)
  	if (gDP.otherMode.depthSource == G_ZS_PRIM) {
  		for (u32 i = firstIndex; i < triangles.num; ++i) {
  			SPVertex & vtx = triangles.vertices[triangles.elements[i]];
@@ -803,7 +982,7 @@ index a2fb0af..17b50aa 100644
  		}
  	}
  }
-@@ -642,6 +647,7 @@ void GraphicsDrawer::_updateTextures() const
+@@ -642,6 +652,7 @@ void GraphicsDrawer::_updateTextures() const
  
  void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
  {
@@ -811,7 +990,7 @@ index a2fb0af..17b50aa 100644
  	CombinerInfo & cmbInfo = CombinerInfo::get();
  	cmbInfo.setPolygonMode(_drawingState);
  	cmbInfo.update();
-@@ -785,7 +791,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
+@@ -785,7 +796,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
  		}
  
  		setDepthCopyParameters();
@@ -820,7 +999,7 @@ index a2fb0af..17b50aa 100644
  	} else if (m_depthCopyMode != BgDepthCopyMode::eCopyDone &&
  		isCurrentColorImageDepthImage() &&
  		config.generalEmulation.enableFragmentDepthWrite != 0 &&
-@@ -819,6 +825,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
+@@ -819,6 +830,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
  
  void GraphicsDrawer::_prepareDrawTriangle(DrawingState _drawingState)
  {
@@ -828,12 +1007,14 @@ index a2fb0af..17b50aa 100644
  	m_texrectDrawer.draw();
  
  	if ((m_modifyVertices & MODIFY_XY) != 0)
-@@ -846,33 +853,145 @@ bool GraphicsDrawer::_canDraw() const
+@@ -846,33 +858,147 @@ bool GraphicsDrawer::_canDraw() const
  	return config.frameBufferEmulation.enable == 0 || frameBufferList().getCurrent() != nullptr;
  }
  
 +#ifdef __3DS__
 +bool g_ctr64TrianglesStashed = false;
++unsigned g_ctr64TriCmdLo = 1, g_ctr64TriCmdHi = 0;
++bool g_ctr64VertexOnlyMoves = false;
 +
 +/* an 88-byte SPVertex in three load/store-multiple pairs: memcpy (what the compiler calls for
 + * it) costs a call and alignment checks per vertex */
@@ -980,7 +1161,7 @@ index a2fb0af..17b50aa 100644
  		}
  		frameBufferList().setBufferChanged(maxY);
  		if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender &&
-@@ -882,11 +1001,22 @@ void GraphicsDrawer::drawTriangles()
+@@ -882,11 +1008,22 @@ void GraphicsDrawer::drawTriangles()
  				pCurrentDepthBuffer->setDirty();
  		}
  	} else {
@@ -1003,7 +1184,7 @@ index a2fb0af..17b50aa 100644
  	dropRenderState();
  }
  
-@@ -977,6 +1107,11 @@ void GraphicsDrawer::drawDMATriangles(u32 _numVtx)
+@@ -977,6 +1114,11 @@ void GraphicsDrawer::drawDMATriangles(u32 _numVtx)
  				pCurrentDepthBuffer->setDirty();
  		}
  	} else {
@@ -1015,7 +1196,18 @@ index a2fb0af..17b50aa 100644
  		gfxContext.drawTriangles(triParams);
  	}
  	dropRenderState();
-@@ -1108,6 +1243,7 @@ void GraphicsDrawer::drawLine(u32 _v0, u32 _v1, float _width, u32 _flag)
+@@ -1072,6 +1214,10 @@ void GraphicsDrawer::_drawThickLine(u32 _v0, u32 _v1, float _width, u32 _flag)
+ 
+ void GraphicsDrawer::drawLine(u32 _v0, u32 _v1, float _width, u32 _flag)
+ {
++#ifdef __3DS__
++	ctr64_cbfd_resolve(triangles.vertices[_v0]);
++	ctr64_cbfd_resolve(triangles.vertices[_v1]);
++#endif
+ 	m_texrectDrawer.draw();
+ 	m_statistics.lines++;
+ 
+@@ -1108,6 +1254,7 @@ void GraphicsDrawer::drawLine(u32 _v0, u32 _v1, float _width, u32 _flag)
  
  void GraphicsDrawer::drawRect(int _ulx, int _uly, int _lrx, int _lry)
  {
@@ -1023,7 +1215,7 @@ index a2fb0af..17b50aa 100644
  	m_texrectDrawer.draw();
  	m_statistics.fillRects++;
  
-@@ -1125,7 +1261,7 @@ void GraphicsDrawer::drawRect(int _ulx, int _uly, int _lrx, int _lry)
+@@ -1125,7 +1272,7 @@ void GraphicsDrawer::drawRect(int _ulx, int _uly, int _lrx, int _lry)
  
  	gfxContext.enable(enable::CULL_FACE, false);
  
@@ -1032,7 +1224,7 @@ index a2fb0af..17b50aa 100644
  	const float W = 1.0f;
  	m_rect[0].x = static_cast<f32>(_ulx);
  	m_rect[0].y = static_cast<f32>(_uly);
-@@ -1321,6 +1457,7 @@ static bool(*texturedRectSpecial)(const GraphicsDrawer::TexturedRectParams & _pa
+@@ -1321,6 +1468,7 @@ static bool(*texturedRectSpecial)(const GraphicsDrawer::TexturedRectParams & _pa
  
  void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  {
@@ -1040,7 +1232,7 @@ index a2fb0af..17b50aa 100644
  	gSP.changed &= ~CHANGED_GEOMETRYMODE; // Don't update cull mode
  	m_drawingState = DrawingState::TexRect;
  	m_statistics.texRects++;
-@@ -1369,7 +1506,7 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
+@@ -1369,7 +1517,7 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  		&& (cache.current[0] != nullptr)
  		//		&& (cache.current[0] == nullptr || cache.current[0]->format == G_IM_FMT_RGBA || cache.current[0]->format == G_IM_FMT_CI)
  		&& !bUseFbTexture && !bUseHdTexture);
@@ -1049,7 +1241,7 @@ index a2fb0af..17b50aa 100644
  	const float W = 1.0f;
  	const f32 ulx = _params.ulx;
  	const f32 uly = _params.uly;
-@@ -1514,6 +1651,15 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
+@@ -1514,6 +1662,15 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  	m_rect[3].bc1 = 1.0f;
  
  
@@ -1066,20 +1258,28 @@ index a2fb0af..17b50aa 100644
  		if (m_bBGMode) {
  			m_texrectDrawer.addBackgroundRect();
 diff --git a/GLideN64/src/GraphicsDrawer.h b/GLideN64/src/GraphicsDrawer.h
-index 466620d..c143f77 100644
+index 466620d..e2ff56c 100644
 --- a/GLideN64/src/GraphicsDrawer.h
 +++ b/GLideN64/src/GraphicsDrawer.h
-@@ -18,6 +18,9 @@ struct CachedTexture;
+@@ -18,6 +18,17 @@ struct CachedTexture;
  struct FrameBuffer;
  
  #define VERTBUFF_SIZE 256U
 +#ifdef __3DS__
 +extern bool g_ctr64TrianglesStashed; /* GraphicsDrawer::stashTriangles holds triangles */
++/* ctr64: a microcode's own triangle commands (Conker's TRI4: 0x10-0x1F), lo > hi = none. Treated
++ * like G_TRI1/G_TRI2 when batching (gSPFlushTriangles, RSP.cpp), set by the microcode's init. */
++extern unsigned g_ctr64TriCmdLo, g_ctr64TriCmdHi;
++/* ctr64: Conker's microcode: light, normal base, light count, segment and coordinate modifier
++ * updates only matter when vertices are loaded (processed vertices are kept by the stash), so
++ * they do not end a triangle batch (RSP.cpp). Set by F3DEX2CBFD's init. */
++extern bool g_ctr64VertexOnlyMoves;
++static inline bool ctr64_is_tri_cmd(unsigned c) { return c - g_ctr64TriCmdLo <= g_ctr64TriCmdHi - g_ctr64TriCmdLo && g_ctr64TriCmdLo <= g_ctr64TriCmdHi; }
 +#endif
  #define ELEMBUFF_SIZE 1024U
  
  constexpr f32 SCREEN_SIZE_DIM = 640.0f;
-@@ -48,6 +51,10 @@ public:
+@@ -48,6 +59,10 @@ public:
  	void addTriangle(u32 _v0, u32 _v1, u32 _v2);
  
  	void drawTriangles();
@@ -1090,7 +1290,7 @@ index 466620d..c143f77 100644
  
  	void drawScreenSpaceTriangle(u32 _numVtx, graphics::DrawModeParam _mode = graphics::drawmode::TRIANGLE_STRIP);
  
-@@ -226,6 +233,11 @@ private:
+@@ -226,6 +241,11 @@ private:
  		u32 num = 0;
  		u32 maxElement = 0;
  	} triangles;
@@ -1103,24 +1303,25 @@ index 466620d..c143f77 100644
  	std::vector<SPVertex> m_dmaVertices;
  	u32 m_dmaVerticesNum{ 0u };
 diff --git a/GLideN64/src/N64.cpp b/GLideN64/src/N64.cpp
-index e10e055..ef959f2 100644
+index e10e055..c63709e 100644
 --- a/GLideN64/src/N64.cpp
 +++ b/GLideN64/src/N64.cpp
-@@ -14,6 +14,9 @@ extern "C" {
+@@ -14,6 +14,10 @@ extern "C" {
  }
  
  u64 TMEM[512];
 +#ifdef __3DS__
 +u32 ctr64_tmem_gen = 1;
++u32 ctr64_tmem_pal_gen = 1;
 +#endif
  u8 *RDRAM;
  
  u32 RDRAMSize = 0;
 diff --git a/GLideN64/src/N64.h b/GLideN64/src/N64.h
-index 4fdd01f..d3e2f62 100644
+index 4fdd01f..0db2c6d 100644
 --- a/GLideN64/src/N64.h
 +++ b/GLideN64/src/N64.h
-@@ -47,6 +47,14 @@ extern "C" {
+@@ -47,6 +47,19 @@ extern "C" {
  
  extern u8 *RDRAM;
  extern u64 TMEM[512];
@@ -1129,17 +1330,76 @@ index 4fdd01f..d3e2f62 100644
 + * _calculateCRC reuses the hash of unchanged TMEM */
 +extern u32 ctr64_tmem_gen;
 +#define CTR64_TMEM_TOUCH() (ctr64_tmem_gen++)
++/* bumped by every write into the upper half of TMEM (palettes) except an unchanged palette
++ * reload (gDPLoadTLUT) */
++extern u32 ctr64_tmem_pal_gen;
++#define CTR64_TMEM_PAL_TOUCH() (ctr64_tmem_pal_gen++)
 +#else
 +#define CTR64_TMEM_TOUCH() ((void)0)
++#define CTR64_TMEM_PAL_TOUCH() ((void)0)
 +#endif
  extern u32 RDRAMSize;
  extern bool ConfigOpen;
  
 diff --git a/GLideN64/src/RSP.cpp b/GLideN64/src/RSP.cpp
-index a6b6078..a65b373 100644
+index a6b6078..a488b93 100644
 --- a/GLideN64/src/RSP.cpp
 +++ b/GLideN64/src/RSP.cpp
-@@ -55,10 +55,28 @@ void _ProcessDList()
+@@ -23,13 +23,53 @@ using namespace std;
+ #define SP_STATUS_HALT 0x0001
+ #define SP_STATUS_BROKE 0x0002
+ #define SP_STATUS_TASKDONE 0x0200
++#ifdef __3DS__
++extern "C" bool ctr64_gfx_infloop_seen, ctr64_gfx_inline_game;
++extern "C" void ctr64_log_line(const char *line); /* ctr64 gfx_async.c: display lists inline from now on */
++/* the command a display list waits at (a branch to itself) and its words then (rsp_core.c resumes
++ * the list only once the game has rewritten it) */
++static u32 ctr64_infloop_addr, ctr64_infloop_w0, ctr64_infloop_w1;
++static bool ctr64_infloop_ok;   /* the wait is a branch to itself (gSPBranchList), not ZSortBOSS's */
++extern bool ctr64_infloop_branch; /* gSP.cpp */ extern u32 ctr64_infloop_cw0, ctr64_infloop_cw1;
++extern "C" bool ctr64_gfx_infloop_unchanged(void)
++{
++	if (!RSP.infloop || !ctr64_infloop_ok)
++		return false;
++	const u32 a = ctr64_infloop_addr;
++	return a == RSP.PC[RSP.PCi] && a + 8 <= RDRAMSize && *(u32*)&RDRAM[a] == ctr64_infloop_w0 &&
++		*(u32*)&RDRAM[a + 4] == ctr64_infloop_w1;
++}
++#endif
+ 
+ RSPInfo		RSP;
++#ifdef __3DS__
++/* DEV ONLY - remove */
++extern "C" { unsigned ctr64_flushcmd[256], ctr64_flushsame[256]; }
++static u32 ctr64_lastw[256][2];
++#endif
++
++#ifdef __3DS__
++/* ctr64: display lists stopped as endless (stats.log). With video on the second core the game
++ * can rewrite a display list while it is still being read (Smash Remix's character select when
++ * R is pressed quickly), and the result may branch back on itself: the video thread then never
++ * finished and the game froze. A real frame is far below this many commands. */
++extern "C" { unsigned ctr64_dl_runaway; }
++#define CTR64_DL_MAX_CMDS (1u << 20)
++#endif
+ 
+ static
+ void _ProcessDList()
+ {
++#ifdef __3DS__
++	u32 cmds = 0;
++#endif
+ 	while (!RSP.halt) {
++#ifdef __3DS__
++		if (++cmds > CTR64_DL_MAX_CMDS) {
++			ctr64_dl_runaway++;
++			break;
++		}
++#endif
+ 		if ((RSP.PC[RSP.PCi] + 8) > RDRAMSize) {
+ #ifdef DEBUG_DUMP
+ 			if ((config.debug.dumpMode & DEBUG_DETAIL) != 0)
+@@ -55,10 +95,39 @@ void _ProcessDList()
  		if (RSP.count == 1)
  			--pci;
  		RSP.nextCmd = _SHIFTR(*(u32*)&RDRAM[RSP.PC[pci]], 24, 8);
@@ -1151,9 +1411,20 @@ index a6b6078..a65b373 100644
 +			const u32 c = RSP.cmd;
 +			if (!(c == G_VTX || c == G_TRI1 || c == G_TRI2 || c == G_TRIX || c == G_QUAD || c == G_MTX ||
 +				  c == G_POPMTX || c == G_DL || c == G_ENDDL || c == G_SPNOOP || c == G_RDPPIPESYNC ||
-+				  c == G_RDPLOADSYNC || c == G_RDPTILESYNC))
++				  c == G_RDPLOADSYNC || c == G_RDPTILESYNC || ctr64_is_tri_cmd(c) ||
++				  (g_ctr64VertexOnlyMoves &&
++				   ((c == G_MOVEMEM && (_SHIFTR(RSP.w0, 0, 8) == G_MV_LIGHT || _SHIFTR(RSP.w0, 0, 8) == G_MV_NORMALES)) ||
++				    (c == G_MOVEWORD && (_SHIFTR(RSP.w0, 16, 8) == G_MW_NUMLIGHT || _SHIFTR(RSP.w0, 16, 8) == G_MW_SEGMENT ||
++				                         _SHIFTR(RSP.w0, 16, 8) == G_MW_COORD_MOD)))))) {
++				/* DEV ONLY - remove: which commands end batches */
++				ctr64_flushcmd[c]++;
++				if (ctr64_lastw[c][0] == RSP.w0 && ctr64_lastw[c][1] == RSP.w1)
++					ctr64_flushsame[c]++;
 +				dwnd().getDrawer().drawTriangles();
++			}
 +		}
++		ctr64_lastw[RSP.cmd][0] = RSP.w0; /* DEV ONLY */
++		ctr64_lastw[RSP.cmd][1] = RSP.w1;
 +		RSP.batchLoop = true;
 +#endif
  
@@ -1168,7 +1439,7 @@ index a6b6078..a65b373 100644
  }
  
  static
-@@ -88,6 +106,9 @@ void _ProcessDListFactor5()
+@@ -88,6 +157,9 @@ void _ProcessDListFactor5()
  #endif
  
  		RSP.nextCmd = _SHIFTR(*(u32*)&RDRAM[RSP.PC[RSP.PCi] + 8], 24, 8);
@@ -1178,6 +1449,43 @@ index a6b6078..a65b373 100644
  
  		GBI.cmd[RSP.cmd](RSP.w0, RSP.w1);
  		RSP.PC[RSP.PCi] += 8;
+@@ -184,6 +256,19 @@ void RSP_ProcessDList()
+ 	}
+ 
+ 	if (RSP.infloop && REG.SP_STATUS) {
++#ifdef __3DS__
++		if (!ctr64_gfx_infloop_seen)
++			ctr64_log_line("video: a display list branches to itself; display lists run on the CPU thread from now on");
++		ctr64_gfx_infloop_seen = true;
++		{
++			const u32 a = RSP.PC[RSP.PCi];
++			ctr64_infloop_ok = ctr64_infloop_branch;
++			ctr64_infloop_branch = false;
++			ctr64_infloop_addr = a;
++			ctr64_infloop_w0 = ctr64_infloop_ok ? ctr64_infloop_cw0 : (a + 8 <= RDRAMSize ? *(u32*)&RDRAM[a] : 0);
++			ctr64_infloop_w1 = ctr64_infloop_ok ? ctr64_infloop_cw1 : (a + 8 <= RDRAMSize ? *(u32*)&RDRAM[a + 4] : 0);
++		}
++#endif
+ 		*REG.SP_STATUS &= ~(SP_STATUS_TASKDONE | SP_STATUS_HALT | SP_STATUS_BROKE);
+ 		return;
+ 	}
+@@ -287,6 +372,16 @@ void RSP_Init()
+ 		TFH.shutdown();
+ 
+ 	strncpy(RSP.romname, romname, 21);
++#ifdef __3DS__
++	/* ctr64: display lists inline (gfx_async.c): Gauntlet's branch to themselves from the first
++	 * frame; Rayman 2 rewrites a list's memory before the video thread has read it (lost full
++	 * syncs, then a freeze after some minutes; Azahar from a state: threaded froze at ~VI 5600,
++	 * inline ran 8000 VIs clean; raising the lost interrupts did not save it) */
++	if (strstr(RSP.romname, "GAUNTLET LEGENDS") != nullptr)
++		ctr64_gfx_infloop_seen = true;
++	if (strstr(RSP.romname, "Rayman 2") != nullptr)
++		ctr64_gfx_infloop_seen = ctr64_gfx_inline_game = true; /* inline, not streamed (gfx_async.c) */
++#endif
+ 	setDepthClearColor();
+ 	config.generalEmulation.hacks = 0;
+ 	if (strstr(RSP.romname, (const char *)"OgreBattle64") != nullptr)
 diff --git a/GLideN64/src/RSP.h b/GLideN64/src/RSP.h
 index d9c5801..76ccd88 100644
 --- a/GLideN64/src/RSP.h
@@ -1852,10 +2160,24 @@ index 9a2b8ab..338a90a 100644
  private:
  	TextureCache()
 diff --git a/GLideN64/src/VI.cpp b/GLideN64/src/VI.cpp
-index cc9f988..49c754a 100644
+index cc9f988..d4ae779 100644
 --- a/GLideN64/src/VI.cpp
 +++ b/GLideN64/src/VI.cpp
-@@ -263,6 +263,19 @@ void VI_UpdateScreen()
+@@ -25,6 +25,13 @@ VIInfo VI;
+ 
+ u16 VI_GetMaxBufferHeight(u16 _width)
+ {
++#ifdef __3DS__
++	/* a 384-wide low-res picture (Mario Tennis) has 240 lines: allocating 480 made its 2x
++	 * buffers 768x960 (3 MB each), rendered outside the VRAM: 45-55% speed on HW */
++	if (_width > 320 && _width <= 400 && !VI.interlaced && VI.height != 0 &&
++		VI.height <= (VI.PAL ? 290U : 240U))
++		return VI.PAL ? 290 : 240;
++#endif
+ 	if (_width > 320 || VI.interlaced)
+ 		return VI.PAL ? 580 : 480;
+ 
+@@ -263,6 +270,25 @@ void VI_UpdateScreen()
  
  	checkHotkeys();
  
@@ -1863,6 +2185,12 @@ index cc9f988..49c754a 100644
 +	/* a hi-res (640-wide) frame buffer cannot be 2x on the PICA (1024 max): the game continues
 +	 * at native size; all buffers are rebuilt so no 2x buffer is mixed with native ones */
 +	extern bool ctr64_aa_too_wide;
++	/* a 480-line (interlaced) picture: its buffers at 2x are 640-768 x 960, 3-4 MB each, more
++	 * than the VRAM holds: they rendered in FCRAM (Mario Tennis 384x480: 45-55% speed,
++	 * Star Wars Episode I Racer menus: 15-20%). The buffers can be created before their height
++	 * is known (FrameBuffer::init), the VI height is. */
++	if (config.frameBufferEmulation.nativeResFactor > 1 && VI.height > 300)
++		ctr64_aa_too_wide = true;
 +	if (ctr64_aa_too_wide && config.frameBufferEmulation.nativeResFactor > 1) {
 +		config.frameBufferEmulation.nativeResFactor = 1;
 +		frameBufferList().destroy();
@@ -1917,7 +2245,7 @@ index 137c33d..9294bbb 100644
  		dest[(destIdx + 3) & destMask] = src[srcIdx++];
  		dest[(destIdx + 2) & destMask] = src[srcIdx++];
 diff --git a/GLideN64/src/gDP.cpp b/GLideN64/src/gDP.cpp
-index adf9d4a..636f110 100644
+index adf9d4a..480d88b 100644
 --- a/GLideN64/src/gDP.cpp
 +++ b/GLideN64/src/gDP.cpp
 @@ -1,3 +1,4 @@
@@ -1925,7 +2253,33 @@ index adf9d4a..636f110 100644
  #include <assert.h>
  #include <algorithm>
  #include <cmath>
-@@ -371,7 +372,7 @@ bool CheckForFrameBufferTexture(u32 _address, u32 _width, u32 _bytes)
+@@ -26,6 +27,9 @@
+ using namespace std;
+ 
+ gDPInfo gDP;
++#ifdef __3DS__
++static bool ctr64_scissor_set; /* see gDPSetColorImage */
++#endif
+ 
+ // angrylion's macro
+ #define SIGN(x, numb)	(((x) & ((1 << numb) - 1)) | -((x) & (1 << (numb - 1))))
+@@ -175,6 +179,15 @@ void gDPSetColorImage( u32 format, u32 size, u32 width, u32 address )
+ 	gDP.colorImage.height = 0;
+ 	gDP.colorImage.address = address;
+ 
++#ifdef __3DS__
++	/* ctr64: the scissor is RDP state that save states do not keep. Rocket: Robot on Wheels sets
++	 * it once at boot: after a state load (scissor 0x0) nothing was drawn, a black screen. Until
++	 * the game sets one, the scissor covers the color image. */
++	if (!ctr64_scissor_set && width > 0) {
++		const u32 h = VI.height != 0 ? VI.height : width * 3 / 4;
++		gDPSetScissor(G_SC_NON_INTERLACE, 0, 0, static_cast<s16>(width << 2), static_cast<s16>(h << 2));
++	}
++#endif
+ 	frameBufferList().saveBuffer(address, static_cast<u16>(format), static_cast<u16>(size), static_cast<u16>(width), false);
+ 
+ #ifdef DEBUG_DUMP
+@@ -371,7 +384,7 @@ bool CheckForFrameBufferTexture(u32 _address, u32 _width, u32 _bytes)
  {
  	gDP.loadTile->textureMode = TEXTUREMODE_NORMAL;
  	gDP.loadTile->frameBufferAddress = 0U;
@@ -1934,10 +2288,13 @@ index adf9d4a..636f110 100644
  	if (!config.frameBufferEmulation.enable)
  		return false;
  
-@@ -468,6 +469,39 @@ void gDPLoadTile32b(u32 uls, u32 ult, u32 lrs, u32 lrt)
+@@ -467,7 +480,41 @@ void gDPLoadTile32b(u32 uls, u32 ult, u32 lrs, u32 lrt)
+ 	const u32 * src = reinterpret_cast<const u32*>(RDRAM);
  	u16 * tmem16 = reinterpret_cast<u16*>(TMEM);
  	u32 c, ptr, tline, s, xorval;
- 
+-
++	CTR64_TMEM_PAL_TOUCH(); /* both TMEM halves */
++
 +#ifdef __3DS__
 +	/* ctr64: two texels at a time. For an even tline + i, texels i and i + 1 land in the two
 +	 * halfwords of one aligned word of each TMEM half (index (tline + i) ^ xorval and the one
@@ -1974,7 +2331,7 @@ index adf9d4a..636f110 100644
  	for (u32 j = 0; j < height; ++j) {
  		tline = tbase + line * j;
  		s = ((j + ult) * gDP.textureImage.width) + uls;
-@@ -479,10 +513,12 @@ void gDPLoadTile32b(u32 uls, u32 ult, u32 lrs, u32 lrt)
+@@ -479,10 +526,12 @@ void gDPLoadTile32b(u32 uls, u32 ult, u32 lrs, u32 lrt)
  			tmem16[ptr | 0x400] = c & 0xffff;
  		}
  	}
@@ -1987,7 +2344,7 @@ index adf9d4a..636f110 100644
  	gDPSetTileSize( tile, uls, ult, lrs, lrt );
  	gDP.loadTileIdx = tile;
  	gDP.loadTile = &gDP.tiles[tile];
-@@ -557,7 +593,9 @@ void gDPLoadTile(u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt)
+@@ -557,7 +606,9 @@ void gDPLoadTile(u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt)
  	if (gDP.loadTile->lrt > gDP.scissor.lry)
  		height2 = static_cast<u32>(gDP.scissor.lry) - gDP.loadTile->ult;
  
@@ -1998,7 +2355,7 @@ index adf9d4a..636f110 100644
  		return;
  
  	if (address >= RDRAMSize) {
-@@ -568,6 +606,7 @@ void gDPLoadTile(u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt)
+@@ -568,9 +619,16 @@ void gDPLoadTile(u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt)
  	if (gDP.loadTile->size == G_IM_SIZ_32b)
  		gDPLoadTile32b(gDP.loadTile->uls, gDP.loadTile->ult, gDP.loadTile->lrs, gDP.loadTile->lrt);
  	else {
@@ -2006,7 +2363,24 @@ index adf9d4a..636f110 100644
  		u32 tmemAddr = gDP.loadTile->tmem;
  		const u32 line = gDP.loadTile->line;
  		const u32 qwpr = bpr >> 3;
-@@ -615,6 +654,17 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
++#ifdef __3DS__
++		/* qwords tmemAddr up to (height - 1) * line + the row's qwords: into the palette half?
++		 * (wraps at 512: past it, too) */
++		if (tmemAddr + (height ? height - 1 : 0) * line + ((bpr + 7) >> 3) > 256)
++			CTR64_TMEM_PAL_TOUCH();
++#endif
+ 		for (u32 y = 0; y < height && address < RDRAMSize; ++y) {
+ 			if (address + bpl > RDRAMSize)
+ 				UnswapCopyWrap(RDRAM, address, reinterpret_cast<u8*>(TMEM), tmemAddr << 3, 0xFFF, RDRAMSize - address);
+@@ -594,6 +652,7 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
+ 	const u32 * src = reinterpret_cast<const u32*>(RDRAM);
+ 	const u32 tb = gDP.loadTile->tmem << 2;
+ 	const u32 line = gDP.loadTile->line << 2;
++	CTR64_TMEM_PAL_TOUCH(); /* both TMEM halves */
+ 
+ 	u16 *tmem16 = reinterpret_cast<u16*>(TMEM);
+ 	u32 addr = gDP.loadTile->imageAddress >> 2;
+@@ -615,6 +674,17 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
  			t = ((j >> 11) & 1) ? 3 : 1;
  			if (t != oldt)
  				i += line;
@@ -2024,7 +2398,7 @@ index adf9d4a..636f110 100644
  			ptr = ((tb + i) ^ t) & 0x3ff;
  			c = src[addr + i];
  			tmem16[ptr] = c >> 16;
-@@ -623,11 +673,23 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
+@@ -623,11 +693,23 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
  			c = src[addr + i + 1];
  			tmem16[ptr] = c >> 16;
  			tmem16[ptr | 0x400] = c & 0xffff;
@@ -2049,7 +2423,7 @@ index adf9d4a..636f110 100644
  			ptr = ((tb + i) ^ 1) & 0x3ff;
  			c = src[addr + i];
  			tmem16[ptr] = c >> 16;
-@@ -638,6 +700,7 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
+@@ -638,6 +720,7 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
  
  void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  {
@@ -2057,7 +2431,7 @@ index adf9d4a..636f110 100644
  	gDPSetTileSize( tile, uls, ult, lrs, dxt );
  	gDP.loadTileIdx = tile;
  	gDP.loadTile = &gDP.tiles[tile];
-@@ -680,7 +743,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
+@@ -680,7 +763,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  	}
  
  	gDP.loadTile->frameBufferAddress = 0;
@@ -2066,12 +2440,22 @@ index adf9d4a..636f110 100644
  
  	const u32 texLowerBound = gDP.loadTile->tmem;
  	const u32 texUpperBound = gDP.loadTile->tmem + (bytes >> 3);
-@@ -696,7 +759,42 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
- 	else if (gDP.loadTile->format == G_IM_FMT_YUV)
+@@ -693,10 +776,51 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
+ 
+ 	if (gDP.loadTile->size == G_IM_SIZ_32b)
+ 		gDPLoadBlock32(gDP.loadTile->uls, gDP.loadTile->lrs, dxt);
+-	else if (gDP.loadTile->format == G_IM_FMT_YUV)
++	else if (gDP.loadTile->format == G_IM_FMT_YUV) {
++		CTR64_TMEM_PAL_TOUCH();
  		memcpy(TMEM, &RDRAM[address], bytes); // HACK!
++	}
  	else {
 +		CTR64_PROF(17);
  		u32 tmemAddr = gDP.loadTile->tmem;
++#ifdef __3DS__
++		if (tmemAddr + (bytes >> 3) > 256) /* reaches the palette half (bytes: whole qwords; wraps at 512) */
++			CTR64_TMEM_PAL_TOUCH();
++#endif
 +#ifdef __3DS__
 +		// ctr64: the loop below in one pass (same result): qword q of the load is on an odd
 +		// line, whose two dwords are swapped, iff bit 0x800 of q * dxt is set. With a
@@ -2109,7 +2493,7 @@ index adf9d4a..636f110 100644
  		UnswapCopyWrap(RDRAM, address, reinterpret_cast<u8*>(TMEM), tmemAddr << 3, 0xFFF, bytes);
  		if (dxt != 0) {
  			u32 dxtCounter = 0;
-@@ -724,6 +822,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
+@@ -724,6 +848,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  			end_dxt_test:
  				DWordInterleaveWrap(reinterpret_cast<u32*>(TMEM), tmemAddr << 1, 0x3FF, line);
  		}
@@ -2117,7 +2501,7 @@ index adf9d4a..636f110 100644
  	}
  
  	DebugMsg( DEBUG_NORMAL, "gDPLoadBlock( %i, %i, %i, %i, %i );\n", tile, uls, ult, lrs, dxt );
-@@ -731,6 +830,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
+@@ -731,6 +856,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  
  void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  {
@@ -2125,7 +2509,7 @@ index adf9d4a..636f110 100644
  	gDPSetTileSize( tile, uls, ult, lrs, lrt );
  	if (gDP.tiles[tile].tmem < 256) {
  		DebugMsg(DEBUG_NORMAL | DEBUG_ERROR, "gDPLoadTLUT wrong tile tmem addr: tile[%d].tmem=%04x;\n", tile, gDP.tiles[tile].tmem);
-@@ -742,6 +842,59 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
+@@ -742,6 +868,111 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  	u16 * dest = reinterpret_cast<u16*>(TMEM);
  	u32 destIdx = gDP.tiles[tile].tmem << 2;
  
@@ -2140,6 +2524,50 @@ index adf9d4a..636f110 100644
 +	static bool s_palValid[16];
 +	static u64 s_crc16[16], s_crc256;
 +	static bool s_crc256Valid;
++	/* An unchanged reload (Conker reloads the same palettes for most of its textures): the same
++	 * source address, entry count and TMEM place as the last load, the same source words, and
++	 * nothing has written the palette half of TMEM since (ctr64_tmem_pal_gen): TMEM and every
++	 * palette hash are already what the load would make them. */
++	static u32 s_lastAddr, s_lastCount, s_lastTmem, s_lastGen;
++	static u32 s_lastRaw[128];
++	const u32 nwords = (u32(count) + 1) >> 1;
++	const bool rawFits = (address & 3) == 0 && nwords <= 128 && address + nwords * 4 <= RDRAMSize;
++	if (rawFits && s_lastGen == ctr64_tmem_pal_gen && address == s_lastAddr && count == s_lastCount &&
++		gDP.tiles[tile].tmem == s_lastTmem &&
++		memcmp(RDRAM + address, s_lastRaw, nwords * 4) == 0) {
++		gDP.changed |= CHANGED_TMEM; CTR64_TMEM_TOUCH();
++		return;
++	}
++	if (rawFits) {
++		memcpy(s_lastRaw, RDRAM + address, nwords * 4);
++		s_lastAddr = address;
++		s_lastCount = count;
++		s_lastTmem = gDP.tiles[tile].tmem;
++	}
++	CTR64_TMEM_PAL_TOUCH();
++	s_lastGen = rawFits ? ctr64_tmem_pal_gen : ctr64_tmem_pal_gen - 1;
++	/* Palettes taken in turn (Conker: ~1200 loads a frame, mostly other palettes than the last):
++	 * TMEM is written as usual, but the hashes of a load whose source words equal a remembered
++	 * load from the same address are taken from it. Only for loads of whole 16-entry groups
++	 * starting at a group, whose hashes depend on the loaded entries alone. */
++	struct PalRec { u32 addr, count, tmem; bool valid; u32 raw[128]; u64 crc16[16]; };
++	static PalRec s_palCache[32];
++	const u32 groups = u32(count) >> 4;
++	PalRec *rec = nullptr;
++	bool recHit = false;
++	if (rawFits && (count & 15) == 0 && (gDP.tiles[tile].tmem & 15) == 0 && groups > 0) {
++		rec = &s_palCache[((address >> 9) ^ (address >> 4)) & 31];
++		recHit = rec->valid && rec->addr == address && rec->count == count && rec->tmem == gDP.tiles[tile].tmem &&
++				 memcmp(rec->raw, RDRAM + address, nwords * 4) == 0;
++		if (!recHit) {
++			rec->valid = true;
++			rec->addr = address;
++			rec->count = count;
++			rec->tmem = gDP.tiles[tile].tmem;
++			memcpy(rec->raw, RDRAM + address, nwords * 4);
++		}
++	}
++	u32 group = 0;
 +	int i = 0;
 +	while (i < count) {
 +		u16 j = 0;
@@ -2159,6 +2587,12 @@ index adf9d4a..636f110 100644
 +			destIdx += 4;
 +		}
 +
++		if (recHit) {
++			gDP.paletteCRC16[pal] = rec->crc16[group++];
++			s_palValid[pal] = false; /* s_palEntries no longer holds this group */
++			pal = (pal + 1) & 0x0F;
++			continue;
++		}
 +		u16 entries[16];
 +		const u16 *grp = dest + 1024 + (pal << 6);
 +		u32 diff = s_palValid[pal] ? 0 : 1;
@@ -2172,6 +2606,8 @@ index adf9d4a..636f110 100644
 +			s_palValid[pal] = true;
 +		}
 +		gDP.paletteCRC16[pal] = s_palCRC[pal];
++		if (rec != nullptr && group < 16)
++			rec->crc16[group++] = s_palCRC[pal];
 +		pal = (pal + 1) & 0x0F;
 +	}
 +
@@ -2185,7 +2621,7 @@ index adf9d4a..636f110 100644
  	int i = 0;
  	while (i < count) {
  		for (u16 j = 0; (j < 16) && (i < count); ++j, ++i) {
-@@ -755,6 +908,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
+@@ -755,6 +986,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  	}
  
  	gDP.paletteCRC256 = CRC_Calculate(UINT64_MAX, gDP.paletteCRC16, sizeof(u64) * 16);
@@ -2193,7 +2629,7 @@ index adf9d4a..636f110 100644
  
  	if (TFH.isInited()) {
  		const u16 start = static_cast<u16>(gDP.tiles[tile].tmem) - 256; // starting location in the palettes
-@@ -762,7 +916,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
+@@ -762,7 +994,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  		memcpy(reinterpret_cast<u8*>(gDP.TexFilterPalette + start), spal, u32(count)<<1);
  	}
  
@@ -2202,7 +2638,17 @@ index adf9d4a..636f110 100644
  
  	DebugMsg( DEBUG_NORMAL, "gDPLoadTLUT( %i, %i, %i, %i, %i );\n",
  		tile, gDP.tiles[tile].uls, gDP.tiles[tile].ult, gDP.tiles[tile].lrs, gDP.tiles[tile].lrt );
-@@ -885,6 +1039,7 @@ void gDPSetKeyGB(u32 cG, u32 sG, u32 wG, u32 cB, u32 sB, u32 wB )
+@@ -770,6 +1002,9 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
+ 
+ void gDPSetScissor(u32 mode, s16 xh, s16 yh, s16 xl, s16 yl)
+ {
++#ifdef __3DS__
++	ctr64_scissor_set = true;
++#endif
+ 	gDP.scissor.mode = mode;
+ 	gDP.scissor.xh = xh;
+ 	gDP.scissor.yh = yh;
+@@ -885,6 +1120,7 @@ void gDPSetKeyGB(u32 cG, u32 sG, u32 wG, u32 cB, u32 sB, u32 wB )
  
  void gDPTextureRectangle(f32 ulx, f32 uly, f32 lrx, f32 lry, s32 tile, s16 s, s16 t, f32 dsdx, f32 dtdy , bool flip)
  {
@@ -2211,7 +2657,7 @@ index adf9d4a..636f110 100644
  		dsdx /= 4.0f;
  		lrx += 1.0f;
 diff --git a/GLideN64/src/gSP.cpp b/GLideN64/src/gSP.cpp
-index d6662d9..9e2166a 100644
+index d6662d9..3d69815 100644
 --- a/GLideN64/src/gSP.cpp
 +++ b/GLideN64/src/gSP.cpp
 @@ -1,3 +1,4 @@
@@ -2219,21 +2665,50 @@ index d6662d9..9e2166a 100644
  #include <math.h>
  #include <stdio.h>
  #include <string.h>
-@@ -45,6 +46,13 @@ void gSPFlushTriangles()
+@@ -31,10 +32,22 @@ using namespace graphics;
+ #endif
+ 
+ static bool g_ConkerUcode;
++#ifdef __3DS__
++int ctr64_flat_stash = 1; /* dev switch noflatstash.txt (pica_ContextImpl.cpp) */
++int ctr64_stash = 1; /* dev switch nostash.txt: no batching of smooth triangles either */
++#endif
+ 
+ void gSPFlushTriangles()
+ {
+ 	if ((gSP.geometryMode & G_SHADING_SMOOTH) == 0) {
++#ifdef __3DS__
++		/* ctr64: flat shading writes each triangle's colour into its (shared) vertices, so the
++		 * triangles were drawn at once, one draw per triangle command (Pilotwings 64: ~900 draws
++		 * a game frame). Stashing copies the vertices as they are now, which keeps that colour;
++		 * the stash is drawn before any state change (RSP.cpp). Dev switch ctr64_flat_stash = 0. */
++		if (ctr64_flat_stash && RSP.batchLoop && dwnd().getDrawer().stashTriangles())
++			return;
++#endif
+ 		dwnd().getDrawer().drawTriangles();
+ 		return;
+ 	}
+@@ -44,7 +57,19 @@ void gSPFlushTriangles()
+ 		(RSP.nextCmd != G_TRI2) &&
  		(RSP.nextCmd != G_TRIX) &&
  		(RSP.nextCmd != G_QUAD)
++#ifdef __3DS__
++		/* ctr64: Conker's TRI4 too (each one was drawn on its own: ~5800 draws a frame); with
++		 * room kept in the element buffer, which addTriangle does not check */
++		&& !(ctr64_is_tri_cmd(RSP.nextCmd) && dwnd().getDrawer().getTrianglesCount() < (int)ELEMBUFF_SIZE - 48)
++#endif
  		) {
 +#ifdef __3DS__
 +		/* ctr64: the triangles so far are set aside (with copies of their vertices, which a vertex
 +		 * load overwrites) and drawn with later ones as one draw; the display-list loop draws
 +		 * them before any command that may change render state (RSP.cpp) */
-+		if (RSP.batchLoop && dwnd().getDrawer().stashTriangles())
++		if (ctr64_stash && RSP.batchLoop && dwnd().getDrawer().stashTriangles())
 +			return;
 +#endif
  		dwnd().getDrawer().drawTriangles();
  		DebugMsg(DEBUG_NORMAL, "Triangles flushed;\n");
  	}
-@@ -510,6 +518,31 @@ void gSPLightVertexStandard(u32 v, SPVertex * spVtx)
+@@ -510,6 +535,31 @@ void gSPLightVertexStandard(u32 v, SPVertex * spVtx)
  {
  #ifndef __NEON_OPT
  	if (!isHWLightingAllowed()) {
@@ -2265,7 +2740,7 @@ index d6662d9..9e2166a 100644
  		for(int j = 0; j < VNUM; ++j) {
  			SPVertex & vtx = spVtx[v+j];
  			const bool useFirstColor = ((v + j) & 1) == 0;
-@@ -526,6 +559,7 @@ void gSPLightVertexStandard(u32 v, SPVertex * spVtx)
+@@ -526,6 +576,7 @@ void gSPLightVertexStandard(u32 v, SPVertex * spVtx)
  			vtx.g = min(1.0f, vtx.g);
  			vtx.b = min(1.0f, vtx.b);
  		}
@@ -2273,7 +2748,7 @@ index d6662d9..9e2166a 100644
  	} else {
  		for(int j = 0; j < VNUM; ++j) {
  			SPVertex & vtx = spVtx[v+j];
-@@ -941,6 +975,7 @@ template <u32 VNUM>
+@@ -941,6 +992,7 @@ template <u32 VNUM>
  u32 gSPLoadVertexData(const Vertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi, u32 n)
  {
  	const u32 end = n - (n%VNUM) + v0;
@@ -2281,7 +2756,7 @@ index d6662d9..9e2166a 100644
  	for (; vi < end; vi += VNUM) {
  		for(u32 j = 0; j < VNUM; ++j) {
  			SPVertex & vtx = spVtx[vi+j];
-@@ -955,7 +990,7 @@ u32 gSPLoadVertexData(const Vertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi, u3
+@@ -955,7 +1007,7 @@ u32 gSPLoadVertexData(const Vertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi, u3
  				vtx.nx = _FIXED2FLOATCOLOR(orgVtx->normal.x, 7);
  				vtx.ny = _FIXED2FLOATCOLOR(orgVtx->normal.y, 7);
  				vtx.nz = _FIXED2FLOATCOLOR(orgVtx->normal.z, 7);
@@ -2290,15 +2765,177 @@ index d6662d9..9e2166a 100644
  					vtx.r = orgVtx->normal.x;
  					vtx.g = orgVtx->normal.y;
  					vtx.b = orgVtx->normal.z;
-@@ -976,6 +1011,7 @@ u32 gSPLoadVertexData(const Vertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi, u3
+@@ -974,8 +1026,156 @@ u32 gSPLoadVertexData(const Vertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi, u3
+ 	return vi;
+ }
  
++#ifdef __3DS__
++/* ctr64: the standard vertex path (gSPLoadVertexData + gSPProcessVertex + gSPLightVertexStandard)
++ * in one loop with the matrix and lights in locals, as ctr64_cbfd_vertices does for Conker:
++ * built with -fno-strict-aliasing, every store to a vertex made the generic path reload the gSP
++ * values it used next, and it re-checked the geometry mode per group. Same arithmetic, same
++ * order. Taken without billboard, point lighting, texture generation, Acclaim lighting and
++ * hardware lighting (those keep the generic path). One difference: HWLight is set to 0 for every
++ * vertex (the generic path, unlit, set it for the first of each group only; the PICA backend does
++ * not read it). Dev switch: ctr64_std_fast = 0. */
++int ctr64_std_fast = 1;
++static bool ctr64_std_fast_ok()
++{
++	if (!ctr64_std_fast || g_ConkerUcode || gSP.matrix.billboard || !GBI.isLegacyVertexPipeline() ||
++		(gSP.geometryMode & G_ACCLAIM_LIGHTING) != 0)
++		return false;
++	if ((gSP.geometryMode & G_LIGHTING) == 0)
++		return true;
++	return (gSP.geometryMode & (G_POINT_LIGHTING | G_TEXTURE_GEN)) == 0 && !isHWLightingAllowed() &&
++		gSP.numLights < 12;
++}
++
++static void ctr64_std_vertices(const Vertex *orgVtx, SPVertex *spVtx, u32 vi, u32 end)
++{
++	if (gSP.changed & CHANGED_MATRIX)
++		_gSPCombineMatrices();
++	f32 m[4][4];
++	memcpy(m, gSP.matrix.combined, sizeof(m));
++	const f32 scale = dwnd().getAdjustScale();
++	const bool lighting = (gSP.geometryMode & G_LIGHTING) != 0;
++	const u32 nlt = gSP.numLights;
++	f32 rgb[2][12][3], dir[12][3];
++	if (lighting) {
++		for (u32 l = 0; l <= nlt; ++l) {
++			for (int c = 0; c < 3; ++c) {
++				rgb[0][l][c] = gSP.lights.rgb[l][c];
++				rgb[1][l][c] = gSP.lights.rgb2[l][c];
++				dir[l][c] = gSP.lights.i_xyz[l][c];
++			}
++		}
++	}
++	for (; vi < end; ++vi, ++orgVtx) {
++		SPVertex &vtx = spVtx[vi];
++		const f32 x0 = orgVtx->x, y0 = orgVtx->y, z0 = orgVtx->z;
++		vtx.s = _FIXED2FLOAT(orgVtx->s, 5);
++		vtx.t = _FIXED2FLOAT(orgVtx->t, 5);
++		f32 cr, cg, cb;
++		f32 nx = 0.0f, ny = 0.0f, nz = 0.0f;
++		if (lighting) {
++			nx = _FIXED2FLOATCOLOR(orgVtx->normal.x, 7);
++			ny = _FIXED2FLOATCOLOR(orgVtx->normal.y, 7);
++			nz = _FIXED2FLOATCOLOR(orgVtx->normal.z, 7);
++			vtx.nx = nx; vtx.ny = ny; vtx.nz = nz;
++		} else {
++			cr = _FIXED2FLOATCOLOR(orgVtx->color.r, 8);
++			cg = _FIXED2FLOATCOLOR(orgVtx->color.g, 8);
++			cb = _FIXED2FLOATCOLOR(orgVtx->color.b, 8);
++		}
++		vtx.a = _FIXED2FLOATCOLOR(orgVtx->color.a, 8);
++		vtx.modify = 0;
++		const f32 x = x0 * m[0][0] + y0 * m[1][0] + z0 * m[2][0] + m[3][0];
++		const f32 y = x0 * m[0][1] + y0 * m[1][1] + z0 * m[2][1] + m[3][1];
++		const f32 z = x0 * m[0][2] + y0 * m[1][2] + z0 * m[2][2] + m[3][2];
++		const f32 w = x0 * m[0][3] + y0 * m[1][3] + z0 * m[2][3] + m[3][3];
++		vtx.x = x; vtx.y = y; vtx.z = z; vtx.w = w;
++		u8 clip = 0;
++		const f32 scaledX = x * scale;
++		if (scaledX > +w) clip |= CLIP_POSX;
++		if (scaledX < -w) clip |= CLIP_NEGX;
++		if (y > +w) clip |= CLIP_POSY;
++		if (y < -w) clip |= CLIP_NEGY;
++		if (w < 0.01f) clip |= CLIP_W;
++		vtx.clip = clip;
++		vtx.HWLight = 0;
++		if (lighting) {
++			const f32 (*c)[3] = rgb[vi & 1];
++			cr = c[nlt][0]; cg = c[nlt][1]; cb = c[nlt][2];
++			for (u32 i = 0; i < nlt; ++i) {
++				const f32 intensity = nx * dir[i][0] + ny * dir[i][1] + nz * dir[i][2];
++				if (intensity > 0.0f) {
++					cr += c[i][0] * intensity;
++					cg += c[i][1] * intensity;
++					cb += c[i][2] * intensity;
++				}
++			}
++			cr = min(1.0f, cr);
++			cg = min(1.0f, cg);
++			cb = min(1.0f, cb);
++		}
++		vtx.r = cr; vtx.g = cg; vtx.b = cb;
++	}
++}
++
++/* bench.c: the standard vertex path on the hardware, generic (4 at a time) against the fast path,
++ * lit and unlit; ticks per variant, and whether the outputs are identical */
++extern "C" int ctr64_bench_std(unsigned long long ticks[4], unsigned reps)
++{
++	static gSPInfo saved;
++	memcpy(&saved, &gSP, sizeof(gSP));
++	const int savedFast = ctr64_std_fast;
++	const bool savedConker = g_ConkerUcode;
++	g_ConkerUcode = false;
++	gSP.matrix.billboard = 0;
++	for (int r = 0; r < 4; ++r)
++		for (int c = 0; c < 4; ++c)
++			gSP.matrix.combined[r][c] = (r == c ? 1.0f : 0.0f) + 0.01f * (r * 4 + c);
++	gSP.changed &= ~CHANGED_MATRIX;
++	gSP.numLights = 2;
++	for (int l = 0; l < 12; ++l) {
++		gSP.lights.rgb[l][R] = 0.1f + 0.05f * l; gSP.lights.rgb[l][G] = 0.2f; gSP.lights.rgb[l][B] = 0.3f - 0.01f * l;
++		gSP.lights.rgb2[l][R] = 0.15f; gSP.lights.rgb2[l][G] = 0.25f + 0.02f * l; gSP.lights.rgb2[l][B] = 0.35f;
++		gSP.lights.i_xyz[l][0] = 0.5f - 0.1f * l; gSP.lights.i_xyz[l][1] = -0.5f; gSP.lights.i_xyz[l][2] = 0.7f;
++	}
++	enum { N = 32 };
++	Vertex in[N];
++	for (int i = 0; i < N; ++i) {
++		in[i].x = (s16)(i * 37 - 500); in[i].y = (s16)(i * 11 - 200); in[i].z = (s16)(300 - i * 23);
++		in[i].s = (s16)(i * 64); in[i].t = (s16)(i * 32);
++		in[i].flag = 0;
++		in[i].color.r = (u8)(i * 7); in[i].color.g = (u8)(255 - i * 3); in[i].color.b = (u8)(i * 13); in[i].color.a = 200;
++	}
++	static SPVertex out[2][N];
++	int same = 1;
++	for (int lit = 0; lit < 2; ++lit) {
++		gSP.geometryMode = lit ? G_LIGHTING : 0;
++		memset(out, 0, sizeof(out));
++		u64 t0 = svcGetSystemTick();
++		for (unsigned k = 0; k < reps; ++k)
++			gSPLoadVertexData<VEC_OPT>(in, out[0], 0, 0, N);
++		ticks[lit * 2] = svcGetSystemTick() - t0;
++		t0 = svcGetSystemTick();
++		for (unsigned k = 0; k < reps; ++k)
++			ctr64_std_vertices(in, out[1], 0, N);
++		ticks[lit * 2 + 1] = svcGetSystemTick() - t0;
++		for (int i = 0; i < N; ++i) {
++			const SPVertex &a = out[0][i], &b = out[1][i];
++			if (memcmp(&a.x, &b.x, 4 * 4) || memcmp(&a.r, &b.r, 4 * 4) || memcmp(&a.s, &b.s, 2 * 4) ||
++				a.clip != b.clip || a.modify != b.modify || (lit && memcmp(&a.nx, &b.nx, 3 * 4)))
++				same = 0;
++		}
++	}
++	memcpy(&gSP, &saved, sizeof(gSP));
++	g_ConkerUcode = savedConker;
++	ctr64_std_fast = savedFast;
++	return same;
++}
++#endif
++
  void gSPVertex(u32 a, u32 n, u32 v0)
  {
 +	CTR64_PROF(0);
  	DebugMsg(DEBUG_NORMAL, "gSPVertex n = %i, v0 = %i, from %08x\n", n, v0, a);
  
  	if ((n + v0) > INDEXMAP_SIZE) {
-@@ -1011,6 +1047,7 @@ template <u32 VNUM>
+@@ -1002,6 +1202,12 @@ void gSPVertex(u32 a, u32 n, u32 v0)
+ 
+ 	const Vertex *vertex = (Vertex*)&RDRAM[address];
+ 	SPVertex * spVtx = dwnd().getDrawer().getVertexPtr(0);
++#ifdef __3DS__
++	if (ctr64_std_fast_ok()) {
++		ctr64_std_vertices(vertex, spVtx, v0, n + v0);
++		return;
++	}
++#endif
+ 	u32 i = gSPLoadVertexData<VEC_OPT>(vertex, spVtx, v0, v0, n);
+ 	if (i < n + v0)
+ 		gSPLoadVertexData<1>(vertex + (i - v0), spVtx, v0, i, n);
+@@ -1011,6 +1217,7 @@ template <u32 VNUM>
  u32 gSPLoadCIVertexData(const PDVertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi, u32 n)
  {
  	const u32 end = n - (n%VNUM) + v0;
@@ -2306,7 +2943,7 @@ index d6662d9..9e2166a 100644
  	for (; vi < end; vi += VNUM) {
  		for(u32 j = 0; j < VNUM; ++j) {
  			SPVertex & vtx = spVtx[vi+j];
-@@ -1025,7 +1062,7 @@ u32 gSPLoadCIVertexData(const PDVertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi
+@@ -1025,7 +1232,7 @@ u32 gSPLoadCIVertexData(const PDVertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi
  				vtx.nx = _FIXED2FLOATCOLOR((s8)color[3], 7);
  				vtx.ny = _FIXED2FLOATCOLOR((s8)color[2], 7);
  				vtx.nz = _FIXED2FLOATCOLOR((s8)color[1], 7);
@@ -2315,7 +2952,371 @@ index d6662d9..9e2166a 100644
  					vtx.r = (s8)color[3];
  					vtx.g = (s8)color[2];
  					vtx.b = (s8)color[1];
-@@ -2035,7 +2072,7 @@ void _loadSpriteImage(const uSprite *_pSprite)
+@@ -1046,6 +1253,7 @@ u32 gSPLoadCIVertexData(const PDVertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi
+ 
+ void gSPCIVertex( u32 a, u32 n, u32 v0 )
+ {
++	CTR64_PROF(0);
+ 	DebugMsg(DEBUG_NORMAL, "gSPCIVertex n = %i, v0 = %i, from %08x\n", n, v0, a);
+ 
+ 	if ((n + v0) > INDEXMAP_SIZE) {
+@@ -1101,6 +1309,7 @@ u32 gSPLoadDMAVertexData(u32 address, SPVertex * spVtx, u32 v0, u32 vi, u32 n)
+ 
+ void gSPDMAVertex( u32 a, u32 n, u32 v0 )
+ {
++	CTR64_PROF(0);
+ 	DebugMsg(DEBUG_NORMAL, "gSPDMAVertex n = %i, v0 = %i, from %08x\n", n, v0, a);
+ 
+ 	if ((n + v0) > INDEXMAP_SIZE) {
+@@ -1150,8 +1359,290 @@ u32 gSPLoadCBFDVertexData(const Vertex *orgVtx, SPVertex * spVtx, u32 v0, u32 vi
+ 	return vi;
+ }
+ 
++#ifdef __3DS__
++/* ctr64: Conker's vertices (gSPLoadCBFDVertexData<1> + gSPProcessVertex<1> + CBFD lighting) in one
++ * loop with the matrix, viewport scale and lights held in locals. GLideN64 is built with
++ * -fno-strict-aliasing, so in the generic path every store to a vertex made the compiler reload
++ * every gSP value it used (matrix, lights) for the next statement; per vertex the generic path
++ * also re-checked gSP.changed and the geometry mode, and called five functions. Same arithmetic,
++ * same order. Taken when no texture generation, Acclaim lighting or billboard is involved (those
++ * keep the generic path), dev switch: ctr64_cbfd_fast = 0. HW sample: the video thread spent ~30%
++ * of its busy time in vertex processing in Conker. */
++int ctr64_cbfd_fast = 1;
++static bool ctr64_cbfd_fast_ok()
++{
++	return ctr64_cbfd_fast && !gSP.matrix.billboard && GBI.isLegacyVertexPipeline() &&
++		(gSP.geometryMode & (G_TEXTURE_GEN | G_ACCLAIM_LIGHTING)) == 0 &&
++		((gSP.geometryMode & G_LIGHTING) == 0 || (gSP.numLights >= 1 && gSP.numLights < 12));
++}
++
++static inline f32 ctr64_min1(f32 v) { return v < 1.0f ? v : 1.0f; } /* = std::min(1.0f, v) */
++
++/* Lazy lighting. Conker loads up to 32 vertices at a time and lights them all, but only about half
++ * are used by a triangle that survives culling (Azahar, rain intro: 233k lit, 118k used). The
++ * lighting (most of the vertex cost) is now done when a triangle first uses the vertex
++ * (GraphicsDrawer::addTriangle; gSPModifyVertex and line drawing too), with the light state of its
++ * load, kept in a ring of light sets: the same values in the same order, identical results. The
++ * vertex keeps its transformed position, normal and unlit colour; ctr64_unlit = its set + 1. */
++struct Ctr64LightSet
++{
++	int nlt;
++	bool advanced, point;
++	f32 lrgb[12][3], lpos[12][3], li[12][3], lca[12];
++	f32 cm[16];
++};
++/* Conker makes ~1400 sets a frame. Before a slot is reused, the vertices still waiting for it are
++ * lit; only the vertex range its loads wrote is looked at (a scan of the whole 22 KB vertex buffer
++ * per reuse, cheap in Azahar, cost the 3DS about what lazy lighting saved). */
++enum { CTR64_LSETS = 256 };
++static Ctr64LightSet s_ctr64LightSets[CTR64_LSETS];
++static u32 s_ctr64LightSetLast = CTR64_LSETS - 1; /* the newest set */
++static bool s_ctr64LightSetUsed[CTR64_LSETS];
++static u32 s_ctr64LightSetWaiting[CTR64_LSETS]; /* vertices still waiting for each set */
++static u16 s_ctr64LightSetLo[CTR64_LSETS], s_ctr64LightSetHi[CTR64_LSETS]; /* vertices its loads wrote */
++
++static inline f32 ctr64_min1(f32 v);
++
++void ctr64_cbfd_light(SPVertex &vtx)
++{
++	const Ctr64LightSet &ls = s_ctr64LightSets[vtx.ctr64_unlit - 1];
++	s_ctr64LightSetWaiting[vtx.ctr64_unlit - 1]--;
++	vtx.ctr64_unlit = 0;
++	const int nlt = ls.nlt;
++	const bool advanced = ls.advanced, point = ls.point;
++	const f32 (*lrgb)[3] = ls.lrgb, (*lpos)[3] = ls.lpos, (*li)[3] = ls.li;
++	const f32 *lca = ls.lca, *cm = ls.cm;
++	const f32 x = vtx.x, y = vtx.y, z = vtx.z;
++	const f32 nx = vtx.nx, ny = vtx.ny, nz = vtx.nz;
++	/* gSPLightVertexCBFD_advanced / _basic. The intensities first, two lights at a time
++	 * (independent: the VFP's divide and multiply-add latencies overlap instead of one
++	 * light waiting for the previous one), then summed in the original order: identical
++	 * results. ctr64_min1 = std::min(1.0f, v) (NaN -> 1). */
++	const f32 px = (x + cm[8]) * cm[12], py = (y + cm[9]) * cm[13], pz = (z + cm[10]) * cm[14];
++	f32 r = lrgb[nlt][0], g = lrgb[nlt][1], b = lrgb[nlt][2];
++	f32 it[12];
++	int top = nlt - 2; /* last point light; basic: lights nlt-2..0 */
++	if (advanced)
++		it[nlt - 1] = ctr64_min1(nx * li[nlt - 1][0] + ny * li[nlt - 1][1] + nz * li[nlt - 1][2]);
++	int l = top;
++	for (; l >= 1; l -= 2) {
++		const int k = l - 1;
++		const f32 ax = px - lpos[l][0], ay = py - lpos[l][1], az = pz - lpos[l][2];
++		const f32 bx = px - lpos[k][0], by = py - lpos[k][1], bz = pz - lpos[k][2];
++		const f32 alen = 2.0f * (ax * ax + ay * ay + az * az) * FIXED2FLOATRECIP16;
++		const f32 blen = 2.0f * (bx * bx + by * by + bz * bz) * FIXED2FLOATRECIP16;
++		f32 ia = ctr64_min1(lca[l] / alen);
++		f32 ib = ctr64_min1(lca[k] / blen);
++		if (advanced && point) {
++			ia *= ctr64_min1(nx * li[l][0] + ny * li[l][1] + nz * li[l][2]);
++			ib *= ctr64_min1(nx * li[k][0] + ny * li[k][1] + nz * li[k][2]);
++		}
++		it[l] = ia;
++		it[k] = ib;
++	}
++	if (l == 0) {
++		const f32 ax = px - lpos[0][0], ay = py - lpos[0][1], az = pz - lpos[0][2];
++		const f32 alen = 2.0f * (ax * ax + ay * ay + az * az) * FIXED2FLOATRECIP16;
++		f32 ia = ctr64_min1(lca[0] / alen);
++		if (advanced && point)
++			ia *= ctr64_min1(nx * li[0][0] + ny * li[0][1] + nz * li[0][2]);
++		it[0] = ia;
++	}
++	for (int j = advanced ? nlt - 1 : top; j >= 0; --j) {
++		const f32 intensity = it[j];
++		if (intensity > 0.0f) {
++			r += lrgb[j][0] * intensity;
++			g += lrgb[j][1] * intensity;
++			b += lrgb[j][2] * intensity;
++		}
++	}
++	r = min(1.0f, r);
++	g = min(1.0f, g);
++	b = min(1.0f, b);
++	vtx.r *= r;
++	vtx.g *= g;
++	vtx.b *= b;
++}
++
++/* a light set for the current lights (the newest one again when they are the same); before a
++ * ring slot is reused, the vertices still waiting for its lights are lit */
++static u32 ctr64_cbfd_light_set(const Ctr64LightSet &cur)
++{
++	Ctr64LightSet &last = s_ctr64LightSets[s_ctr64LightSetLast];
++	if (s_ctr64LightSetUsed[s_ctr64LightSetLast] && memcmp(&last, &cur, sizeof(cur)) == 0)
++		return s_ctr64LightSetLast + 1;
++	const u32 k = (s_ctr64LightSetLast + 1) % CTR64_LSETS;
++	if (s_ctr64LightSetUsed[k] && s_ctr64LightSetWaiting[k] != 0) {
++		SPVertex *v = dwnd().getDrawer().getVertexPtr(0);
++		for (u32 i = s_ctr64LightSetLo[k]; i < s_ctr64LightSetHi[k] && s_ctr64LightSetWaiting[k] != 0; ++i)
++			if (v[i].ctr64_unlit == k + 1)
++				ctr64_cbfd_light(v[i]);
++	}
++	memcpy(&s_ctr64LightSets[k], &cur, sizeof(cur));
++	s_ctr64LightSetUsed[k] = true;
++	s_ctr64LightSetLo[k] = VERTBUFF_SIZE;
++	s_ctr64LightSetHi[k] = 0;
++	s_ctr64LightSetLast = k;
++	return k + 1;
++}
++
++/* before the vertex buffer is written by anything else than ctr64_cbfd_vertices */
++static void ctr64_cbfd_resolve_range(SPVertex *spVtx, u32 v0, u32 n)
++{
++	for (u32 i = v0; i < v0 + n && i < VERTBUFF_SIZE; ++i)
++		if (spVtx[i].ctr64_unlit != 0) {
++			s_ctr64LightSetWaiting[spVtx[i].ctr64_unlit - 1]--;
++			spVtx[i].ctr64_unlit = 0;
++		}
++}
++
++static void ctr64_cbfd_vertices(const Vertex *orgVtx, SPVertex *spVtx, u32 vi, u32 end)
++{
++	if (gSP.changed & CHANGED_MATRIX)
++		_gSPCombineMatrices();
++	f32 m[4][4];
++	memcpy(m, gSP.matrix.combined, sizeof(m));
++	const f32 scale = dwnd().getAdjustScale();
++	const bool lighting = (gSP.geometryMode & G_LIGHTING) != 0;
++	const bool advanced = gSP.cbfd.advancedLighting;
++	const bool point = (gSP.geometryMode & G_POINT_LIGHTING) != 0;
++	const int nlt = (int)gSP.numLights;
++	const u32 nbase = gSP.cbfd.vertexNormalBase;
++	u32 token = 0;
++	if (lighting) {
++		Ctr64LightSet cur;
++		memset(&cur, 0, sizeof(cur)); /* unused entries compare equal */
++		cur.nlt = nlt;
++		cur.advanced = advanced;
++		cur.point = point;
++		for (int l = 0; l <= nlt; ++l) {
++			cur.lrgb[l][0] = gSP.lights.rgb[l][R]; cur.lrgb[l][1] = gSP.lights.rgb[l][G]; cur.lrgb[l][2] = gSP.lights.rgb[l][B];
++			cur.lpos[l][0] = gSP.lights.pos_xyzw[l][X]; cur.lpos[l][1] = gSP.lights.pos_xyzw[l][Y]; cur.lpos[l][2] = gSP.lights.pos_xyzw[l][Z];
++			cur.li[l][0] = gSP.lights.i_xyz[l][0]; cur.li[l][1] = gSP.lights.i_xyz[l][1]; cur.li[l][2] = gSP.lights.i_xyz[l][2];
++			cur.lca[l] = gSP.lights.ca[l];
++		}
++		memcpy(cur.cm, gSP.cbfd.vertexCoordMod, sizeof(cur.cm));
++		token = ctr64_cbfd_light_set(cur);
++		u16 &lo = s_ctr64LightSetLo[token - 1], &hi = s_ctr64LightSetHi[token - 1];
++		if (vi < lo)
++			lo = static_cast<u16>(vi);
++		if (end > hi)
++			hi = static_cast<u16>(end);
++	}
++	const s8 *rdram8 = (const s8 *)RDRAM;
++	for (; vi < end; ++vi, ++orgVtx) {
++		SPVertex &vtx = spVtx[vi];
++		/* gSPLoadCBFDVertexData */
++		const f32 x0 = orgVtx->x, y0 = orgVtx->y, z0 = orgVtx->z;
++		vtx.s = _FIXED2FLOAT(orgVtx->s, 5);
++		vtx.t = _FIXED2FLOAT(orgVtx->t, 5);
++		const s16 flag = orgVtx->flag;
++		vtx.flag = flag;
++		f32 nx = 0.0f, ny = 0.0f, nz = 0.0f;
++		if (lighting) {
++			const u32 off = vi << 1;
++			nx = _FIXED2FLOATCOLOR(rdram8[(nbase + off + 0) ^ 3], 7);
++			ny = _FIXED2FLOATCOLOR(rdram8[(nbase + off + 1) ^ 3], 7);
++			nz = _FIXED2FLOATCOLOR((s8)(flag & 0xFF), 7);
++			vtx.nx = nx; vtx.ny = ny; vtx.nz = nz;
++		}
++		f32 cr = _FIXED2FLOATCOLOR(orgVtx->color.r, 8);
++		f32 cg = _FIXED2FLOATCOLOR(orgVtx->color.g, 8);
++		f32 cb = _FIXED2FLOATCOLOR(orgVtx->color.b, 8);
++		vtx.a = _FIXED2FLOATCOLOR(orgVtx->color.a, 8);
++		/* gSPProcessVertex: transform, clip codes */
++		vtx.modify = 0;
++		const f32 x = x0 * m[0][0] + y0 * m[1][0] + z0 * m[2][0] + m[3][0];
++		const f32 y = x0 * m[0][1] + y0 * m[1][1] + z0 * m[2][1] + m[3][1];
++		const f32 z = x0 * m[0][2] + y0 * m[1][2] + z0 * m[2][2] + m[3][2];
++		const f32 w = x0 * m[0][3] + y0 * m[1][3] + z0 * m[2][3] + m[3][3];
++		vtx.x = x; vtx.y = y; vtx.z = z; vtx.w = w;
++		u8 clip = 0;
++		const f32 scaledX = x * scale;
++		if (scaledX > +w) clip |= CLIP_POSX;
++		if (scaledX < -w) clip |= CLIP_NEGX;
++		if (y > +w) clip |= CLIP_POSY;
++		if (y < -w) clip |= CLIP_NEGY;
++		if (w < 0.01f) clip |= CLIP_W;
++		vtx.clip = clip;
++		vtx.HWLight = 0;
++		if (vtx.ctr64_unlit != 0) /* overwritten before any triangle used it */
++			s_ctr64LightSetWaiting[vtx.ctr64_unlit - 1]--;
++		vtx.ctr64_unlit = (lighting && flag >= 0) ? token : 0; /* lit when a triangle uses it */
++		if (vtx.ctr64_unlit != 0)
++			s_ctr64LightSetWaiting[token - 1]++;
++		vtx.r = cr; vtx.g = cg; vtx.b = cb;
++	}
++}
++
++/* bench.c: the CBFD vertex path on the hardware, generic (1 and 4 at a time) against the fast path
++ * on the same input; result: ticks per variant, and whether the outputs are identical */
++extern "C" int ctr64_bench_cbfd(unsigned long long ticks[3], unsigned reps)
++{
++	static gSPInfo saved;
++	memcpy(&saved, &gSP, sizeof(gSP));
++	const bool savedConker = g_ConkerUcode;
++	const int savedFast = ctr64_cbfd_fast;
++	g_ConkerUcode = true;
++	gSP.matrix.billboard = 0;
++	for (int r = 0; r < 4; ++r)
++		for (int c = 0; c < 4; ++c)
++			gSP.matrix.combined[r][c] = (r == c ? 1.0f : 0.0f) + 0.01f * (r * 4 + c);
++	gSP.changed &= ~CHANGED_MATRIX;
++	gSP.geometryMode = G_LIGHTING | G_POINT_LIGHTING;
++	gSP.cbfd.advancedLighting = true;
++	gSP.cbfd.vertexNormalBase = 0x1000;
++	gSP.numLights = 5;
++	for (int l = 0; l < 12; ++l) {
++		gSP.lights.rgb[l][R] = 0.1f + 0.05f * l; gSP.lights.rgb[l][G] = 0.2f; gSP.lights.rgb[l][B] = 0.3f - 0.01f * l;
++		gSP.lights.pos_xyzw[l][X] = 100.0f * l; gSP.lights.pos_xyzw[l][Y] = -50.0f * l; gSP.lights.pos_xyzw[l][Z] = 30.0f;
++		gSP.lights.i_xyz[l][0] = 0.5f; gSP.lights.i_xyz[l][1] = -0.5f; gSP.lights.i_xyz[l][2] = 0.7f;
++		gSP.lights.ca[l] = 2000.0f + 100.0f * l;
++	}
++	for (int k = 0; k < 16; ++k)
++		gSP.cbfd.vertexCoordMod[k] = (k >= 12) ? 1.5f : 3.0f * k;
++	enum { N = 32 };
++	Vertex in[N];
++	for (int i = 0; i < N; ++i) {
++		in[i].x = (s16)(i * 37 - 500); in[i].y = (s16)(i * 11 - 200); in[i].z = (s16)(300 - i * 23);
++		in[i].s = (s16)(i * 64); in[i].t = (s16)(i * 32);
++		in[i].flag = (s16)(i * 5 - 40);
++		in[i].color.r = (u8)(i * 7); in[i].color.g = (u8)(255 - i * 3); in[i].color.b = 128; in[i].color.a = 200;
++	}
++	static SPVertex out[3][N];
++	memset(out, 0, sizeof(out));
++	u64 t0 = svcGetSystemTick();
++	for (unsigned k = 0; k < reps; ++k)
++		gSPLoadCBFDVertexData<1>(in, out[0], 0, 0, N);
++	ticks[0] = svcGetSystemTick() - t0;
++	t0 = svcGetSystemTick();
++	for (unsigned k = 0; k < reps; ++k)
++		gSPLoadCBFDVertexData<4>(in, out[1], 0, 0, N);
++	ticks[1] = svcGetSystemTick() - t0;
++	t0 = svcGetSystemTick();
++	for (unsigned k = 0; k < reps; ++k) {
++		ctr64_cbfd_vertices(in, out[2], 0, N);
++		for (int i = 0; i < N; ++i) /* the lighting, which drawing does later (lazy lighting) */
++			ctr64_cbfd_resolve(out[2][i]);
++	}
++	ticks[2] = svcGetSystemTick() - t0;
++	int same = 1;
++	for (int i = 0; i < N; ++i) {
++		const SPVertex &a = out[0][i], &b = out[2][i];
++		if (memcmp(&a.x, &b.x, 4 * 4) || memcmp(&a.r, &b.r, 4 * 4) || memcmp(&a.s, &b.s, 2 * 4) ||
++			(a.flag != b.flag) || (a.clip != b.clip) || (a.HWLight != b.HWLight) || memcmp(&a.nx, &b.nx, 3 * 4))
++			same = 0;
++	}
++	memcpy(&gSP, &saved, sizeof(gSP));
++	g_ConkerUcode = savedConker;
++	ctr64_cbfd_fast = savedFast;
++	return same;
++}
++#endif
++
+ void gSPCBFDVertex( u32 a, u32 n, u32 v0 )
+ {
++	CTR64_PROF(0);
+ 	DebugMsg(DEBUG_NORMAL, "gSPCBFDVertex n = %i, v0 = %i, from %08x\n", n, v0, a);
+ 
+ 	if ((n + v0) > INDEXMAP_SIZE) {
+@@ -1176,6 +1667,13 @@ void gSPCBFDVertex( u32 a, u32 n, u32 v0 )
+ 
+ 	const Vertex *vertex = (Vertex*)&RDRAM[address];
+ 	SPVertex * spVtx = dwnd().getDrawer().getVertexPtr(0);
++#ifdef __3DS__
++	if (ctr64_cbfd_fast_ok()) {
++		ctr64_cbfd_vertices(vertex, spVtx, v0, n + v0);
++		return;
++	}
++	ctr64_cbfd_resolve_range(spVtx, v0, n);
++#endif
+ 	u32 i = gSPLoadCBFDVertexData<VEC_OPT>(vertex, spVtx, v0, v0, n);
+ 	if (i < n + v0)
+ 		gSPLoadCBFDVertexData<1>(vertex + (i - v0), spVtx, v0, i, n);
+@@ -1229,6 +1727,7 @@ u32 gSPLoadF3DAMVertexData(const Vertex *orgVtx, SPVertex * spVtx, u32 v0, u32 v
+ 
+ void gSPF3DAMVertex(u32 a, u32 n, u32 v0)
+ {
++	CTR64_PROF(0);
+ 	DebugMsg(DEBUG_NORMAL, "gSPF3DAMVertex n = %i, v0 = %i, from %08x\n", n, v0, a);
+ 
+ 	if ((n + v0) > INDEXMAP_SIZE) {
+@@ -1393,6 +1892,12 @@ void gSPDisplayList( u32 dl )
+ 	}
+ }
+ 
++#ifdef __3DS__
++bool ctr64_infloop_branch;
++/* the branch's words as read: with the list on the worker the CPU may rewrite them before
++ * RSP.cpp looks again, and recording them then waited forever (Gauntlet's intro, stream mode) */
++u32 ctr64_infloop_cw0, ctr64_infloop_cw1;
++#endif
+ void gSPBranchList( u32 dl )
+ {
+ 	u32 address = RSP_SegmentToPhysical( dl );
+@@ -1406,6 +1911,11 @@ void gSPBranchList( u32 dl )
+ 	DebugMsg(DEBUG_NORMAL, "gSPBranchList( 0x%08X ) nopush\n", dl );
+ 
+ 	if (address == (RSP.PC[RSP.PCi] - 8)) {
++#ifdef __3DS__
++		ctr64_infloop_branch = true; /* RSP.cpp: waits for this command to be rewritten */
++		ctr64_infloop_cw0 = RSP.w0;
++		ctr64_infloop_cw1 = RSP.w1;
++#endif
+ 		RSP.infloop = true;
+ 		RSP.PC[RSP.PCi] -= 8;
+ 		RSP.halt = true;
+@@ -1692,6 +2202,9 @@ void gSPModifyVertex( u32 _vtx, u32 _where, u32 _val )
+ 	GraphicsDrawer & drawer = dwnd().getDrawer();
+ 
+ 	SPVertex & vtx0 = drawer.getVertex(_vtx);
++#ifdef __3DS__
++	ctr64_cbfd_resolve(vtx0);
++#endif
+ 	switch (_where) {
+ 		case G_MWO_POINT_RGBA:
+ 			vtx0.r = _FIXED2FLOATCOLOR(_SHIFTR( _val, 24, 8 ),8);
+@@ -2035,7 +2548,7 @@ void _loadSpriteImage(const uSprite *_pSprite)
  			gDP.tiles[0].frameBufferAddress = pBuffer->m_startAddress;
  			gDP.tiles[0].textureMode = TEXTUREMODE_FRAMEBUFFER_BG;
  			gDP.tiles[0].loadType = LOADTYPE_TILE;
@@ -2324,7 +3325,7 @@ index d6662d9..9e2166a 100644
  		}
  	}
  }
-@@ -2065,7 +2102,7 @@ void gSPSprite2DBase(u32 _base)
+@@ -2065,7 +2578,7 @@ void gSPSprite2DBase(u32 _base)
  	gSPTexture( 1.0f, 1.0f, 0, 0, TRUE );
  	gDP.otherMode.texturePersp = 1;
  
@@ -2334,10 +3335,37 @@ index d6662d9..9e2166a 100644
  
  	f32 scaleX = 1.0f, scaleY = 1.0f;
 diff --git a/GLideN64/src/gSP.h b/GLideN64/src/gSP.h
-index 84e50b2..61b2b08 100644
+index 84e50b2..90165f3 100644
 --- a/GLideN64/src/gSP.h
 +++ b/GLideN64/src/gSP.h
-@@ -150,6 +150,23 @@ struct gSPInfo
+@@ -36,7 +36,8 @@ enum Axis { X ,Y, Z, W };
+ struct SPVertex
+ {
+ 	f32 x, y, z, w;
+-	f32 nx, ny, nz, __pad0;
++	f32 nx, ny, nz;
++	u32 ctr64_unlit; /* 3DS: lighting not done yet (light set + 1, gSP.cpp ctr64_cbfd_vertices) */
+ 	f32 r, g, b, a;
+ 	f32 flat_r, flat_g, flat_b, flat_a;
+ 	f32 s, t;
+@@ -47,6 +48,16 @@ struct SPVertex
+ 	s16 flag;
+ };
+ 
++#ifdef __3DS__
++void ctr64_cbfd_light(SPVertex &_vtx);
++/* the lighting of a vertex whose lighting was left until a triangle uses it */
++static inline void ctr64_cbfd_resolve(SPVertex &_vtx)
++{
++	if (_vtx.ctr64_unlit != 0)
++		ctr64_cbfd_light(_vtx);
++}
++#endif
++
+ struct gSPInfo
+ {
+ 	u32 segment[16];
+@@ -150,6 +161,23 @@ struct gSPInfo
  
  extern gSPInfo gSP;
  
@@ -2361,6 +3389,28 @@ index 84e50b2..61b2b08 100644
  void gSPLoadUcodeEx( u32 uc_start, u32 uc_dstart, u16 uc_dsize );
  void gSPNoOp();
  void gSPMatrix( u32 matrix, u8 param );
+diff --git a/GLideN64/src/uCodes/F3DEX2CBFD.cpp b/GLideN64/src/uCodes/F3DEX2CBFD.cpp
+index a740aad..969675e 100644
+--- a/GLideN64/src/uCodes/F3DEX2CBFD.cpp
++++ b/GLideN64/src/uCodes/F3DEX2CBFD.cpp
+@@ -1,4 +1,7 @@
+ #include "GLideN64.h"
++#ifdef __3DS__
++extern unsigned g_ctr64TriCmdLo, g_ctr64TriCmdHi; extern bool g_ctr64VertexOnlyMoves; /* GraphicsDrawer.cpp */
++#endif
+ #include "DebugDump.h"
+ #include "F3D.h"
+ #include "F3DEX.h"
+@@ -147,4 +150,9 @@ void F3DEX2CBFD_Init()
+ 	GBI_SetGBI( G_LINE3D,				F3DEX2_LINE3D,				F3DEX2_Line3D );
+ 	for (u32 i = 0; i < 16; ++i)
+ 		GBI.cmd[F3DEX2CBFD_TRI4+i] = F3DEX2CBFD_Tri4;
++#ifdef __3DS__
++	g_ctr64TriCmdLo = F3DEX2CBFD_TRI4;
++	g_ctr64TriCmdHi = F3DEX2CBFD_TRI4 + 15;
++	g_ctr64VertexOnlyMoves = true;
++#endif
+ }
 diff --git a/GLideN64/src/uCodes/F5Indi_Naboo.cpp b/GLideN64/src/uCodes/F5Indi_Naboo.cpp
 index b661ea9..3aefc08 100644
 --- a/GLideN64/src/uCodes/F5Indi_Naboo.cpp
@@ -2467,10 +3517,19 @@ index 8e3d81e..5631e74 100644
  
  #ifdef ANDROID
 diff --git a/custom/GLideN64/mupenplus/Config_mupenplus.cpp b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
-index fb51f34..575dc55 100644
+index fb51f34..1726133 100644
 --- a/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 +++ b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
-@@ -19,6 +19,16 @@ extern "C" {
+@@ -11,6 +11,8 @@
+ #include "../GLideN64.h"
+ #include "../GBI.h"
+ #include "../RSP.h"
++#include <cstdio>
++#include <cstring>
+ #include "../Log.h"
+ extern "C" {
+ #include "main/util.h"
+@@ -19,6 +21,16 @@ extern "C" {
  
  Config config;
  
@@ -2487,7 +3546,7 @@ index fb51f34..575dc55 100644
  std::string replaceChars(std::string myString)
  {
  	for (size_t pos = myString.find(' '); pos != std::string::npos; pos = myString.find(' ', pos))
-@@ -171,7 +181,13 @@ extern "C" void Config_LoadConfig()
+@@ -171,7 +183,13 @@ extern "C" void Config_LoadConfig()
  	config.frameBufferEmulation.copyFromRDRAM = EnableCopyColorFromRDRAM;
  
  	// TODO: Make this a Core options or maybe only default to bsOnVerticalInterrupt on Android with Thr Renderer
@@ -2501,7 +3560,7 @@ index fb51f34..575dc55 100644
  
  #ifdef HAVE_OPENGLES2
  	config.generalEmulation.enableFragmentDepthWrite = 0;
-@@ -220,6 +236,9 @@ extern "C" void Config_LoadConfig()
+@@ -220,6 +238,9 @@ extern "C" void Config_LoadConfig()
  	config.textureFilter.txHiresTextureFileStorage = EnableEnhancedHighResStorage;
  	config.textureFilter.txHiresVramLimit = MaxHiResTxVramLimit;
  	config.frameBufferEmulation.nativeResFactor = EnableNativeResFactor;
@@ -2511,11 +3570,30 @@ index fb51f34..575dc55 100644
  
  	config.generalEmulation.hacks = hacks;
  
-@@ -230,5 +249,55 @@ extern "C" void Config_LoadConfig()
+@@ -230,5 +251,74 @@ extern "C" void Config_LoadConfig()
  		LoadCustomSettings(false);
  	}
  
 +#ifdef __3DS__
++	/* ctr64 per-game choices (dev switch nogamefix.txt: off):
++	 * - Wave Race 64: its custom ini entry copies every frame to RDRAM in sync mode, a ~9 ms GPU
++	 *   wait per frame (HW 80-96%); the double-buffered copy never waits, and the frames are the
++	 *   same (Azahar, in a race).
++	 * - Yoshi's Story: its three parallax backgrounds are 336-texel images scrolled past their
++	 *   edge, which the one-piece mode draws as one quad that has to wrap at 336 (PICA textures
++	 *   wrap at the power-of-two size: half the screen black on HW, the wrong half elsewhere);
++	 *   the stripped mode draws them the RDP's way, right. */
++	{
++		FILE *f = fopen("sdmc:/3ds/ctr64/nogamefix.txt", "r");
++		if (f)
++			fclose(f);
++		else {
++			if (strstr(RSP.romname, "WAVE RACE 64") != nullptr && config.frameBufferEmulation.copyToRDRAM == Config::ctSync)
++				config.frameBufferEmulation.copyToRDRAM = Config::ctDoubleBuffer;
++			if (strstr(RSP.romname, "YOSHI STORY") != nullptr)
++				config.graphics2D.bgMode = Config::BGMode::bgStripped;
++		}
++	}
 +	/* ctr64 video settings override the game's own (custom ini) choices */
 +	g_ctr64GameCopyToRDRAM = config.frameBufferEmulation.copyToRDRAM;
 +	if (ctr64_setting_fb_copy >= 0)
@@ -2914,6 +3992,22 @@ index 4426728..be19d3e 100644
          }
      }
  }
+diff --git a/mupen64plus-core/src/device/r4300/interrupt.c b/mupen64plus-core/src/device/r4300/interrupt.c
+index 9c81a18..dd6886f 100644
+--- a/mupen64plus-core/src/device/r4300/interrupt.c
++++ b/mupen64plus-core/src/device/r4300/interrupt.c
+@@ -140,9 +140,11 @@ void add_interrupt_event_count(struct cp0* cp0, int type, unsigned int count)
+     unsigned int* cp0_next_interrupt = r4300_cp0_next_interrupt(cp0);
+     int* cp0_cycle_count = r4300_cp0_cycle_count(cp0);
+ 
++#if !defined(__3DS__) /* ctr64: async display lists queue several DP_INT checks (rsp_core.c) */
+     if (get_event(&cp0->q, type)) {
+         DebugMessage(M64MSG_WARNING, "two events of type 0x%x in interrupt queue", type);
+     }
++#endif
+ 
+     event = alloc_node(&cp0->q.pool);
+     if (event == NULL)
 diff --git a/mupen64plus-core/src/device/r4300/mips_instructions.def b/mupen64plus-core/src/device/r4300/mips_instructions.def
 index c3a4acf..8ff5e97 100644
 --- a/mupen64plus-core/src/device/r4300/mips_instructions.def
@@ -2990,7 +4084,7 @@ index c3a4acf..8ff5e97 100644
                      }
                  }
 diff --git a/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.c b/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.c
-index 8acef67..f9f1337 100644
+index 8acef67..692cb4e 100644
 --- a/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.c
 +++ b/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.c
 @@ -31,6 +31,9 @@
@@ -3003,7 +4097,27 @@ index 8acef67..f9f1337 100644
  
  void jump_vaddr_r0(void);
  void jump_vaddr_r1(void);
-@@ -239,9 +242,18 @@ static u_int jump_table_symbols[] = {
+@@ -61,6 +64,19 @@ static void invalidate_addr(u_int addr);
+ 
+ static u_int literals[1024][2];
+ static unsigned int needs_clear_cache[1<<(TARGET_SIZE_2-17)];
++#if defined(__3DS__)
++/* ctr64: single patched instructions (undone links) are flushed by line, all in one call, rather
++ * than marking their whole 4 KB page in needs_clear_cache (Conker: ~15000 page flushes a second). */
++_Bool ctr_jit_flush_lines(const unsigned int *lines, unsigned int n);
++static unsigned int ctr64_kill_lines[512], ctr64_kill_n;
++static void mark_clear_cache(uintptr_t host_addr)
++{
++  unsigned int line=(unsigned int)host_addr&~31u;
++  if(ctr64_kill_n&&ctr64_kill_lines[ctr64_kill_n-1]==line) return;
++  if(ctr64_kill_n<512) { ctr64_kill_lines[ctr64_kill_n++]=line; return; }
++  needs_clear_cache[(host_addr-(uintptr_t)base_addr)>>17]|=1<<(((host_addr-(uintptr_t)base_addr)>>12)&31);
++}
++#endif
+ 
+ static const u_int jump_vaddr_reg[16] = {
+   (int)jump_vaddr_r0,
+@@ -239,9 +255,18 @@ static u_int jump_table_symbols[] = {
    (int)breakpoint
  };
  
@@ -3022,7 +4136,7 @@ index 8acef67..f9f1337 100644
  }
  
  /* Linker */
-@@ -394,10 +406,14 @@ static void alloc_reg(struct regstat *cur,int i,signed char reg)
+@@ -394,10 +419,14 @@ static void alloc_reg(struct regstat *cur,int i,signed char reg)
    if((cur->u>>reg)&1) return;
  
    // see if it's already allocated
@@ -3037,7 +4151,7 @@ index 8acef67..f9f1337 100644
  
    // Keep the same mapping if the register was already allocated in a loop
    preferred_reg = loop_reg(i,reg,preferred_reg);
-@@ -838,7 +854,11 @@ static void alloc_arm_reg(struct regstat *cur,int i,signed char reg,int hr)
+@@ -838,7 +867,11 @@ static void alloc_arm_reg(struct regstat *cur,int i,signed char reg,int hr)
    int dirty=0;
  
    // see if it's already allocated (and dealloc it)
@@ -3049,7 +4163,7 @@ index 8acef67..f9f1337 100644
    {
      if(n!=EXCLUDE_REG&&cur->regmap[n]==reg) {
        dirty=(cur->dirty>>n)&1;
-@@ -1918,6 +1938,15 @@ static void emit_readptr(int addr, int rt)
+@@ -1918,6 +1951,15 @@ static void emit_readptr(int addr, int rt)
  {
    emit_readword(addr,rt);
  }
@@ -3065,7 +4179,7 @@ index 8acef67..f9f1337 100644
  static void emit_movsbl(int addr, int rt)
  {
    u_int offset = addr-(u_int)&g_dev.r4300.new_dynarec_hot_state;
-@@ -2353,6 +2382,55 @@ static void emit_vstr(int vr,int r)
+@@ -2353,6 +2395,55 @@ static void emit_vstr(int vr,int r)
    output_w32(0xed800b00|(vr<<12)|(r<<16));
  }
  
@@ -3121,7 +4235,7 @@ index 8acef67..f9f1337 100644
  static void emit_ftosizs(int s,int d)
  {
    assem_debug("ftosizs s%d,s%d",d,s);
-@@ -3063,53 +3141,53 @@ static void fconv_assemble_arm(int i,struct regstat *i_regs)
+@@ -3063,53 +3154,53 @@ static void fconv_assemble_arm(int i,struct regstat *i_regs)
  #ifndef INTERPRET_FCONV
    #if (defined(__VFP_FP__) && !defined(__SOFTFP__))
    if(opcode2[i]==0x10&&(source[i]&0x3f)==0x0d) { // trunc_w_s
@@ -3187,7 +4301,7 @@ index 8acef67..f9f1337 100644
      emit_fcvtsd(7,13);
      emit_fsts(13,temp);
      return;
-@@ -3129,146 +3207,146 @@ static void fconv_assemble_arm(int i,struct regstat *i_regs)
+@@ -3129,146 +3220,146 @@ static void fconv_assemble_arm(int i,struct regstat *i_regs)
  
    if(opcode2[i]==0x14&&(source[i]&0x3f)==0x20) {
      emit_addimm(FP,fp_fcr31,ARG1_REG);
@@ -3386,7 +4500,7 @@ index 8acef67..f9f1337 100644
      emit_call((int)floor_w_d);
    }
  
-@@ -3306,8 +3384,8 @@ static void fcomp_assemble(int i,struct regstat *i_regs)
+@@ -3306,8 +3397,8 @@ static void fcomp_assemble(int i,struct regstat *i_regs)
  
    #if (defined(__VFP_FP__) && !defined(__SOFTFP__))
    if(opcode2[i]==0x10) {
@@ -3397,7 +4511,7 @@ index 8acef67..f9f1337 100644
      emit_orimm(fs,0x800000,fs);
      emit_flds(temp,14);
      emit_flds(HOST_TEMPREG,15);
-@@ -3329,8 +3407,8 @@ static void fcomp_assemble(int i,struct regstat *i_regs)
+@@ -3329,8 +3420,8 @@ static void fcomp_assemble(int i,struct regstat *i_regs)
      return;
    }
    if(opcode2[i]==0x11) {
@@ -3408,7 +4522,7 @@ index 8acef67..f9f1337 100644
      emit_orimm(fs,0x800000,fs);
      emit_vldr(temp,6);
      emit_vldr(HOST_TEMPREG,7);
-@@ -3365,8 +3443,8 @@ static void fcomp_assemble(int i,struct regstat *i_regs)
+@@ -3365,8 +3456,8 @@ static void fcomp_assemble(int i,struct regstat *i_regs)
    save_regs(reglist);
    if(opcode2[i]==0x10) {
      emit_addimm(FP,fp_fcr31,ARG1_REG);
@@ -3419,7 +4533,7 @@ index 8acef67..f9f1337 100644
      if((source[i]&0x3f)==0x30) emit_call((int)c_f_s);
      if((source[i]&0x3f)==0x31) emit_call((int)c_un_s);
      if((source[i]&0x3f)==0x32) emit_call((int)c_eq_s);
-@@ -3386,8 +3464,8 @@ static void fcomp_assemble(int i,struct regstat *i_regs)
+@@ -3386,8 +3477,8 @@ static void fcomp_assemble(int i,struct regstat *i_regs)
    }
    if(opcode2[i]==0x11) {
      emit_addimm(FP,fp_fcr31,ARG1_REG);
@@ -3430,12 +4544,12 @@ index 8acef67..f9f1337 100644
      if((source[i]&0x3f)==0x30) emit_call((int)c_f_d);
      if((source[i]&0x3f)==0x31) emit_call((int)c_un_d);
      if((source[i]&0x3f)==0x32) emit_call((int)c_eq_d);
-@@ -3426,129 +3504,45 @@ static void float_assemble(int i,struct regstat *i_regs)
+@@ -3426,129 +3517,45 @@ static void float_assemble(int i,struct regstat *i_regs)
  
  #ifndef INTERPRET_FLOAT
    #if (defined(__VFP_FP__) && !defined(__SOFTFP__))
 -  if((source[i]&0x3f)==6) // mov
--  {
+   {
 -    if(((source[i]>>11)&0x1f)!=((source[i]>>6)&0x1f)) {
 -      if(opcode2[i]==0x10) {
 -        emit_readword((u_int)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_simple[(source[i]>>11)&0x1f],temp);
@@ -3448,13 +4562,25 @@ index 8acef67..f9f1337 100644
 -        emit_readword((u_int)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_double[(source[i]>>6)&0x1f],HOST_TEMPREG);
 -        emit_vldr(temp,7);
 -        emit_vstr(7,HOST_TEMPREG);
--      }
--    }
++    /* ctr64: operands straight from / to the FPU registers (emit_fpr_load/store); same
++     * operations and order as before (both sources are loaded before the result is stored) */
++    const int r_s=(source[i]>>11)&0x1f, r_t=(source[i]>>16)&0x1f, r_d=(source[i]>>6)&0x1f;
++    const int dbl=opcode2[i]==0x11;
++#define CTR64_FPR(n) (dbl?(void *const *)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_double[(n)]:(void *const *)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_simple[(n)])
++    const int a=dbl?7:15, b=dbl?6:13;
++    const int op=source[i]&0x3f;
++    if(op==6) { // mov
++      if(r_s!=r_d) {
++        emit_fpr_load(CTR64_FPR(r_s),a,dbl,temp);
++        emit_fpr_store(CTR64_FPR(r_d),a,dbl,temp);
+       }
++      return;
+     }
 -    return;
 -  }
 -
 -  if((source[i]&0x3f)>3)
-   {
+-  {
 -    if(opcode2[i]==0x10) {
 -      emit_readword((u_int)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_simple[(source[i]>>11)&0x1f],temp);
 -      emit_flds(temp,15);
@@ -3474,18 +4600,7 @@ index 8acef67..f9f1337 100644
 -      emit_vldr(temp,7);
 -      if(((source[i]>>11)&0x1f)!=((source[i]>>6)&0x1f)) {
 -        emit_readword((u_int)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_double[(source[i]>>6)&0x1f],temp);
-+    /* ctr64: operands straight from / to the FPU registers (emit_fpr_load/store); same
-+     * operations and order as before (both sources are loaded before the result is stored) */
-+    const int r_s=(source[i]>>11)&0x1f, r_t=(source[i]>>16)&0x1f, r_d=(source[i]>>6)&0x1f;
-+    const int dbl=opcode2[i]==0x11;
-+#define CTR64_FPR(n) (dbl?(void *const *)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_double[(n)]:(void *const *)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_simple[(n)])
-+    const int a=dbl?7:15, b=dbl?6:13;
-+    const int op=source[i]&0x3f;
-+    if(op==6) { // mov
-+      if(r_s!=r_d) {
-+        emit_fpr_load(CTR64_FPR(r_s),a,dbl,temp);
-+        emit_fpr_store(CTR64_FPR(r_d),a,dbl,temp);
-       }
+-      }
 -      if((source[i]&0x3f)==4) // sqrt
 -        emit_fsqrtd(7,7);
 -      if((source[i]&0x3f)==5) // abs
@@ -3503,8 +4618,7 @@ index 8acef67..f9f1337 100644
 -    }
 -    if(opcode2[i]==0x11) {
 -      emit_readword((u_int)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_double[(source[i]>>11)&0x1f],temp);
-+      return;
-     }
+-    }
 -    if(((source[i]>>11)&0x1f)!=((source[i]>>16)&0x1f)) {
 -      if(opcode2[i]==0x10) {
 -        emit_readword((u_int)&g_dev.r4300.new_dynarec_hot_state.cp1_regs_simple[(source[i]>>16)&0x1f],HOST_TEMPREG);
@@ -3594,7 +4708,7 @@ index 8acef67..f9f1337 100644
      return;
    }
    #endif
-@@ -3566,19 +3560,19 @@ static void float_assemble(int i,struct regstat *i_regs)
+@@ -3566,19 +3573,19 @@ static void float_assemble(int i,struct regstat *i_regs)
      {
        case 0x00: case 0x01: case 0x02: case 0x03:
          emit_addimm(FP,fp_fcr31,ARG1_REG);
@@ -3621,7 +4735,7 @@ index 8acef67..f9f1337 100644
          break;
      }
      switch(source[i]&0x3f)
-@@ -3601,19 +3595,19 @@ static void float_assemble(int i,struct regstat *i_regs)
+@@ -3601,19 +3608,19 @@ static void float_assemble(int i,struct regstat *i_regs)
      {
        case 0x00: case 0x01: case 0x02: case 0x03:
          emit_addimm(FP,fp_fcr31,ARG1_REG);
@@ -3648,6 +4762,32 @@ index 8acef67..f9f1337 100644
          break;
      }
      switch(source[i]&0x3f)
+@@ -3940,6 +3947,12 @@ static void do_miniht_insert(u_int return_address,int rt,int temp) {
+ static void do_clear_cache(void)
+ {
+   int i,j;
++#if defined(__3DS__)
++  if(!ctr_jit_flush_lines(ctr64_kill_lines,ctr64_kill_n))
++    for(unsigned int k=0;k<ctr64_kill_n;k++)
++      needs_clear_cache[(ctr64_kill_lines[k]-(uintptr_t)base_addr)>>17]|=1<<(((ctr64_kill_lines[k]-(uintptr_t)base_addr)>>12)&31);
++  ctr64_kill_n=0;
++#endif
+   for (i=0;i<(1<<(TARGET_SIZE_2-17));i++)
+   {
+     u_int bitmap=needs_clear_cache[i];
+@@ -3956,10 +3969,11 @@ static void do_clear_cache(void)
+               end+=4096;
+               j++;
+             }else{
+-              cache_flush((void *)start,(void *)end);
+               break;
+             }
+           }
++          /* ctr64: also a run that reaches bit 31 (upstream never flushed it) */
++          cache_flush((void *)start,(void *)end);
+         }
+       }
+       needs_clear_cache[i]=0;
 diff --git a/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.h b/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.h
 index e562423..340fd97 100644
 --- a/mupen64plus-core/src/device/r4300/new_dynarec/arm/assem_arm.h
@@ -3689,7 +4829,7 @@ index adcae2d..4488d21 100644
      bl     dynamic_linker
      mov    pc, r0
 diff --git a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
-index 1e8f261..6f02f04 100644
+index 1e8f261..0fc0764 100644
 --- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
 +++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
 @@ -55,7 +55,10 @@
@@ -3724,7 +4864,7 @@ index 1e8f261..6f02f04 100644
    uint64_t u;
    uint64_t uu;
    u_int wasconst;
-@@ -296,15 +301,68 @@ int new_recompile_block(int addr);
+@@ -296,15 +301,66 @@ int new_recompile_block(int addr);
  void invalidate_block(u_int block);
  void *get_addr_ht(u_int vaddr);
  void *get_addr_32(u_int vaddr,u_int flags);
@@ -3758,11 +4898,9 @@ index 1e8f261..6f02f04 100644
 +#define CTR64_CT_INFLIGHT(addr) (ctr_jit_thread_busy && (uintptr_t)(addr)-ctr64_ct_lo < ctr64_ct_span)
 +#define CTR64_CT_SYNC() do { if (ctr_jit_thread_busy && !ctr_jit_on_compile_thread()) ctr64_ct_sync(); } while (0)
 +/* ctr64: FPU register addresses are built into compiled code for the current Status.FR (emit_fpr_addr).
-+ * A game that keeps switching FR (Jet Force Gemini: per thread) would recompile everything at each
-+ * switch: after CTR64_FR_TOGGLES switches the code loads the addresses at run time instead. */
-+#define CTR64_FR_TOGGLES 8
++ * At a game's first FR switch (Jet Force Gemini: per thread; Donkey Kong 64: around one function)
++ * all code is thrown away and from then on loads the addresses at run time (MTC0_new). */
 +int ctr64_fr_dynamic;
-+static int ctr64_fr_toggles;
 +#define CTR64_CT_TAKE() do { if (ctr64_ct_unfinished && !ctr_jit_thread_busy) ctr64_ct_finish(); } while (0)
 +#else
 +#define CTR64_CT_INFLIGHT(addr) 0
@@ -3793,7 +4931,7 @@ index 1e8f261..6f02f04 100644
  
  static u_int start;
  static u_int *source;
-@@ -330,6 +388,127 @@ static u_int ba[MAXBLOCK];
+@@ -330,6 +386,171 @@ static u_int ba[MAXBLOCK];
  static char likely[MAXBLOCK];
  static char is_ds[MAXBLOCK];
  static char ooo[MAXBLOCK];
@@ -3808,6 +4946,41 @@ index 1e8f261..6f02f04 100644
 + * stores, COP0/COP1, HI/LO. Dev switch nowaitskip.txt: off. */
 +static char ctr64_wl[MAXBLOCK];
 +int ctr64_waitskip = 1;
++/* Yield loops (ctr64_wl 2): `while (x == old) osYieldThread();` (1080 Snowboarding: 80k thread
++ * switches a second, each through __osEnqueueAndYield/__osDispatchThread - MFC0/MTC0, MI mask
++ * reads and writes, ERET - half of the CPU thread). The yield is opaque (it clobbers the caller-
++ * saved registers) and the loop may read through pointers held in registers. Skipping to the
++ * next event is exact only while the yield gives the CPU straight back to the same thread (no
++ * other ready thread of equal priority): ERET_new sets ctr64_yield_same when an ERET resumes the
++ * same place and stack as the one before it, and the skip is taken only then. */
++int ctr64_yield_same;
++static u_int ctr64_eret_pc, ctr64_eret_sp;
++#define CTR64_WL_YIELD 0xFFFFFFFFu   /* marker in the loop's instruction sequence */
++#define CTR64_WL_CLOBBER 0x8300FFFEu /* at, v0-v1, a0-a3, t0-t7, t8-t9, ra */
++static u_int *ctr64_wl_code(u_int a);
++/* libultra's osYieldThread: sets its own state to OS_STATE_RUNNABLE (2, halfword at 0x10) and
++ * calls __osEnqueueAndYield, which starts by reading Status (mfc0 t0, $12) */
++static int ctr64_wl_is_yield(u_int g)
++{
++  u_int *c=ctr64_wl_code(g);
++  if(!c) return 0;
++  int two=-1, sh=0, eay=0;
++  for(int k=0;k<24;k++) {
++    u_int x=c[k];
++    if(x==0x03e00008) return two>=0&&sh&&eay;
++    if((x>>26)==0x09&&((x>>21)&31)==0&&(x&0xffff)==2) two=(x>>16)&31;      /* addiu rX, zero, 2 */
++    else if((x>>26)==0x29&&(x&0xffff)==0x10&&two>=0&&(int)((x>>16)&31)==two) sh=1; /* sh rX, 0x10(..) */
++    else if((x>>26)==0x2b||(x>>26)==0x28||(x>>26)==0x29||(x>>26)==0x3f) {  /* other stores: stack only */
++      if(((x>>21)&31)!=29) return 0;
++    }
++    else if((x>>26)==3) {
++      u_int t=(g&0xF0000000)|((x&0x3FFFFFF)<<2);
++      u_int *e=ctr64_wl_code(t);
++      if(e&&(e[0]==0x40086000||e[1]==0x40086000||e[2]==0x40086000||e[3]==0x40086000)) eay=1;
++    }
++  }
++  return 0;
++}
 +unsigned int ctr64_waitloops; /* compiled (stats.log "dynarec events") */
 +static int ctr64_wl_rdram(u_int a, int size)
 +{
@@ -3817,7 +4990,7 @@ index 1e8f261..6f02f04 100644
 +  return 1;
 +}
 +/* one instruction of the loop, in execution order; 0: not allowed */
-+static int ctr64_wl_insn(u_int w, uint32_t wr_all, uint32_t *wr_now, int known[32], u_int val[32])
++static int ctr64_wl_insn(u_int w, uint32_t wr_all, uint32_t *wr_now, int known[32], u_int val[32], int yl)
 +{
 +  int op=w>>26, rs=(w>>21)&31, rt=(w>>16)&31, rd=(w>>11)&31, fn=w&63;
 +  int src1=-1, src2=-1, dst=-1, ld=0;
@@ -3835,9 +5008,9 @@ index 1e8f261..6f02f04 100644
 +  if(src1>0&&((wr_all>>src1)&1)&&!((*wr_now>>src1)&1)) return 0;
 +  if(src2>0&&((wr_all>>src2)&1)&&!((*wr_now>>src2)&1)) return 0;
 +  if(ld) {
-+    if(!known[rs]) return 0;
 +    int size=(op==0x23)?4:(op==0x21||op==0x25)?2:1;
-+    if(!ctr64_wl_rdram(val[rs]+imm,size)) return 0;
++    if(!known[rs]) { if(!yl) return 0; }   /* yield loop: through a pointer the loop holds */
++    else if(!ctr64_wl_rdram(val[rs]+imm,size)) return 0;
 +  }
 +  if(dst>0) {
 +    *wr_now|=1u<<dst;
@@ -3880,13 +5053,17 @@ index 1e8f261..6f02f04 100644
 +  const int len=(me-ba[i])>>2;
 +  /* the loop's instructions in execution order: body, a JAL's delay slot, its getter */
 +  /* (a JAL anywhere else - in a delay slot, inside the getter - is not followed: rejected) */
-+  u_int seq[48]; int n=0, k;
++  u_int seq[48]; int n=0, k, yl=0;
 +  for(k=0;k<len;k++) {
 +    u_int x=lc[k];
 +    if((x>>26)==3) {                       /* JAL getter */
 +      u_int g=((ba[i]+k*4+4)&0xF0000000)|((x&0x3FFFFFF)<<2);
 +      u_int *gc=ctr64_wl_code(g);
 +      if(!gc||k+1>=len||(lc[k+1]>>26)==3) return 0;
++      if(!yl&&ctr64_wl_is_yield(g)) {      /* JAL osYieldThread: the call is opaque */
++        seq[n++]=x; seq[n++]=lc[k+1]; seq[n++]=CTR64_WL_YIELD; k++; yl=1;
++        continue;
++      }
 +      seq[n++]=x; seq[n++]=lc[k+1]; k++;
 +      int m;
 +      for(m=0;m<8;m++) {
@@ -3904,24 +5081,29 @@ index 1e8f261..6f02f04 100644
 +    seq[n++]=x;
 +  }
 +  uint32_t wr_all=0, wr_now=0;
-+  for(k=0;k<n;k++) wr_all|=ctr64_wl_writes(seq[k]);
++  for(k=0;k<n;k++) wr_all|=seq[k]==CTR64_WL_YIELD?CTR64_WL_CLOBBER:ctr64_wl_writes(seq[k]);
 +  wr_all&=~1u;
 +  int known[32]={1}; u_int val[32]={0};
 +  for(k=0;k<n;k++) {
++    if(seq[k]==CTR64_WL_YIELD) {
++      wr_now|=CTR64_WL_CLOBBER;
++      for(int r=1;r<32;r++) if((CTR64_WL_CLOBBER>>r)&1) known[r]=0;
++      continue;
++    }
 +    if((seq[k]>>26)==3) { wr_now|=1u<<31; continue; }
-+    if(!ctr64_wl_insn(seq[k],wr_all,&wr_now,known,val)) return 0;
++    if(!ctr64_wl_insn(seq[k],wr_all,&wr_now,known,val,yl)) return 0;
 +  }
 +  int rs=(w>>21)&31, rt=(w>>16)&31;      /* the branch reads values of this iteration */
 +  if(rs&&((wr_all>>rs)&1)&&!((wr_now>>rs)&1)) return 0;
 +  if(rt&&((wr_all>>rt)&1)&&!((wr_now>>rt)&1)) return 0;
 +  if(!(wr_all&((1u<<rs)|(1u<<rt))&~1u)) return 0;  /* it tests something the loop loads */
-+  return 1;
++  return yl?2:1;
 +}
 +#endif
  static uint64_t unneeded_reg[MAXBLOCK];
  static uint64_t unneeded_reg_upper[MAXBLOCK];
  static uint64_t branch_unneeded_reg[MAXBLOCK];
-@@ -361,6 +540,34 @@ static u_int dirty_entry_count;
+@@ -361,7 +582,63 @@ static u_int dirty_entry_count;
  static u_int copy_size;
  static struct ll_entry* hash_table[65536][2];
  static struct ll_entry *jump_in[4096];
@@ -3932,6 +5114,7 @@ index 1e8f261..6f02f04 100644
 + * through dynamic_linker -> get_clean, which walked the whole page list (24% of the dynarec's
 + * time in SSB/MK64 transitions). */
 +static u_int ctr64_ji_gen[4096];
++static struct ll_entry *jump_dirty[4096];
 +static int ctr64_rb_in_idle; /* compiling remembered blocks between frames (ctr64_rb_idle) */
 +int ctr64_fast_compile; /* optional compiler passes skipped (bits, see pass 5); dev switch fastcompile.txt */
 +/* ctr64: dev switch spnocheck.txt: stores relative to the stack pointer ($sp, r29) skip the check
@@ -3941,6 +5124,23 @@ index 1e8f261..6f02f04 100644
 +int ctr64_sp_nocheck=0;
 +#if defined(__3DS__)
 +#define CTR64_SP_NOCHECK(i) (ctr64_sp_nocheck&&rs1[i]==29)
++/* a writable TLB mapping onto a physical page that has compiled code (ctr64_protect_aliases) */
++#if defined(__3DS__)
++#define CTR64_ALIAS_HAS_CODE(lutw) (!g_dev.r4300.cached_interp.invalid_code[(lutw)>>12])
++/* per physical page: its aliases are write-protected (ctr64_protect_aliases); cleared when the page
++ * is invalidated (an alias may have been unprotected) and on state loads. Mappings made later are
++ * checked by the TLB writes themselves (CTR64_ALIAS_HAS_CODE). */
++static u_char ctr64_alias_gen[2048];
++/* per virtual page (hashed): the TLB has evicted it. Jumps into such pages are not linked
++ * (dynamic_linker): each eviction would unlink them again (free, cache flush) and the next jump
++ * link them (malloc), ~20k times a second in Conker. They go through the lookup instead. */
++static u_char ctr64_tlb_churn[2048];
++static int ctr64_tlb_soft_evict(u_int vp);
++int ctr64_churn_nolink=1; /* dev switch churnlink.txt: 0 */
++int ctr64_ht_first=1; /* dev switch nohtfirst.txt: 0 (dynamic_linker) */
++#else
++#define CTR64_ALIAS_HAS_CODE(lutw) 0
++#endif
 +#else
 +#define CTR64_SP_NOCHECK(i) 0
 +#endif
@@ -3949,14 +5149,25 @@ index 1e8f261..6f02f04 100644
 +static unsigned short ctr64_pgen[2049]; /* RDRAM page write generations (DMA, interpreted stores, state loads); [2048] = cartridge ROM (never written) */
 +static void ctr64_bg_page(unsigned int page); /* background precompile: a page was written */
 +static struct { u_int vaddr, page, gen; struct ll_entry *e; } ctr64_gc[4096];
-+#define CTR64_JI_TOUCH(head) do { if((head)>=jump_in&&(head)<jump_in+4096) ctr64_ji_gen[(head)-jump_in]++; } while(0)
++/* ctr64: get_dirty cache, the same scheme for the jump_dirty lists: per list a generation bumped by
++ * every change; a slot remembers the first entry for (vaddr, flags) that is not in flight (or none).
++ * get_dirty then checks that entry exactly as the walk would; only if it fails (expiring, code
++ * changed) does it walk on. HW sample (Conker): the jump_dirty walk was 11% of the CPU thread. */
++static u_int ctr64_jd_gen[4096];
++unsigned ctr64_gd_stat[4]; /* get_dirty cache: hits, slot taken, list changed (stats.log) */
++static struct { u_int vaddr, flags, page, gen; struct ll_entry *e; } ctr64_gd[4096];
++#define CTR64_JI_TOUCH(head) do { if((head)>=jump_in&&(head)<jump_in+4096) ctr64_ji_gen[(head)-jump_in]++; \
++  else if((head)>=jump_dirty&&(head)<jump_dirty+4096) ctr64_jd_gen[(head)-jump_dirty]++; } while(0)
 +#else
 +#define CTR64_JI_TOUCH(head) do { } while(0)
 +#endif
++#if !defined(__3DS__)
  static struct ll_entry *jump_dirty[4096];
++#endif
  static struct ll_entry *jump_out[4096];
  static unsigned char restore_candidate[512];
-@@ -380,12 +587,128 @@ static void clear_all_regs(signed char regmap[])
+ 
+@@ -380,12 +657,128 @@ static void clear_all_regs(signed char regmap[])
    for (hr=0;hr<HOST_REGS;hr++) regmap[hr]=-1;
  }
  
@@ -4085,7 +5296,7 @@ index 1e8f261..6f02f04 100644
  
  // Find a register that is available for two consecutive cycles
  static signed char get_reg2(signed char regmap1[],signed char regmap2[],int r)
-@@ -397,6 +720,15 @@ static signed char get_reg2(signed char regmap1[],signed char regmap2[],int r)
+@@ -397,6 +790,15 @@ static signed char get_reg2(signed char regmap1[],signed char regmap2[],int r)
  
  static int count_free_regs(signed char regmap[])
  {
@@ -4101,7 +5312,7 @@ index 1e8f261..6f02f04 100644
    int count=0;
    int hr;
    for(hr=0;hr<HOST_REGS;hr++)
-@@ -410,13 +742,17 @@ static int count_free_regs(signed char regmap[])
+@@ -410,13 +812,17 @@ static int count_free_regs(signed char regmap[])
  
  static void dirty_reg(struct regstat *cur,signed char reg)
  {
@@ -4121,7 +5332,7 @@ index 1e8f261..6f02f04 100644
  }
  
  // If we dirty the lower half of a 64 bit register which is now being
-@@ -427,7 +763,12 @@ static void dirty_reg(struct regstat *cur,signed char reg)
+@@ -427,7 +833,12 @@ static void dirty_reg(struct regstat *cur,signed char reg)
  static void flush_dirty_uppers(struct regstat *cur)
  {
    int hr,reg;
@@ -4135,7 +5346,7 @@ index 1e8f261..6f02f04 100644
      if((cur->dirty>>hr)&1) {
        reg=cur->regmap[hr];
        if(reg>=64)
-@@ -610,6 +951,18 @@ static int needed_again(int r, int i)
+@@ -610,6 +1021,18 @@ static int needed_again(int r, int i)
        break;
      }
    }
@@ -4154,7 +5365,7 @@ index 1e8f261..6f02f04 100644
    for(;j>=1;j--)
    {
      if(rs1[i+j]==r) rn=j;
-@@ -1267,7 +1620,11 @@ static void provisional_r32(void)
+@@ -1267,7 +1690,11 @@ static void provisional_r32(void)
  
      // Dirty registers which are 32-bit, require 32-bit input
      // as they will be written as 32-bit values
@@ -4166,7 +5377,7 @@ index 1e8f261..6f02f04 100644
      {
        if(regs[i].regmap_entry[hr]>0&&regs[i].regmap_entry[hr]<64) {
          if((regs[i].was32>>regs[i].regmap_entry[hr])&(regs[i].wasdirty>>hr)&1) {
-@@ -1606,6 +1963,34 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1606,6 +2033,34 @@ static void clean_registers(int istart,int iend,int wr)
      }
      will_dirty_next=will_dirty_i;
      wont_dirty_next=wont_dirty_i;
@@ -4201,7 +5412,7 @@ index 1e8f261..6f02f04 100644
      for(r=0;r<HOST_REGS;r++) {
        if(r!=EXCLUDE_REG) {
          if((regs[i].regmap[r]&63)==rt1[i]) will_dirty_i|=1<<r;
-@@ -1646,6 +2031,12 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1646,6 +2101,12 @@ static void clean_registers(int istart,int iend,int wr)
          if(itype[i]==RJUMP||itype[i]==UJUMP||itype[i]==CJUMP||itype[i]==SJUMP||itype[i]==FJUMP)
          {
            if(i<iend-1&&itype[i]!=RJUMP&&itype[i]!=UJUMP&&(source[i]>>16)!=0x1000) {
@@ -4214,7 +5425,7 @@ index 1e8f261..6f02f04 100644
              for(r=0;r<HOST_REGS;r++) {
                if(r!=EXCLUDE_REG) {
                  if(regs[i].regmap[r]==regmap_pre[i+2][r]) {
-@@ -1653,11 +2044,18 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1653,11 +2114,18 @@ static void clean_registers(int istart,int iend,int wr)
                  }else {/*DebugMessage(M64MSG_VERBOSE, "i: %x (%d) mismatch(+2): %d",start+i*4,i,r); / *assert(!((wont_dirty_i>>r)&1));*/}
                }
              }
@@ -4233,7 +5444,7 @@ index 1e8f261..6f02f04 100644
              for(r=0;r<HOST_REGS;r++) {
                if(r!=EXCLUDE_REG) {
                  if(regs[i].regmap[r]==regmap_pre[i+1][r]) {
-@@ -1665,6 +2063,7 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1665,6 +2133,7 @@ static void clean_registers(int istart,int iend,int wr)
                  }else {/*DebugMessage(M64MSG_VERBOSE, "i: %x (%d) mismatch(+1): %d",start+i*4,i,r);/ *assert(!((wont_dirty_i>>r)&1));*/}
                }
              }
@@ -4241,7 +5452,7 @@ index 1e8f261..6f02f04 100644
            }
          }
          #endif
-@@ -1673,8 +2072,23 @@ static void clean_registers(int istart,int iend,int wr)
+@@ -1673,8 +2142,23 @@ static void clean_registers(int istart,int iend,int wr)
      // Deal with changed mappings
      temp_will_dirty=will_dirty_i;
      temp_wont_dirty=wont_dirty_i;
@@ -4265,7 +5476,7 @@ index 1e8f261..6f02f04 100644
          int nr;
          if(regs[i].regmap[r]==regmap_pre[i][r]) {
            if(wr) {
-@@ -1760,7 +2174,7 @@ static int get_final_value(int hr, int i, int *value)
+@@ -1760,7 +2244,7 @@ static int get_final_value(int hr, int i, int *value)
    }
  }
  
@@ -4274,7 +5485,7 @@ index 1e8f261..6f02f04 100644
  {
    if((u_int)addr>=start && (u_int)addr<start+slen*4-4)
    {
-@@ -1855,13 +2269,13 @@ static void alloc_all(struct regstat *cur,int i)
+@@ -1855,13 +2339,13 @@ static void alloc_all(struct regstat *cur,int i)
           ((cur->regmap[hr]&63)!=rt1[i])&&((cur->regmap[hr]&63)!=rt2[i]))
        {
          cur->regmap[hr]=-1;
@@ -4290,7 +5501,26 @@ index 1e8f261..6f02f04 100644
        }
      }
    }
-@@ -1965,6 +2379,7 @@ void* ERET_new(void)
+@@ -1937,6 +2421,14 @@ void* ERET_new(void)
+     {
+         state->cp0_regs[CP0_STATUS_REG] &= ~CP0_STATUS_EXL;
+         state->pcaddr = state->cp0_regs[CP0_EPC_REG];
++#if defined(__3DS__)
++        {   /* ctr64: yield loops (ctr64_wl 2): the same thread resumed at the same place again */
++            const u_int pc = (u_int)state->pcaddr, sp = (u_int)state->regs[29];
++            ctr64_yield_same = pc == ctr64_eret_pc && sp == ctr64_eret_sp;
++            ctr64_eret_pc = pc;
++            ctr64_eret_sp = sp;
++        }
++#endif
+     }
+     r4300->llbit = 0;
+     r4300->delay_slot = 0;
+@@ -1962,9 +2454,11 @@ void* ERET_new(void)
+     }
+ }
+ 
++
  static void TLBWI_new(int pcaddr, int count)
  {
    unsigned int i;
@@ -4298,7 +5528,47 @@ index 1e8f261..6f02f04 100644
    UPDATE_COUNT_IN
    state->pcaddr = pcaddr;
  
-@@ -2042,6 +2457,7 @@ static void TLBWI_new(int pcaddr, int count)
+@@ -1977,6 +2471,10 @@ static void TLBWI_new(int pcaddr, int count)
+   {
+     if(i<0x80000||i>0xBFFFF)
+     {
++#if defined(__3DS__)
++      ctr64_tlb_churn[i&2047]=1;
++      if(!ctr64_tlb_soft_evict(i))
++#endif
+       invalidate_block(i);
+       state->memory_map[i]=(uintptr_t)-1;
+     }
+@@ -1985,6 +2483,10 @@ static void TLBWI_new(int pcaddr, int count)
+   {
+     if(i<0x80000||i>0xBFFFF)
+     {
++#if defined(__3DS__)
++      ctr64_tlb_churn[i&2047]=1;
++      if(!ctr64_tlb_soft_evict(i))
++#endif
+       invalidate_block(i);
+       state->memory_map[i]=(uintptr_t)-1;
+     }
+@@ -2003,7 +2505,7 @@ static void TLBWI_new(int pcaddr, int count)
+       if(r4300->cp0.tlb.LUT_r[i]) {
+         state->memory_map[i]=((uintptr_t)g_dev.rdram.dram+(uintptr_t)((r4300->cp0.tlb.LUT_r[i]&0xFFFFF000)-0x80000000)-(i<<12))>>2;
+         // FIXME: should make sure the physical page is invalid too
+-        if(!r4300->cp0.tlb.LUT_w[i]||!r4300->cached_interp.invalid_code[i]) {
++        if(!r4300->cp0.tlb.LUT_w[i]||!r4300->cached_interp.invalid_code[i]||CTR64_ALIAS_HAS_CODE(r4300->cp0.tlb.LUT_w[i])) {
+           state->memory_map[i]|=WRITE_PROTECT; // Write protect
+         }else{
+           assert(r4300->cp0.tlb.LUT_r[i]==r4300->cp0.tlb.LUT_w[i]);
+@@ -2024,7 +2526,7 @@ static void TLBWI_new(int pcaddr, int count)
+       if(r4300->cp0.tlb.LUT_r[i]) {
+         state->memory_map[i]=((uintptr_t)g_dev.rdram.dram+(uintptr_t)((r4300->cp0.tlb.LUT_r[i]&0xFFFFF000)-0x80000000)-(i<<12))>>2;
+         // FIXME: should make sure the physical page is invalid too
+-        if(!r4300->cp0.tlb.LUT_w[i]||!r4300->cached_interp.invalid_code[i]) {
++        if(!r4300->cp0.tlb.LUT_w[i]||!r4300->cached_interp.invalid_code[i]||CTR64_ALIAS_HAS_CODE(r4300->cp0.tlb.LUT_w[i])) {
+           state->memory_map[i]|=WRITE_PROTECT; // Write protect
+         }else{
+           assert(r4300->cp0.tlb.LUT_r[i]==r4300->cp0.tlb.LUT_w[i]);
+@@ -2042,6 +2544,7 @@ static void TLBWI_new(int pcaddr, int count)
  
  static void TLBWR_new(int pcaddr, int count)
  {
@@ -4306,11 +5576,62 @@ index 1e8f261..6f02f04 100644
    unsigned int i;
    UPDATE_COUNT_IN
    state->pcaddr = pcaddr;
-@@ -2124,13 +2540,30 @@ static void MFC0_new(int copr, int count)
+@@ -2056,6 +2559,10 @@ static void TLBWR_new(int pcaddr, int count)
+   {
+     if(i<0x80000||i>0xBFFFF)
+     {
++#if defined(__3DS__)
++      ctr64_tlb_churn[i&2047]=1;
++      if(!ctr64_tlb_soft_evict(i))
++#endif
+       invalidate_block(i);
+       state->memory_map[i]=(uintptr_t)-1;
+     }
+@@ -2064,6 +2571,10 @@ static void TLBWR_new(int pcaddr, int count)
+   {
+     if(i<0x80000||i>0xBFFFF)
+     {
++#if defined(__3DS__)
++      ctr64_tlb_churn[i&2047]=1;
++      if(!ctr64_tlb_soft_evict(i))
++#endif
+       invalidate_block(i);
+       state->memory_map[i]=(uintptr_t)-1;
+     }
+@@ -2079,7 +2590,7 @@ static void TLBWR_new(int pcaddr, int count)
+       if(r4300->cp0.tlb.LUT_r[i]) {
+         state->memory_map[i]=((uintptr_t)g_dev.rdram.dram+(uintptr_t)((r4300->cp0.tlb.LUT_r[i]&0xFFFFF000)-0x80000000)-(i<<12))>>2;
+         // FIXME: should make sure the physical page is invalid too
+-        if(!r4300->cp0.tlb.LUT_w[i]||!r4300->cached_interp.invalid_code[i]) {
++        if(!r4300->cp0.tlb.LUT_w[i]||!r4300->cached_interp.invalid_code[i]||CTR64_ALIAS_HAS_CODE(r4300->cp0.tlb.LUT_w[i])) {
+           state->memory_map[i]|=WRITE_PROTECT; // Write protect
+         }else{
+           assert(r4300->cp0.tlb.LUT_r[i]==r4300->cp0.tlb.LUT_w[i]);
+@@ -2100,7 +2611,7 @@ static void TLBWR_new(int pcaddr, int count)
+       if(r4300->cp0.tlb.LUT_r[i]) {
+         state->memory_map[i]=((uintptr_t)g_dev.rdram.dram+(uintptr_t)((r4300->cp0.tlb.LUT_r[i]&0xFFFFF000)-0x80000000)-(i<<12))>>2;
+         // FIXME: should make sure the physical page is invalid too
+-        if(!r4300->cp0.tlb.LUT_w[i]||!r4300->cached_interp.invalid_code[i]) {
++        if(!r4300->cp0.tlb.LUT_w[i]||!r4300->cached_interp.invalid_code[i]||CTR64_ALIAS_HAS_CODE(r4300->cp0.tlb.LUT_w[i])) {
+           state->memory_map[i]|=WRITE_PROTECT; // Write protect
+         }else{
+           assert(r4300->cp0.tlb.LUT_r[i]==r4300->cp0.tlb.LUT_w[i]);
+@@ -2116,6 +2627,9 @@ static void TLBWR_new(int pcaddr, int count)
+   UPDATE_COUNT_OUT
+ }
+ 
++#if defined(__3DS__)
++int ctr64_mfc0_inline=1; /* dev switch nomfc0inline.txt: 0 */
++#endif
+ static void MFC0_new(int copr, int count)
+ {
+   UPDATE_COUNT_IN
+@@ -2124,13 +2638,58 @@ static void MFC0_new(int copr, int count)
    UPDATE_COUNT_OUT
  }
  
 +static void invalidate_all_pages(void);
++static void ll_clear(struct ll_entry **head);
  static void MTC0_new(int copr, int count, int pcaddr)
  {
    UPDATE_COUNT_IN
@@ -4319,15 +5640,42 @@ index 1e8f261..6f02f04 100644
    state->fake_pc.f.r.nrd = copr;
 +#if defined(__3DS__)
 +  const uint32_t fr_before = state->cp0_regs[CP0_STATUS_REG] & CP0_STATUS_FR;
++  /* ctr64: MTC0 Status (__osDisableInt/__osRestoreInt, thousands a second) as the interpreter's
++   * Status case does it (mips_instructions.def), without its decode and PC bookkeeping, while
++   * Status.FR stays (an FR switch takes the full path below) */
++  if (copr == CP0_STATUS_REG && ctr64_mfc0_inline) {
++    const uint32_t v = (uint32_t)state->rt & ~UINT32_C(0x080000);
++    if ((v & CP0_STATUS_FR) == fr_before) {
++      int *cp0_cycle_count = r4300_cp0_cycle_count(&r4300->cp0);
++      *r4300_cp0_latch(&r4300->cp0) = (uint32_t)state->rt;
++      state->cp0_regs[CP0_STATUS_REG] = v;
++      state->pcaddr += 4; /* ADD_TO_PC(1): an interrupt taken below returns past the MTC0 */
++      cp0_update_count(r4300);
++      r4300_check_interrupt(r4300, CP0_CAUSE_IP2, r4300->mi->regs[MI_INTR_REG] & r4300->mi->regs[MI_INTR_MASK_REG]);
++      r4300->cp0.interrupt_unsafe_state |= INTR_UNSAFE_R4300;
++      if (*cp0_cycle_count >= 0) gen_interrupt(r4300);
++      r4300->cp0.interrupt_unsafe_state &= ~INTR_UNSAFE_R4300;
++      UPDATE_COUNT_OUT
++      return;
++    }
++  }
 +#endif
    cached_interp_MTC0();
 +#if defined(__3DS__)
-+  /* ctr64: compiled code has the FPR addresses of the old Status.FR built in (emit_fpr_addr):
-+   * throw it all away and continue after this instruction in freshly compiled code */
++  /* ctr64: compiled code has the FPR addresses of the old Status.FR built in (emit_fpr_addr). At
++   * the first switch the code goes over to loading them at run time (ctr64_fr_dynamic) and all
++   * code compiled so far is thrown away for good. invalidate_all_pages alone only made it dirty:
++   * a dirty block whose MIPS code is unchanged is taken back (verify_dirty, clean_blocks), with
++   * the OLD FR's addresses in it. Donkey Kong 64 switches FR around one function (0x8061963c /
++   * 0x8061ac38): restored blocks read the wrong FPU registers and the DK Rap's dancers were
++   * thrown off screen (a red wall over the picture, since 0.9.0). */
 +  if (copr == CP0_STATUS_REG && (state->cp0_regs[CP0_STATUS_REG] & CP0_STATUS_FR) != fr_before && !ctr64_fr_dynamic) {
 +    CTR64_CT_SYNC();
-+    if (++ctr64_fr_toggles >= CTR64_FR_TOGGLES) ctr64_fr_dynamic = 1;
++    ctr64_fr_dynamic = 1;
 +    invalidate_all_pages();
++    for (int k = 0; k < 4096; k++)
++      ll_clear(&jump_dirty[k]);
++    memset(hash_table, 0, sizeof(hash_table));
 +    if (!state->pending_exception) {
 +      state->pcaddr = pcaddr + 4;
 +      state->pending_exception = 1;
@@ -4337,7 +5685,7 @@ index 1e8f261..6f02f04 100644
    UPDATE_COUNT_OUT
  }
  
-@@ -2150,10 +2583,16 @@ static unsigned int hshift(uint32_t address)
+@@ -2150,10 +2709,16 @@ static unsigned int hshift(uint32_t address)
      return ((address & 2) ^ 2) << 3;
  }
  
@@ -4354,7 +5702,7 @@ index 1e8f261..6f02f04 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    unsigned int shift = bshift(state->address);
-@@ -2167,6 +2606,7 @@ static void read_hword_new(int pcaddr, int count)
+@@ -2167,6 +2732,7 @@ static void read_hword_new(int pcaddr, int count)
  {
    uint32_t value;
    UPDATE_COUNT_IN
@@ -4362,7 +5710,7 @@ index 1e8f261..6f02f04 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    unsigned int shift = hshift(state->address);
-@@ -2180,6 +2620,7 @@ static void read_word_new(int pcaddr, int count)
+@@ -2180,6 +2746,7 @@ static void read_word_new(int pcaddr, int count)
  {
    uint32_t value;
    UPDATE_COUNT_IN
@@ -4370,7 +5718,7 @@ index 1e8f261..6f02f04 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    if (r4300_read_aligned_word(r4300, state->address, &value)) {
-@@ -2191,6 +2632,7 @@ static void read_word_new(int pcaddr, int count)
+@@ -2191,6 +2758,7 @@ static void read_word_new(int pcaddr, int count)
  static void read_dword_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -4378,7 +5726,7 @@ index 1e8f261..6f02f04 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    r4300_read_aligned_dword(r4300, state->address, (uint64_t*)&state->rdword);
-@@ -2200,6 +2642,7 @@ static void read_dword_new(int pcaddr, int count)
+@@ -2200,6 +2768,7 @@ static void read_dword_new(int pcaddr, int count)
  static void write_byte_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -4386,7 +5734,7 @@ index 1e8f261..6f02f04 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    unsigned int shift = bshift(state->address);
-@@ -2211,6 +2654,7 @@ static void write_byte_new(int pcaddr, int count)
+@@ -2211,6 +2780,7 @@ static void write_byte_new(int pcaddr, int count)
  static void write_hword_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -4394,7 +5742,7 @@ index 1e8f261..6f02f04 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    unsigned int shift = hshift(state->address);
-@@ -2222,6 +2666,7 @@ static void write_hword_new(int pcaddr, int count)
+@@ -2222,6 +2792,7 @@ static void write_hword_new(int pcaddr, int count)
  static void write_word_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -4402,7 +5750,7 @@ index 1e8f261..6f02f04 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    r4300_write_aligned_word(r4300, state->address, state->wword, UINT32_C(0xffffffff));
-@@ -2231,6 +2676,7 @@ static void write_word_new(int pcaddr, int count)
+@@ -2231,6 +2802,7 @@ static void write_word_new(int pcaddr, int count)
  static void write_dword_new(int pcaddr, int count)
  {
    UPDATE_COUNT_IN
@@ -4410,7 +5758,7 @@ index 1e8f261..6f02f04 100644
    state->pcaddr = pcaddr&~1;
    r4300->delay_slot = pcaddr & 1;
    /* NOTE: in dynarec, we only need an all-one mask */
-@@ -2395,7 +2841,7 @@ static void tlb_speed_hacks()
+@@ -2395,7 +2967,7 @@ static void tlb_speed_hacks()
        rom_addr=(uintptr_t)ROM_COPY;
      }
      #endif
@@ -4419,7 +5767,7 @@ index 1e8f261..6f02f04 100644
        for(n=0x7F000;n<0x80000;n++) {
          g_dev.r4300.new_dynarec_hot_state.memory_map[n]=(((uintptr_t)(rom_addr+addr-0x7F000000))>>2)|WRITE_PROTECT;
        }
-@@ -2406,6 +2852,7 @@ static void tlb_speed_hacks()
+@@ -2406,6 +2978,7 @@ static void tlb_speed_hacks()
  /**** Linker ****/
  u_int verify_dirty(struct ll_entry * head)
  {
@@ -4427,25 +5775,53 @@ index 1e8f261..6f02f04 100644
    void *source = NULL;
    if((int)head->start>=0xa0000000&&(int)head->start<0xa07fffff) {
      source=(void *)((uintptr_t)g_dev.rdram.dram+head->start-0xa0000000);
-@@ -2449,8 +2896,17 @@ static struct ll_entry *ll_add_32(struct ll_entry **head,int vaddr,u_int reg32,v
+@@ -2430,10 +3003,27 @@ u_int verify_dirty(struct ll_entry * head)
+   else
+     assert(0);
+ 
++#if defined(__3DS__)
++  /* ctr64: equal or not, 8 words per branch (newlib's memcmp: ~9 instructions per word). Code in
++   * TLB-mapped memory (Conker) is checked at every entry: memcmp was 33% of all Azahar samples in
++   * Conker's rain walk. Both are word-aligned and length is a multiple of 4. */
++  {
++    const uint32_t *a=(const uint32_t *)source, *b=(const uint32_t *)head->copy;
++    u_int n=head->length>>2;
++    for(;n>=8;n-=8,a+=8,b+=8)
++      if((a[0]^b[0])|(a[1]^b[1])|(a[2]^b[2])|(a[3]^b[3])|(a[4]^b[4])|(a[5]^b[5])|(a[6]^b[6])|(a[7]^b[7]))
++        return head->vaddr;
++    for(;n;n--)
++      if(*a++!=*b++)
++        return head->vaddr;
++    return 0;
++  }
++#else
+   if(memcmp(source,head->copy,head->length))
+     return head->vaddr;
+   else
+     return 0;
++#endif
+ }
+ 
+ // Add virtual address mapping for 32-bit compiled block
+@@ -2449,8 +3039,17 @@ static struct ll_entry *ll_add_32(struct ll_entry **head,int vaddr,u_int reg32,v
    new_entry->start=start;
    new_entry->copy=copy;
    new_entry->length=length;
 +  CTR64_JI_TOUCH(head);
 +#if defined(__3DS__)
 +  while(__sync_lock_test_and_set(&ctr64_ll_lock,1)) { }
-   new_entry->next=*head;
++  new_entry->next=*head;
 +  __sync_synchronize(); /* the entry is complete before a reader can see it */
-   *head=new_entry;
++  *head=new_entry;
 +  __sync_lock_release(&ctr64_ll_lock);
 +#else
-+  new_entry->next=*head;
-+  *head=new_entry;
+   new_entry->next=*head;
+   *head=new_entry;
 +#endif
    return new_entry;
  }
  
-@@ -2464,6 +2920,7 @@ static void ll_remove_matching_addrs(struct ll_entry **head,intptr_t addr,int sh
+@@ -2464,6 +3063,7 @@ static void ll_remove_matching_addrs(struct ll_entry **head,intptr_t addr,int sh
  {
    struct ll_entry **cur=head;
    struct ll_entry *next;
@@ -4453,7 +5829,7 @@ index 1e8f261..6f02f04 100644
    while(*cur) {
      if((((uintptr_t)((*cur)->addr)-(uintptr_t)base_addr)>>shift)==((addr-(uintptr_t)base_addr)>>shift) ||
         (((uintptr_t)((*cur)->addr)-(uintptr_t)base_addr-MAX_OUTPUT_BLOCK_SIZE)>>shift)==((addr-(uintptr_t)base_addr)>>shift))
-@@ -2496,6 +2953,7 @@ static void ll_clear(struct ll_entry **head)
+@@ -2496,6 +3096,7 @@ static void ll_clear(struct ll_entry **head)
  {
    struct ll_entry *cur;
    struct ll_entry *next;
@@ -4461,7 +5837,19 @@ index 1e8f261..6f02f04 100644
    if((cur=*head)) {
      *head=0;
      while(cur) {
-@@ -2555,17 +3013,31 @@ static struct ll_entry *get_clean(struct r4300_core* r4300,u_int vaddr,u_int fla
+@@ -2528,7 +3129,11 @@ static void ll_kill_pointers(struct ll_entry *head,intptr_t addr,int shift)
+       inv_debug("EXP: Kill pointer at %x (%x)\n",(intptr_t)head->addr,head->vaddr);
+       uintptr_t host_addr=(intptr_t)kill_pointer(head->addr);
+       #if NEW_DYNAREC == NEW_DYNAREC_ARM
++#if defined(__3DS__)
++        mark_clear_cache(host_addr);
++#else
+         needs_clear_cache[(host_addr-(uintptr_t)base_addr)>>17]|=1<<(((host_addr-(uintptr_t)base_addr)>>12)&31);
++#endif
+       #else
+         /* avoid unused variable warning */
+         (void)host_addr;
+@@ -2555,17 +3160,117 @@ static struct ll_entry *get_clean(struct r4300_core* r4300,u_int vaddr,u_int fla
    u_int page=(vaddr^0x80000000)>>12;
    if(page>262143&&r4300->cp0.tlb.LUT_r[vaddr>>12]) page=(r4300->cp0.tlb.LUT_r[vaddr>>12]^0x80000000)>>12;
    if(page>2048) page=2048+(page&2047);
@@ -4469,7 +5857,7 @@ index 1e8f261..6f02f04 100644
    struct ll_entry *head;
 +#if defined(__3DS__)
 +  const int cacheable=flags==~0u&&!ctr_jit_thread_busy;
-+  const u_int slot=((vaddr>>2)^(vaddr>>14))&4095;
++  const u_int slot=((vaddr>>2)^(vaddr>>14)^(page*0x9E5u))&4095; /* page too (see get_dirty) */
 +  if(cacheable&&ctr64_gc[slot].vaddr==vaddr&&ctr64_gc[slot].page==page&&ctr64_gc[slot].gen==ctr64_ji_gen[page]+1)
 +    return ctr64_gc[slot].e;
 +  const u_int gen=ctr64_ji_gen[page];
@@ -4490,13 +5878,100 @@ index 1e8f261..6f02f04 100644
 +  }
 +#endif
 +  return head;
- }
- 
++}
++
 +unsigned ctr64_dirty_stat[4]; /* ctr64 stats: dirty restores ok, code changed, expiring, none */
++#if defined(__3DS__)
++/* ctr64: a dirty block that verify_dirty just found unchanged goes back to the clean list now,
++ * with the checks clean_blocks makes (every page it spans valid, not about to expire), instead of
++ * waiting for clean_blocks' sweep (32 pages per Count>>19 step: ~1.4 s for all of them). Until
++ * then the hash table holds its dirty entry (verify stub: a full compare at EVERY entry) and the
++ * linker does not link it. Conker's TLB refills (~5000/s) invalidate the evicted virtual pages, so
++ * their blocks were dirty nearly all the time: verify_dirty 34% of the emulation core. Restored
++ * blocks stay write-protected exactly as clean_blocks leaves them. Dev switch noqrestore.txt. */
++/* ctr64: the FIXME in TLBWI_new/TLBWR_new: a page with compiled code is write-protected through
++ * the mappings it was compiled from, but another TLB entry that maps the same physical page
++ * writable (an alias) stayed unprotected, so stores through it reached the code without
++ * invalidating it. Upstream mostly got away with it because such blocks were dirty (compared at
++ * every entry). ppage: 0x80000 + physical page. Called where a page gets code (compile, restore);
++ * TLB writes check new mappings themselves. */
++static void ctr64_protect_aliases(u_int ppage)
++{
++  if(!using_tlb||ppage<0x80000||ppage>=0x80800) return;
++  if(ctr64_alias_gen[ppage-0x80000]) return;
++  ctr64_alias_gen[ppage-0x80000]=1;
++  const u_int pa=(ppage-0x80000)<<12;
++  for(int k=0;k<32;k++) {
++    const struct tlb_entry *e=&g_dev.r4300.cp0.tlb.entries[k];
++    for(int h=0;h<2;h++) {
++      const u_int v=h?e->v_odd:e->v_even, d=h?e->d_odd:e->d_even;
++      const u_int st=h?e->start_odd:e->start_even, en=h?e->end_odd:e->end_even, ph=h?e->phys_odd:e->phys_even;
++      if(!v||!d||st>=en||pa<(ph&~0xFFFu)||pa-(ph&~0xFFFu)>en-st) continue;
++      const u_int vp=(st+(pa-(ph&~0xFFFu)))>>12;
++      if((vp<0x80000||vp>0xBFFFF)&&(g_dev.r4300.cp0.tlb.LUT_w[vp]>>12)==ppage&&
++         g_dev.r4300.new_dynarec_hot_state.memory_map[vp]!=(uintptr_t)-1)
++        g_dev.r4300.new_dynarec_hot_state.memory_map[vp]|=WRITE_PROTECT;
++    }
++  }
++}
++int ctr64_quick_restore=1;
++unsigned ctr64_quick_restores; /* stats */
++/* ctr64: pages whose code keeps coming back unchanged after a write invalidated it: the game
++ * writes data next to its code (Gauntlet Legends: ~1500 times a second). Every round was a page
++ * invalidation (unlinks, cache flushes), a full compare and a restore that write-protected the
++ * page again. After CTR64_HOT_RESTORES such rounds within ~1 s a page stays writable: its blocks
++ * stay dirty (compared at every entry, never linked) until a state load or a full invalidation.
++ * Dev switch nohotpage.txt. */
++#define CTR64_HOT_RESTORES 16
++int ctr64_hot_pages_on=1;
++unsigned ctr64_hot_stat[2]; /* stats: pages turned hot, dirty entries left unprotected */
++static struct { unsigned short cnt, epoch; } ctr64_hot_cnt[4096];
++static unsigned char ctr64_hot[4096];
++static int ctr64_page_hot(u_int page)
++{
++  extern unsigned ctr64_vi_count; /* gfx_async.c */
++  if(!ctr64_hot_pages_on) return 0;
++  if(ctr64_hot[page]) return 1;
++  const unsigned short ep=(unsigned short)(ctr64_vi_count>>6);
++  if(ctr64_hot_cnt[page].epoch!=ep) { ctr64_hot_cnt[page].epoch=ep; ctr64_hot_cnt[page].cnt=0; }
++  if(++ctr64_hot_cnt[page].cnt<CTR64_HOT_RESTORES) return 0;
++  ctr64_hot[page]=1;
++  ctr64_hot_stat[0]++;
++  return 1;
+ }
+-
++static struct ll_entry *ctr64_restore_now(struct ll_entry *head)
++{
++  if(ctr_jit_thread_busy) return NULL;
++  u_int i,j,start,end,inv=0;
++  if((signed int)head->vaddr>=0x80000000&&(signed int)head->vaddr<0x80800000) {
++    start=head->start>>12;
++    end=(head->start+head->length-1)>>12;
++    for(i=start;i<=end;i++) inv|=g_dev.r4300.cached_interp.invalid_code[i];
++  }
++  else if((signed int)head->vaddr>=(signed int)0xC0000000) {
++    start=head->start>>12;
++    end=(head->start+head->length-1)>>12;
++    for(i=start;i<=end;i++) {
++      inv|=g_dev.r4300.cached_interp.invalid_code[i];
++      j=(((uintptr_t)i<<12)+(uintptr_t)(g_dev.r4300.new_dynarec_hot_state.memory_map[i]<<2)-(uintptr_t)g_dev.rdram.dram+(uintptr_t)0x80000000)>>12;
++      inv|=g_dev.r4300.cached_interp.invalid_code[j];
++    }
++  }
++  else return NULL; /* clean_blocks does not restore these either */
++  if(inv) return NULL;
++  if((((uintptr_t)head->clean_addr-(uintptr_t)out)<<(32-TARGET_SIZE_2))<=0x60000000+(MAX_OUTPUT_BLOCK_SIZE<<(32-TARGET_SIZE_2)))
++    return NULL;
++  u_int ppage=(head->vaddr^0x80000000)>>12;
++  if(ppage>262143&&g_dev.r4300.cp0.tlb.LUT_r[head->vaddr>>12]) ppage=(g_dev.r4300.cp0.tlb.LUT_r[head->vaddr>>12]^0x80000000)>>12;
++  if(ppage>2048) ppage=2048+(ppage&2047);
++  return ll_add_32(jump_in+ppage,head->vaddr,head->reg32,head->clean_addr,head->clean_addr,head->start,head->copy,head->length);
++}
++#endif
  static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int flags)
  {
    u_int page=(vaddr^0x80000000)>>12;
-@@ -2574,13 +3046,18 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
+@@ -2574,37 +3279,544 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
    if(page>2048) page=2048+(page&2047);
    if(vpage>262143&&r4300->cp0.tlb.LUT_r[vaddr>>12]) vpage&=2047; // jump_dirty uses a hash of the virtual address instead
    if(vpage>2048) vpage=2048+(vpage&2047);
@@ -4504,6 +5979,24 @@ index 1e8f261..6f02f04 100644
    struct ll_entry *head;
    head=jump_dirty[vpage];
 +  int ctr64_seen=0;
++#if defined(__3DS__)
++  const int gd_ok=!ctr_jit_thread_busy;
++  const u_int gd_slot=((vaddr>>2)^(vaddr>>14)^(vpage*0x9E5u))&4095; /* page too: a TLB address is looked up mapped and unmapped (two lists) */
++  if(gd_ok&&ctr64_gd[gd_slot].vaddr==vaddr&&ctr64_gd[gd_slot].page==vpage
++     &&ctr64_gd[gd_slot].gen==ctr64_jd_gen[vpage]+1) {
++    /* the first entry for vaddr is known: start the walk there (entries before it are for other addresses) */
++    head=ctr64_gd[gd_slot].e;
++    ctr64_gd_stat[0]++;
++  }
++  else if(gd_ok) {
++    ctr64_gd_stat[ctr64_gd[gd_slot].vaddr!=vaddr?1:ctr64_gd[gd_slot].page!=vpage?2:3]++;
++    struct ll_entry *h=head;
++    while(h!=NULL&&h->vaddr!=vaddr) h=h->next; /* the first entry for vaddr (flags and in-flight checked below) */
++    ctr64_gd[gd_slot].vaddr=vaddr; ctr64_gd[gd_slot].flags=flags; ctr64_gd[gd_slot].page=vpage;
++    ctr64_gd[gd_slot].gen=ctr64_jd_gen[vpage]+1; ctr64_gd[gd_slot].e=h;
++    head=h;
++  }
++#endif
    while(head!=NULL) {
 -    if(head->vaddr==vaddr&&(head->reg32&flags)==0) {
 +    if(head->vaddr==vaddr&&(head->reg32&flags)==0&&!CTR64_CT_INFLIGHT(head->addr)) {
@@ -4513,17 +6006,41 @@ index 1e8f261..6f02f04 100644
 +        ctr64_seen=2;
          if(verify_dirty(head)==0) {
 +          ctr64_dirty_stat[0]++;
++#if defined(__3DS__)
++          if(r4300->cached_interp.invalid_code[vaddr>>12]&&ctr64_page_hot(page)) { ctr64_hot_stat[1]++; return head; }
++#endif
            r4300->cached_interp.invalid_code[vaddr>>12]=0;
            r4300->new_dynarec_hot_state.memory_map[vaddr>>12]|=WRITE_PROTECT;
++#if defined(__3DS__)
++          ctr64_protect_aliases(vaddr>>12);
++#endif
            if(vpage<2048) {
-@@ -2597,14 +3074,467 @@ static struct ll_entry *get_dirty(struct r4300_core* r4300,u_int vaddr,u_int fla
+             if(r4300->cp0.tlb.LUT_r[vaddr>>12]) {
+               r4300->cached_interp.invalid_code[r4300->cp0.tlb.LUT_r[vaddr>>12]>>12]=0;
+               r4300->new_dynarec_hot_state.memory_map[r4300->cp0.tlb.LUT_r[vaddr>>12]>>12]|=WRITE_PROTECT;
++#if defined(__3DS__)
++              ctr64_protect_aliases(r4300->cp0.tlb.LUT_r[vaddr>>12]>>12);
++#endif
+             }
+             restore_candidate[vpage>>3]|=1<<(vpage&7);
+           }
+           else restore_candidate[page>>3]|=1<<(page&7);
++#if defined(__3DS__)
++          if(ctr64_quick_restore) {
++            struct ll_entry *c=ctr64_restore_now(head);
++            if(c) { ctr64_quick_restores++; return c; }
++          }
++#endif
+           return head;
+         }
+       }
      }
      head=head->next;
    }
 +  ctr64_dirty_stat[ctr64_seen==0?3:ctr64_seen==1?2:1]++; /* none / expiring / code changed */
-   return NULL;
- }
- 
++  return NULL;
++}
++
 +#if defined(__3DS__)
 +/* ctr64: interpret first, compile when hot. A block compile costs ~20k ARM instructions per MIPS
 + * instruction (0.7 ms a block on a New 3DS): entering an area compiled ~2800 blocks in a second
@@ -4828,9 +6345,9 @@ index 1e8f261..6f02f04 100644
 +    else { ht_bin[1]=ht_bin[0]; ht_bin[0]=head; }
 +    return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
 +  }
-+  return NULL;
-+}
-+
+   return NULL;
+ }
+ 
 +/* what get_addr & co return for code to interpret: the stub saves the cycle count, calls
 + * ctr64_interp_run and jumps where it says */
 +static void *ctr64_interp_entry(u_int vaddr)
@@ -4981,10 +6498,35 @@ index 1e8f261..6f02f04 100644
    struct r4300_core* r4300 = &g_dev.r4300;
    struct ll_entry *head;
 +  CTR64_DISP(2);
++#if defined(__3DS__)
++  /* ctr64: a target in a TLB page that was evicted is never linked (ctr64_tlb_churn), so every
++   * jump there comes back here: look in the hash table first and keep the block found by
++   * get_clean there (its list walk was the cost: Conker ~6000 calls a VI) */
++  if(ctr64_ht_first&&ctr64_churn_nolink&&ctr64_quick_restore&&(signed int)vaddr>=(signed int)0xC0000000&&ctr64_tlb_churn[(vaddr>>12)&2047]) {
++    struct ll_entry **hb=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
++    if(hb[0]&&hb[0]->vaddr==vaddr) return (void *)(((intptr_t)hb[0]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
++    if(hb[1]&&hb[1]->vaddr==vaddr) return (void *)(((intptr_t)hb[1]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
++    head=get_clean(r4300,vaddr,~0);
++    if(head!=NULL){
++      hb[1]=hb[0];
++      hb[0]=head;
++      return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
++    }
++  }
++#endif
  
  #ifndef DISABLE_BLOCK_LINKING
    head=get_clean(r4300,vaddr,~0);
-@@ -2623,6 +3553,7 @@ void *dynamic_linker(void * src, u_int vaddr)
+@@ -2617,12 +3829,16 @@ void *dynamic_linker(void * src, u_int vaddr)
+       add_link(vaddr, add_pointer(src_rw,head->addr));
+     }
+ #else
++#if defined(__3DS__)
++    if(!(ctr64_churn_nolink&&ctr64_quick_restore&&(signed int)vaddr>=(signed int)0xC0000000&&ctr64_tlb_churn[(vaddr>>12)&2047]))
++#endif
+     add_link(vaddr, add_pointer(src_rw,head->addr));
+ #endif
+     return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  #endif
  
@@ -4992,7 +6534,7 @@ index 1e8f261..6f02f04 100644
    struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
    if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[0]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[1]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
-@@ -2649,6 +3580,7 @@ void *dynamic_linker(void * src, u_int vaddr)
+@@ -2649,6 +3865,7 @@ void *dynamic_linker(void * src, u_int vaddr)
      return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  
@@ -5000,15 +6542,40 @@ index 1e8f261..6f02f04 100644
    int r=new_recompile_block(vaddr);
    if(r==0) return dynamic_linker(src,vaddr);
    // Execute in unmapped page, generate pagefault execption
-@@ -2663,6 +3595,7 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
+@@ -2663,6 +3880,23 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
  {
    struct r4300_core* r4300 = &g_dev.r4300;
    struct ll_entry *head;
 +  CTR64_DISP(2);
++#if defined(__3DS__)
++  /* ctr64: a target in a TLB page that was evicted is never linked (ctr64_tlb_churn), so every
++   * jump there comes back here: look in the hash table first and keep the block found by
++   * get_clean there (its list walk was the cost: Conker ~6000 calls a VI) */
++  if(ctr64_ht_first&&ctr64_churn_nolink&&ctr64_quick_restore&&(signed int)vaddr>=(signed int)0xC0000000&&ctr64_tlb_churn[(vaddr>>12)&2047]) {
++    struct ll_entry **hb=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
++    if(hb[0]&&hb[0]->vaddr==vaddr) return (void *)(((intptr_t)hb[0]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
++    if(hb[1]&&hb[1]->vaddr==vaddr) return (void *)(((intptr_t)hb[1]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
++    head=get_clean(r4300,vaddr,~0);
++    if(head!=NULL){
++      hb[1]=hb[0];
++      hb[0]=head;
++      return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
++    }
++  }
++#endif
  
  #ifndef DISABLE_BLOCK_LINKING
    head=get_clean(r4300,vaddr,~0);
-@@ -2681,6 +3614,7 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
+@@ -2675,12 +3909,16 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
+       add_link(vaddr, add_pointer(src_rw,head->addr));
+     }
+ #else
++#if defined(__3DS__)
++    if(!(ctr64_churn_nolink&&ctr64_quick_restore&&(signed int)vaddr>=(signed int)0xC0000000&&ctr64_tlb_churn[(vaddr>>12)&2047]))
++#endif
+     add_link(vaddr, add_pointer(src_rw,head->addr));
+ #endif
+     return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  #endif
  
@@ -5016,7 +6583,7 @@ index 1e8f261..6f02f04 100644
    struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
    if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[0]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) return (void *)(((intptr_t)ht_bin[1]->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
-@@ -2719,16 +3653,23 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
+@@ -2719,16 +3957,23 @@ void *dynamic_linker_ds(void * src, u_int vaddr)
  
  // Get address from virtual address
  // This is called from the recompiled JR/JALR instructions
@@ -5040,7 +6607,7 @@ index 1e8f261..6f02f04 100644
      return (void*)(((intptr_t)head->addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  
-@@ -2745,6 +3686,13 @@ void *get_addr(u_int vaddr)
+@@ -2745,6 +3990,13 @@ void *get_addr(u_int vaddr)
      return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  
@@ -5054,7 +6621,7 @@ index 1e8f261..6f02f04 100644
    int r=new_recompile_block(vaddr);
    if(r==0) return get_addr(vaddr);
    // Execute in unmapped page, generate pagefault execption
-@@ -2758,9 +3706,11 @@ void *get_addr(u_int vaddr)
+@@ -2758,9 +4010,11 @@ void *get_addr(u_int vaddr)
  // Look up address in hash table first
  void *get_addr_ht(u_int vaddr)
  {
@@ -5066,7 +6633,7 @@ index 1e8f261..6f02f04 100644
    return get_addr(vaddr);
  }
  
-@@ -2796,6 +3746,13 @@ void *get_addr_32(u_int vaddr,u_int flags)
+@@ -2796,6 +4050,13 @@ void *get_addr_32(u_int vaddr,u_int flags)
      return (void*)(((intptr_t)head->clean_addr-(intptr_t)base_addr)+(intptr_t)base_addr_rx);
    }
  
@@ -5080,7 +6647,83 @@ index 1e8f261..6f02f04 100644
    int r=new_recompile_block(vaddr);
    if(r==0) return get_addr(vaddr);
    // Execute in unmapped page, generate pagefault execption
-@@ -2856,6 +3813,7 @@ static void invalidate_page(u_int page)
+@@ -2849,6 +4110,75 @@ static void *check_addr(u_int vaddr)
+   return NULL;
+ }
+ 
++#if defined(__3DS__)
++/* ctr64: soft TLB eviction. A TLB write that replaces an entry used to invalidate the evicted
++ * virtual pages like a store into their code: every block of the PHYSICAL page was freed (the
++ * kseg0 ones too), the physical page lost its write protection, and every block came back only
++ * through jump_dirty, verify_dirty and a relink. Conker refills the TLB ~5000 times a second with
++ * the same few mappings: ~20k block restores a second, a third of the CPU thread.
++ * Blocks are filed by physical page (jump_in[page], the lookups take the page from the current
++ * mapping), so a block stays correct for as long as its physical page is unchanged: here only
++ * what reaches a block BY VIRTUAL ADDRESS is cut - its hash table entries, links into it and the
++ * mini_ht return cache - and the page stays write-protected, so stores still invalidate it. A
++ * later mapping of the same virtual page onto the same physical page finds the block again
++ * through get_clean; a mapping elsewhere looks in the other page's list. Blocks that cross a page
++ * boundary take the old path. Dev switch nosoftevict.txt. */
++int ctr64_soft_evict=1;
++int ctr64_se_cache=1; /* dev switch nosecache.txt */
++#define CTR64_SE_N 256 /* Conker: 80-170 entry points per evicted page (14 overflowed 80% of evictions) */
++static struct ctr64_se_slot { u_int vp, page, gen, n; u_int va[CTR64_SE_N]; } ctr64_se[512];
++unsigned ctr64_soft_evicts[2]; /* stats.log: soft, old path */
++static int ctr64_tlb_soft_evict(u_int vp)
++{
++  if(!ctr64_soft_evict) return 0;
++  const u_int lut=g_dev.r4300.cp0.tlb.LUT_r[vp];
++  if(!lut) return 0;
++  const u_int page=(lut^0x80000000)>>12;
++  if(page>=2048) return 0;
++  struct ll_entry *h;
++  /* the blocks of vp in the page's list, remembered while that list is unchanged (Conker evicts
++   * the same few pages thousands of times a second; the list walks were 4% of the CPU thread) */
++  struct ctr64_se_slot *se=&ctr64_se[(vp^(vp>>9))&511];
++  if(ctr64_se_cache&&se->vp==vp&&se->page==page&&se->gen==ctr64_ji_gen[page]+1) {
++    for(u_int i=0;i<se->n;i++) remove_hash(se->va[i]);
++  } else {
++    u_int n=0;
++    for(h=jump_in[page];h!=NULL;h=h->next)
++      if((h->vaddr>>12)==vp) {
++        if((h->start>>12)!=((h->start+h->length-1)>>12)) {
++          ctr64_soft_evicts[1]++;
++          return 0; /* the old path (hash entries removed so far: it removes them too) */
++        }
++        remove_hash(h->vaddr);
++        if(n<CTR64_SE_N) se->va[n]=h->vaddr;
++        n++;
++      }
++    se->vp=vp; se->page=page; se->n=n;
++    se->gen=n<=CTR64_SE_N?ctr64_ji_gen[page]+1:0;
++  }
++  struct ll_entry **pp=&jump_out[page];
++  int killed=0;
++  while(*pp!=NULL) {
++    h=*pp;
++    if((h->vaddr>>12)==vp) {
++      uintptr_t host_addr=(intptr_t)kill_pointer(h->addr);
++      mark_clear_cache(host_addr);
++      *pp=h->next;
++      free(h);
++      killed=1;
++    }
++    else pp=&h->next;
++  }
++  if(killed) do_clear_cache();
++  g_dev.r4300.cached_interp.invalid_code[vp]=1;
++  #ifdef USE_MINI_HT
++  memset(g_dev.r4300.new_dynarec_hot_state.mini_ht,-1,sizeof(g_dev.r4300.new_dynarec_hot_state.mini_ht));
++  #endif
++  ctr64_soft_evicts[0]++;
++  return 1;
++}
++#endif
++
+ // This is called when we write to a compiled block (see do_invstub)
+ static void invalidate_page(u_int page)
+ {
+@@ -2856,6 +4186,7 @@ static void invalidate_page(u_int page)
    struct ll_entry *next;
    head=jump_in[page];
    jump_in[page]=0;
@@ -5088,7 +6731,19 @@ index 1e8f261..6f02f04 100644
    while(head!=NULL) {
      inv_debug("INVALIDATE: %x\n",head->vaddr);
      remove_hash(head->vaddr);
-@@ -2882,6 +3840,10 @@ static void invalidate_page(u_int page)
+@@ -2869,7 +4200,11 @@ static void invalidate_page(u_int page)
+     inv_debug("INVALIDATE: kill pointer to %x (%x)\n",head->vaddr,(intptr_t)head->addr);
+       uintptr_t host_addr=(intptr_t)kill_pointer(head->addr);
+     #if NEW_DYNAREC == NEW_DYNAREC_ARM
++#if defined(__3DS__)
++      mark_clear_cache(host_addr);
++#else
+       needs_clear_cache[(host_addr-(uintptr_t)base_addr)>>17]|=1<<(((host_addr-(uintptr_t)base_addr)>>12)&31);
++#endif
+     #else
+       /* avoid unused variable warning */
+       (void)host_addr;
+@@ -2882,6 +4217,10 @@ static void invalidate_page(u_int page)
  
  void invalidate_block(u_int block)
  {
@@ -5099,15 +6754,63 @@ index 1e8f261..6f02f04 100644
    u_int page;
    page=block^0x80000;
    if(block<0x100000&&page>262143&&g_dev.r4300.cp0.tlb.LUT_r[block]) page=(g_dev.r4300.cp0.tlb.LUT_r[block]^0x80000000)>>12;
-@@ -2961,6 +3923,7 @@ void invalidate_block(u_int block)
+@@ -2902,11 +4241,22 @@ void invalidate_block(u_int block)
+     }
+     if((signed int)head->vaddr>=(signed int)0xC0000000) {
+       assert(page<2048);
++#if defined(__3DS__)
++      /* soft-evicted (ctr64_tlb_soft_evict): its virtual page is unmapped or mapped elsewhere
++       * now; such blocks never cross a page */
++      if(g_dev.r4300.new_dynarec_hot_state.memory_map[head->vaddr>>12]==(uintptr_t)-1||
++         ((head->vaddr+(g_dev.r4300.new_dynarec_hot_state.memory_map[head->vaddr>>12]<<2)-(uintptr_t)g_dev.rdram.dram)>>12)!=page) {
++        start=end=page;
++      } else {
++#endif
+       assert(g_dev.r4300.new_dynarec_hot_state.memory_map[head->vaddr>>12]!=(uintptr_t)-1);
+       u_int paddr=head->vaddr+(g_dev.r4300.new_dynarec_hot_state.memory_map[head->vaddr>>12]<<2)-(uintptr_t)g_dev.rdram.dram;
+       start=(paddr-(head->vaddr-head->start))>>12;
+       end=(paddr+((head->start+head->length)-head->vaddr)-1)>>12;
+       assert(start<2048&&end<2048);
++#if defined(__3DS__)
++      }
++#endif
+     }
+     else if((signed int)head->vaddr>=(signed int)0x80800000) {
+       assert(page>=2048);
+@@ -2943,6 +4293,11 @@ void invalidate_block(u_int block)
+   if(block<0x100000) {
+     g_dev.r4300.cached_interp.invalid_code[block]=1;
+   }
++#if defined(__3DS__)
++  if(block>=0x80000&&block<0x80800) ctr64_alias_gen[block-0x80000]=0;
++  if(block<0x100000&&g_dev.r4300.cp0.tlb.LUT_r[block]&&(g_dev.r4300.cp0.tlb.LUT_r[block]>>12)-0x80000<2048)
++    ctr64_alias_gen[(g_dev.r4300.cp0.tlb.LUT_r[block]>>12)-0x80000]=0;
++#endif
+   // If there is a valid TLB entry for this page, remove write protect
+   if(block<0x100000&&g_dev.r4300.cp0.tlb.LUT_w[block]) {
+     assert(g_dev.r4300.cp0.tlb.LUT_r[block]==g_dev.r4300.cp0.tlb.LUT_w[block]);
+@@ -2961,6 +4316,11 @@ void invalidate_block(u_int block)
  // Anything could have changed, so invalidate everything.
  static void invalidate_all_pages(void)
  {
 +  CTR64_CT_SYNC();
++#if defined(__3DS__)
++  memset(ctr64_alias_gen,0,sizeof(ctr64_alias_gen));
++  memset(ctr64_hot,0,sizeof(ctr64_hot));
++#endif
    u_int page;
    for(page=0;page<4096;page++)
      invalidate_page(page);
-@@ -2996,14 +3959,24 @@ void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t addre
+@@ -2981,7 +4341,7 @@ static void invalidate_all_pages(void)
+   for(page=0;page<0x100000;page++) {
+     if(g_dev.r4300.cp0.tlb.LUT_r[page]) {
+       g_dev.r4300.new_dynarec_hot_state.memory_map[page]=((uintptr_t)g_dev.rdram.dram+(uintptr_t)((g_dev.r4300.cp0.tlb.LUT_r[page]&0xFFFFF000)-0x80000000)-(page<<12))>>2;
+-      if(!g_dev.r4300.cp0.tlb.LUT_w[page]||!g_dev.r4300.cached_interp.invalid_code[page])
++      if(!g_dev.r4300.cp0.tlb.LUT_w[page]||!g_dev.r4300.cached_interp.invalid_code[page]||CTR64_ALIAS_HAS_CODE(g_dev.r4300.cp0.tlb.LUT_w[page]))
+         g_dev.r4300.new_dynarec_hot_state.memory_map[page]|=WRITE_PROTECT; // Write protect
+     }
+     else g_dev.r4300.new_dynarec_hot_state.memory_map[page]=(uintptr_t)-1;
+@@ -2996,14 +4356,24 @@ void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t addre
      size_t begin;
      size_t end;
  
@@ -5132,7 +6835,7 @@ index 1e8f261..6f02f04 100644
  
          for(i = begin; i <= end; ++i) {
              if(r4300->cached_interp.invalid_code[i] == 0) {
-@@ -3092,17 +4065,35 @@ void* cop1_unusable(void)
+@@ -3092,17 +4462,35 @@ void* cop1_unusable(void)
      return get_addr_ht(state->pcaddr);
  }
  
@@ -5169,7 +6872,7 @@ index 1e8f261..6f02f04 100644
      {
          for(int i=0;i<32;i++)
          {
-@@ -3692,7 +4683,7 @@ static void delayslot_alloc(struct regstat *current,int i)
+@@ -3692,7 +5080,7 @@ static void delayslot_alloc(struct regstat *current,int i)
      case SPAN:
        assem_debug("jump in the delay slot.  this shouldn't happen.");//exit(1);
        DebugMessage(M64MSG_VERBOSE, "Disabled speculative precompilation");
@@ -5178,7 +6881,7 @@ index 1e8f261..6f02f04 100644
        ccadj[i-1]+=1;
        break;
      case IMM16:
-@@ -3794,9 +4785,47 @@ static void pagespan_alloc(struct regstat *current,int i)
+@@ -3794,9 +5182,47 @@ static void pagespan_alloc(struct regstat *current,int i)
  }
  
  /**** Assembler utils ****/
@@ -5227,7 +6930,7 @@ index 1e8f261..6f02f04 100644
    for(hr=0;hr<HOST_REGS;hr++) {
      if(hr!=EXCLUDE_REG) {
        if(pre[hr]!=entry[hr]) {
-@@ -3839,13 +4868,18 @@ static void wb_invalidate(signed char pre[],signed char entry[],uint64_t dirty,u
+@@ -3839,13 +5265,18 @@ static void wb_invalidate(signed char pre[],signed char entry[],uint64_t dirty,u
        }
      }
    }
@@ -5247,7 +6950,7 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG) {
        if(((i_regmap[hr]&63)>0)&&((i_regmap[hr]&63)<CSREG)) {
          if((i_dirty>>hr)&1) {
-@@ -3873,7 +4907,7 @@ static void wb_dirtys(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirty)
+@@ -3873,7 +5304,7 @@ static void wb_dirtys(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirty)
  
  // Write out dirty registers that we need to reload (pair with load_needed_regs)
  // This writes the registers not written by store_regs_bt
@@ -5256,7 +6959,7 @@ index 1e8f261..6f02f04 100644
  {
    int hr;
    int t=(addr-start)>>2;
-@@ -3910,11 +4944,15 @@ static void wb_needed_dirtys(signed char i_regmap[],uint64_t i_is32,uint64_t i_d
+@@ -3910,11 +5341,15 @@ static void wb_needed_dirtys(signed char i_regmap[],uint64_t i_is32,uint64_t i_d
  // This is useful where we have a 32-bit value in a register, and want to
  // keep it in a 32-bit register, but can't guarantee that it won't be read
  // as a 64-bit value later.
@@ -5273,7 +6976,7 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG) {
        //if(pre[hr]==entry[hr]) {
          if((reg=pre[hr])>=0) {
-@@ -3934,7 +4972,11 @@ static void wb_valid(signed char pre[],signed char entry[],u_int dirty_pre,u_int
+@@ -3934,7 +5369,11 @@ static void wb_valid(signed char pre[],signed char entry[],u_int dirty_pre,u_int
  {
    //if(dirty_pre==dirty) return;
    int hr,reg;
@@ -5285,7 +6988,7 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG) {
        reg=pre[hr];
        if(((~u)>>(reg&63))&1) {
-@@ -3958,10 +5000,14 @@ static void wb_valid(signed char pre[],signed char entry[],u_int dirty_pre,u_int
+@@ -3958,10 +5397,14 @@ static void wb_valid(signed char pre[],signed char entry[],u_int dirty_pre,u_int
  #endif
  
  // Write out a single register
@@ -5301,7 +7004,7 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG) {
        if((regmap[hr]&63)==r) {
          if((dirty>>hr)&1) {
-@@ -3981,7 +5027,7 @@ static void wb_register(signed char r,signed char regmap[],uint64_t dirty,uint64
+@@ -3981,7 +5424,7 @@ static void wb_register(signed char r,signed char regmap[],uint64_t dirty,uint64
  }
  
  // Store dirty registers prior to branch
@@ -5310,7 +7013,7 @@ index 1e8f261..6f02f04 100644
  {
    if(internal_branch(i_is32,addr))
    {
-@@ -4024,7 +5070,7 @@ static void store_regs_bt(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirt
+@@ -4024,7 +5467,7 @@ static void store_regs_bt(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirt
  }
  
  // Load all needed registers for branch target
@@ -5319,7 +7022,7 @@ index 1e8f261..6f02f04 100644
  {
    //if(addr>=start && addr<(start+slen*4))
    if(internal_branch(i_is32,addr))
-@@ -4097,6 +5143,54 @@ static void load_regs_bt(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirty
+@@ -4097,6 +5540,54 @@ static void load_regs_bt(signed char i_regmap[],uint64_t i_is32,uint64_t i_dirty
  static void load_regs(signed char entry[],signed char regmap[],int is32,int rs1,int rs2)
  {
    int hr;
@@ -5374,7 +7077,7 @@ index 1e8f261..6f02f04 100644
    // Load 32-bit regs
    for(hr=0;hr<HOST_REGS;hr++) {
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0) {
-@@ -4143,7 +5237,11 @@ static void load_consts(signed char pre[],signed char regmap[],int is32,int i)
+@@ -4143,7 +5634,11 @@ static void load_consts(signed char pre[],signed char regmap[],int is32,int i)
  {
    int hr;
    // Load 32-bit regs
@@ -5386,7 +7089,7 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0) {
        //if(entry[hr]!=regmap[hr]) {
        if(i==0||!((regs[i-1].isconst>>hr)&1)||pre[hr]!=regmap[hr]||bt[i]) {
-@@ -4162,7 +5260,11 @@ static void load_consts(signed char pre[],signed char regmap[],int is32,int i)
+@@ -4162,7 +5657,11 @@ static void load_consts(signed char pre[],signed char regmap[],int is32,int i)
      }
    }
    // Load 64-bit regs
@@ -5398,7 +7101,7 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0) {
        //if(entry[hr]!=regmap[hr]) {
        if(i==0||!((regs[i-1].isconst>>hr)&1)||pre[hr]!=regmap[hr]||bt[i]) {
-@@ -4194,7 +5296,11 @@ static void load_all_consts(signed char regmap[],int is32,u_int dirty,u_int isco
+@@ -4194,7 +5693,11 @@ static void load_all_consts(signed char regmap[],int is32,u_int dirty,u_int isco
  {
    int hr;
    // Load 32-bit regs
@@ -5410,7 +7113,7 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0&&((dirty>>hr)&1)) {
        if(((isconst>>hr)&1)&&regmap[hr]<64&&regmap[hr]>0) {
          int value=constmap[i][hr];
-@@ -4208,7 +5314,11 @@ static void load_all_consts(signed char regmap[],int is32,u_int dirty,u_int isco
+@@ -4208,7 +5711,11 @@ static void load_all_consts(signed char regmap[],int is32,u_int dirty,u_int isco
      }
    }
    // Load 64-bit regs
@@ -5422,7 +7125,7 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG&&regmap[hr]>=0&&((dirty>>hr)&1)) {
        if(((isconst>>hr)&1)&&regmap[hr]>64) {
          if((is32>>(regmap[hr]&63))&1) {
-@@ -4317,7 +5427,11 @@ static void load_regs_entry(int t)
+@@ -4317,7 +5824,11 @@ static void load_regs_entry(int t)
  static void loop_preload(signed char pre[],signed char entry[])
  {
    int hr;
@@ -5434,20 +7137,44 @@ index 1e8f261..6f02f04 100644
      if(hr!=EXCLUDE_REG) {
        if(pre[hr]!=entry[hr]) {
          if(entry[hr]>=0) {
-@@ -4548,6 +5662,12 @@ static void do_cc(int i,signed char i_regmap[],int *adj,int addr,int taken,int i
+@@ -4548,6 +6059,21 @@ static void do_cc(int i,signed char i_regmap[],int *adj,int addr,int taken,int i
      *adj=0;
    }
    count=ccadj[i];
 +#if defined(__3DS__) && NEW_DYNAREC >= NEW_DYNAREC_ARM
 +  if(taken==TAKEN && ctr64_wl[i] && !(i==(ba[i]-start)>>2 && source[i+1]==0)) {
++    intptr_t gate=0;
++    if(ctr64_wl[i]==2) {                  /* yield loop: only while the yields come straight back */
++      emit_movimm((u_int)&ctr64_yield_same,HOST_TEMPREG);
++      emit_readword_indexed(0,HOST_TEMPREG,HOST_TEMPREG);
++      emit_test(HOST_TEMPREG,HOST_TEMPREG);
++      gate=(intptr_t)out;
++      emit_jeq(0);
++    }
 +    emit_test(HOST_CCREG,HOST_CCREG);
 +    emit_cmovs_imm(0,HOST_CCREG); /* the cycle count at the next event: the check below fires */
++    if(gate) set_jump_target(gate,(intptr_t)out);
 +  }
 +#endif
    if(taken==TAKEN && i==(ba[i]-start)>>2 && source[i+1]==0) {
      // Idle loop
      idle=(intptr_t)out;
-@@ -5451,32 +6571,28 @@ static void cop1_assemble(int i,struct regstat *i_regs)
+@@ -5286,6 +6812,14 @@ static void cop0_assemble(int i,struct regstat *i_regs)
+     if(rt1[i]) {
+       signed char t=get_reg(i_regs->regmap,rt1[i]);
+       char copr=(source[i]>>11)&0x1f;
++#if defined(__3DS__) && NEW_DYNAREC >= NEW_DYNAREC_ARM
++      /* ctr64: registers without side effects (not Count, Random or the unused ones, which read
++       * the latch) are a load: __osDisableInt's MFC0 Status, thousands a second (Iggy's Reckin'
++       * Balls: the C call and its helpers were 10% of the CPU thread) */
++      if(t>=0&&ctr64_mfc0_inline&&copr!=CP0_COUNT_REG&&copr!=CP0_RANDOM_REG&&copr!=7&&copr!=31&&!(copr>=21&&copr<=25)) {
++        emit_readword((uintptr_t)&g_dev.r4300.new_dynarec_hot_state.cp0_regs[copr],t);
++      } else
++#endif
+       if(t>=0) {
+         reglist&=~(1<<t);
+ 
+@@ -5451,32 +6985,28 @@ static void cop1_assemble(int i,struct regstat *i_regs)
    if (opcode2[i]==0) { // MFC1
      signed char tl=get_reg(i_regs->regmap,rt1[i]);
      if(tl>=0) {
@@ -5486,7 +7213,7 @@ index 1e8f261..6f02f04 100644
    }
    else if (opcode2[i]==2) // CFC1
    {
-@@ -6465,7 +7581,7 @@ static void store_assemble(int i,struct regstat *i_regs)
+@@ -6465,7 +7995,7 @@ static void store_assemble(int i,struct regstat *i_regs)
        }
      }
  
@@ -5495,7 +7222,7 @@ index 1e8f261..6f02f04 100644
        #ifdef DESTRUCTIVE_SHIFT
        // The x86 shift operation is 'destructive'; it overwrites the
        // source register, so we need to make a copy first and use that.
-@@ -6835,13 +7951,11 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
+@@ -6835,13 +8365,11 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
      cop1_usable=1;
    }
    if (opcode[i]==0x39) { // SWC1 (get float address)
@@ -5512,7 +7239,7 @@ index 1e8f261..6f02f04 100644
    }
  
  #ifndef INTERPRET_C1LS
-@@ -6909,7 +8023,7 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
+@@ -6909,7 +8437,7 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
        emit_writedword_indexed_tlb(th,tl,0,addr,map);
      }
  
@@ -5521,7 +7248,7 @@ index 1e8f261..6f02f04 100644
        if (opcode[i]==0x39||opcode[i]==0x3D) { // SWC1/SDC1
          #ifdef DESTRUCTIVE_SHIFT
          addr=temp;
-@@ -6947,13 +8061,11 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
+@@ -6947,13 +8475,11 @@ static void c1ls_assemble(int i,struct regstat *i_regs)
  #endif
  
    if (opcode[i]==0x31) { // LWC1 (write float)
@@ -5538,18 +7265,17 @@ index 1e8f261..6f02f04 100644
    }
  }
  
-@@ -8710,6 +9822,10 @@ void new_dynarec_init(void)
+@@ -8710,6 +10236,9 @@ void new_dynarec_init(void)
  {
    DebugMessage(M64MSG_INFO, "Init new dynarec");
    ensure_dynarec_cache_alignment();
 +#if defined(__3DS__)
 +  ctr64_fr_dynamic=0;
-+  ctr64_fr_toggles=0;
 +#endif
  
  #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
    recomp_dbg_init();
-@@ -8768,8 +9884,15 @@ void new_dynarec_init(void)
+@@ -8768,8 +10297,15 @@ void new_dynarec_init(void)
    base_addr_rx = base_addr;
  #endif
  #elif NEW_DYNAREC == NEW_DYNAREC_ARM
@@ -5565,7 +7291,7 @@ index 1e8f261..6f02f04 100644
    base_addr = g_dev.r4300.extra_memory;
    base_addr_rx = base_addr;
  #else
-@@ -8810,8 +9933,14 @@ void new_dynarec_init(void)
+@@ -8810,8 +10346,14 @@ void new_dynarec_init(void)
    // Copy this into local area so we don't have to put it in every literal pool
    g_dev.r4300.new_dynarec_hot_state.invc_ptr=g_dev.r4300.cached_interp.invalid_code;
  #endif
@@ -5581,7 +7307,7 @@ index 1e8f261..6f02f04 100644
  #else
    stop_after_jal=1;
  #endif
-@@ -8835,6 +9964,9 @@ void new_dynarec_cleanup(void)
+@@ -8835,6 +10377,9 @@ void new_dynarec_cleanup(void)
  #endif
  
    int n;
@@ -5591,7 +7317,7 @@ index 1e8f261..6f02f04 100644
    for(n=0;n<4096;n++) ll_clear(jump_in+n);
    for(n=0;n<4096;n++) ll_clear(jump_out+n);
    for(n=0;n<4096;n++) ll_clear(jump_dirty+n);
-@@ -8844,6 +9976,8 @@ void new_dynarec_cleanup(void)
+@@ -8844,6 +10389,8 @@ void new_dynarec_cleanup(void)
      VirtualFree(base_addr, 0, MEM_RELEASE);
    #elif NEW_DYNAREC == NEW_DYNAREC_ARM64 && CACHE_ADDR!=FIXED_CACHE_ADDR
      if (munmap (base_addr_rx, 1<<TARGET_SIZE_2) < 0) {DebugMessage(M64MSG_ERROR, "munmap() failed");}
@@ -5600,7 +7326,7 @@ index 1e8f261..6f02f04 100644
    #else
      mprotect(base_addr, 1<<TARGET_SIZE_2, PROT_READ | PROT_WRITE);
    #endif
-@@ -8853,6 +9987,444 @@ void new_dynarec_cleanup(void)
+@@ -8853,6 +10400,444 @@ void new_dynarec_cleanup(void)
  #endif
  }
  
@@ -6045,7 +7771,7 @@ index 1e8f261..6f02f04 100644
  int new_recompile_block(int addr)
  {
  #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
-@@ -8925,6 +10497,7 @@ int new_recompile_block(int addr)
+@@ -8925,6 +10910,7 @@ int new_recompile_block(int addr)
    //DebugMessage(M64MSG_VERBOSE, "addr = %x source = %x %x", addr,source,source[0]);
  
    /* Pass 1 disassembly */
@@ -6053,7 +7779,7 @@ index 1e8f261..6f02f04 100644
  
    for(i=0;!done;i++) {
      bt[i]=0;likely[i]=0;ooo[i]=0;op2=0;
-@@ -9429,7 +11002,7 @@ int new_recompile_block(int addr)
+@@ -9429,7 +11415,7 @@ int new_recompile_block(int addr)
          // Stop if we're compiling junk
          if(type==UJUMP||type==CJUMP||type==SJUMP||type==RJUMP||type==FJUMP)
          {
@@ -6062,7 +7788,7 @@ index 1e8f261..6f02f04 100644
            itype[i]=NOP;
            DebugMessage(M64MSG_VERBOSE, "Disabled speculative precompilation");
          }
-@@ -9440,7 +11013,15 @@ int new_recompile_block(int addr)
+@@ -9440,7 +11426,15 @@ int new_recompile_block(int addr)
          if((source[i+1]&0xfc00003f)==0x0d) done=1;
        }
        // Don't recompile stuff that's already compiled
@@ -6078,7 +7804,7 @@ index 1e8f261..6f02f04 100644
        // Don't get too close to the limit
        if(i>MAXBLOCK/2) done=1;
      }
-@@ -9451,11 +11032,19 @@ int new_recompile_block(int addr)
+@@ -9451,11 +11445,19 @@ int new_recompile_block(int addr)
      if (i==MAXBLOCK-1) done=1;
      // Stop if we're compiling junk
      if(itype[i]==NI&&opcode[i]==0x11) {
@@ -6099,7 +7825,7 @@ index 1e8f261..6f02f04 100644
    if(itype[i-1]==UJUMP||itype[i-1]==CJUMP||itype[i-1]==SJUMP||itype[i-1]==RJUMP||itype[i-1]==FJUMP) {
      if(start+i*4==pagelimit) {
        itype[i-1]=SPAN;
-@@ -9464,10 +11053,12 @@ int new_recompile_block(int addr)
+@@ -9464,10 +11466,12 @@ int new_recompile_block(int addr)
    assert(slen>0);
  
    /* Pass 2 - Register dependencies and branch targets */
@@ -6112,7 +7838,7 @@ index 1e8f261..6f02f04 100644
  
    struct regstat current; // Current register allocations/status
    current.is32=1;
-@@ -9828,7 +11419,11 @@ int new_recompile_block(int addr)
+@@ -9828,7 +11832,11 @@ int new_recompile_block(int addr)
                  if(rs2[i]) alloc_reg64(&current,i,rs2[i]);
                }
              }
@@ -6125,7 +7851,7 @@ index 1e8f261..6f02f04 100644
              {
                ooo[i]=1;
                delayslot_alloc(&current,i+1);
-@@ -10051,7 +11646,11 @@ int new_recompile_block(int addr)
+@@ -10051,7 +12059,11 @@ int new_recompile_block(int addr)
        }
  
        // Make sure the allocator didn't do anything bad
@@ -6137,7 +7863,7 @@ index 1e8f261..6f02f04 100644
        {
          int r;
          r=current.regmap[hr];
-@@ -10063,7 +11662,7 @@ int new_recompile_block(int addr)
+@@ -10063,7 +12075,7 @@ int new_recompile_block(int addr)
                {
                  //FIXME: delayslot_alloc realloc registers removed from cache by jump instruction, thus the missing dirty flag
                  assert(itype[i]==CJUMP);
@@ -6146,7 +7872,7 @@ index 1e8f261..6f02f04 100644
                }
                //assert (((current.dirty>>hr)&1)!=0);
              }
-@@ -10086,7 +11685,21 @@ int new_recompile_block(int addr)
+@@ -10086,7 +12098,21 @@ int new_recompile_block(int addr)
        }
  
        // Create entry (branch target) regmap
@@ -6168,7 +7894,7 @@ index 1e8f261..6f02f04 100644
        {
          int r,or;
          r=current.regmap[hr];
-@@ -10445,6 +12058,10 @@ int new_recompile_block(int addr)
+@@ -10445,6 +12471,10 @@ int new_recompile_block(int addr)
        regs[i].isconst=current.isconst;
        memcpy(constmap[i],current.constmap,sizeof(current.constmap));
      }
@@ -6179,7 +7905,7 @@ index 1e8f261..6f02f04 100644
      for(hr=0;hr<HOST_REGS;hr++) {
        if(hr!=EXCLUDE_REG&&regs[i].regmap[hr]>=0) {
          if(regmap_pre[i][hr]!=regs[i].regmap[hr]) {
-@@ -10452,12 +12069,14 @@ int new_recompile_block(int addr)
+@@ -10452,12 +12482,14 @@ int new_recompile_block(int addr)
          }
        }
      }
@@ -6195,7 +7921,7 @@ index 1e8f261..6f02f04 100644
  
    for (i=slen-1;i>=0;i--)
    {
-@@ -10467,18 +12086,18 @@ int new_recompile_block(int addr)
+@@ -10467,18 +12499,18 @@ int new_recompile_block(int addr)
        if(ba[i]<start || ba[i]>=(start+slen*4))
        {
          // Branch out of this block, don't need anything
@@ -6217,7 +7943,7 @@ index 1e8f261..6f02f04 100644
            }
          }
        }
-@@ -10487,95 +12106,149 @@ int new_recompile_block(int addr)
+@@ -10487,95 +12519,149 @@ int new_recompile_block(int addr)
        {
          if(i<slen-2) {
            nr|=needed_reg[i+2];
@@ -6410,7 +8136,7 @@ index 1e8f261..6f02f04 100644
        }
        // Don't store a register immediately after writing it,
        // may prevent dual-issue.
-@@ -10584,25 +12257,87 @@ int new_recompile_block(int addr)
+@@ -10584,25 +12670,87 @@ int new_recompile_block(int addr)
        if(i>0&&!bt[i]&&((regs[i].wasdirty>>hr)&1)) {
          if((regmap_pre[i][hr]>0&&regmap_pre[i][hr]<64&&!((unneeded_reg[i]>>regmap_pre[i][hr])&1)) ||
             (regmap_pre[i][hr]>64&&!((unneeded_reg_upper[i]>>(regmap_pre[i][hr]&63))&1)) ) {
@@ -6504,7 +8230,7 @@ index 1e8f261..6f02f04 100644
      for(hr=0;hr<HOST_REGS;hr++)
      {
        if(!((nr>>hr)&1)) {
-@@ -10685,7 +12420,8 @@ int new_recompile_block(int addr)
+@@ -10685,7 +12833,8 @@ int new_recompile_block(int addr)
            if(i>0)
            {
              int d1=0,d2=0,map=-1,temp=-1;
@@ -6514,7 +8240,7 @@ index 1e8f261..6f02f04 100644
              {
                d1=dep1[i];
                d2=dep2[i];
-@@ -10730,6 +12466,13 @@ int new_recompile_block(int addr)
+@@ -10730,6 +12879,13 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 5 - Pre-allocate registers */
@@ -6528,7 +8254,7 @@ index 1e8f261..6f02f04 100644
  
    // If a register is allocated during a loop, try to allocate it for the
    // entire loop, if possible.  This avoids loading/storing registers
-@@ -10762,10 +12505,15 @@ int new_recompile_block(int addr)
+@@ -10762,10 +12918,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -6544,7 +8270,7 @@ index 1e8f261..6f02f04 100644
                // and alloc new one
                f_regmap[hr]=regs[i].regmap[hr];
              }
-@@ -10779,10 +12527,15 @@ int new_recompile_block(int addr)
+@@ -10779,10 +12940,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=branch_regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -6560,7 +8286,7 @@ index 1e8f261..6f02f04 100644
                // and alloc new one
                f_regmap[hr]=branch_regs[i].regmap[hr];
              }
-@@ -10872,10 +12625,10 @@ int new_recompile_block(int addr)
+@@ -10872,10 +13038,10 @@ int new_recompile_block(int addr)
                          regs[k].regmap_entry[hr]=f_regmap[hr];
                          regs[k].regmap[hr]=f_regmap[hr];
                          regmap_pre[k+1][hr]=f_regmap[hr];
@@ -6575,7 +8301,7 @@ index 1e8f261..6f02f04 100644
                          regs[k].wasconst&=~(1LL<<hr);
                          regs[k].isconst&=~(1LL<<hr);
                          k++;
-@@ -10890,24 +12643,24 @@ int new_recompile_block(int addr)
+@@ -10890,24 +13056,24 @@ int new_recompile_block(int addr)
                        //DebugMessage(M64MSG_VERBOSE, "OK fill %x (r%d)",start+i*4,hr);
                        regs[i].regmap_entry[hr]=f_regmap[hr];
                        regs[i].regmap[hr]=f_regmap[hr];
@@ -6610,7 +8336,7 @@ index 1e8f261..6f02f04 100644
                          assert((branch_regs[i].is32&(1LL<<(f_regmap[hr]&63)))==
                            (regs[i+2].was32&(1LL<<(f_regmap[hr]&63))));
                        }
-@@ -10918,18 +12671,18 @@ int new_recompile_block(int addr)
+@@ -10918,18 +13084,18 @@ int new_recompile_block(int addr)
                      // but may dirty it in pass 6
                      regs[k].regmap_entry[hr]=f_regmap[hr];
                      regs[k].regmap[hr]=f_regmap[hr];
@@ -6632,7 +8358,7 @@ index 1e8f261..6f02f04 100644
                          assert((branch_regs[k].is32&(1LL<<(f_regmap[hr]&63)))==
                            (regs[k+2].was32&(1LL<<(f_regmap[hr]&63))));//DebugMessage(M64MSG_VERBOSE, "Extend CC, %x -> %x",start+k*4,start+j*4);
                        }
-@@ -10937,7 +12690,7 @@ int new_recompile_block(int addr)
+@@ -10937,7 +13103,7 @@ int new_recompile_block(int addr)
                      else
                      {
                        regmap_pre[k+1][hr]=f_regmap[hr];
@@ -6641,7 +8367,7 @@ index 1e8f261..6f02f04 100644
                      }
                    }
                    if(regs[j].regmap[hr]==f_regmap[hr])
-@@ -10998,7 +12751,11 @@ int new_recompile_block(int addr)
+@@ -10998,7 +13164,11 @@ int new_recompile_block(int addr)
        }
      }else{
        // Non branch or undetermined branch target
@@ -6653,7 +8379,7 @@ index 1e8f261..6f02f04 100644
        {
          if(hr!=EXCLUDE_REG) {
            if(regs[i].regmap[hr]>64) {
-@@ -11009,10 +12766,15 @@ int new_recompile_block(int addr)
+@@ -11009,10 +13179,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -6669,7 +8395,7 @@ index 1e8f261..6f02f04 100644
                // and alloc new one
                f_regmap[hr]=regs[i].regmap[hr];
              }
-@@ -11035,8 +12797,8 @@ int new_recompile_block(int addr)
+@@ -11035,8 +13210,8 @@ int new_recompile_block(int addr)
              regs[k].regmap_entry[HOST_CCREG]=CCREG;
              regs[k].regmap[HOST_CCREG]=CCREG;
              regmap_pre[k+1][HOST_CCREG]=CCREG;
@@ -6680,7 +8406,7 @@ index 1e8f261..6f02f04 100644
              regs[k].wasconst&=~(1<<HOST_CCREG);
              regs[k].isconst&=~(1<<HOST_CCREG);
              k++;
-@@ -11062,8 +12824,8 @@ int new_recompile_block(int addr)
+@@ -11062,8 +13237,8 @@ int new_recompile_block(int addr)
                regs[k].regmap_entry[HOST_CCREG]=CCREG;
                regs[k].regmap[HOST_CCREG]=CCREG;
                regmap_pre[k+1][HOST_CCREG]=CCREG;
@@ -6691,7 +8417,7 @@ index 1e8f261..6f02f04 100644
                regs[k].wasconst&=~(1<<HOST_CCREG);
                regs[k].isconst&=~(1<<HOST_CCREG);
                k++;
-@@ -11084,6 +12846,10 @@ int new_recompile_block(int addr)
+@@ -11084,6 +13259,10 @@ int new_recompile_block(int addr)
      }
    }
  
@@ -6702,7 +8428,7 @@ index 1e8f261..6f02f04 100644
    // Cache memory offset or tlb map pointer if a register is available
    #ifndef HOST_IMM_ADDR32
    #ifndef RAM_OFFSET
-@@ -11224,18 +12990,18 @@ int new_recompile_block(int addr)
+@@ -11224,18 +13403,18 @@ int new_recompile_block(int addr)
              assert(regs[j].regmap[maxscore]<0);
              if(j>loop_start[maxscore]) regs[j].regmap_entry[maxscore]=reg;
              regs[j].regmap[maxscore]=reg;
@@ -6725,7 +8451,7 @@ index 1e8f261..6f02f04 100644
                }
                // loop optimization (loop_preload)
                int t=(ba[j]-start)>>2;
-@@ -11248,7 +13014,7 @@ int new_recompile_block(int addr)
+@@ -11248,7 +13427,7 @@ int new_recompile_block(int addr)
              {
                if(j<1||(itype[j-1]!=RJUMP&&itype[j-1]!=UJUMP&&itype[j-1]!=CJUMP&&itype[j-1]!=SJUMP&&itype[j-1]!=FJUMP)) {
                  regmap_pre[j+1][maxscore]=reg;
@@ -6734,7 +8460,7 @@ index 1e8f261..6f02f04 100644
                }
              }
            }
-@@ -11264,6 +13030,10 @@ int new_recompile_block(int addr)
+@@ -11264,6 +13443,10 @@ int new_recompile_block(int addr)
    }
    #endif
  
@@ -6745,7 +8471,7 @@ index 1e8f261..6f02f04 100644
    // This allocates registers (if possible) one instruction prior
    // to use, which can avoid a load-use penalty on certain CPUs.
    for(i=0;i<slen-1;i++)
-@@ -11288,8 +13058,8 @@ int new_recompile_block(int addr)
+@@ -11288,8 +13471,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6756,7 +8482,7 @@ index 1e8f261..6f02f04 100644
                  free_regs--;
                }
              }
-@@ -11305,8 +13075,8 @@ int new_recompile_block(int addr)
+@@ -11305,8 +13488,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6767,7 +8493,7 @@ index 1e8f261..6f02f04 100644
                  free_regs--;
                }
              }
-@@ -11323,8 +13093,8 @@ int new_recompile_block(int addr)
+@@ -11323,8 +13506,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6778,7 +8504,7 @@ index 1e8f261..6f02f04 100644
                  free_regs--;
                }
              }
-@@ -11345,8 +13115,8 @@ int new_recompile_block(int addr)
+@@ -11345,8 +13528,8 @@ int new_recompile_block(int addr)
                    regs[i].isconst&=~(1<<hr);
                    regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                    constmap[i][hr]=constmap[i+1][hr];
@@ -6789,7 +8515,7 @@ index 1e8f261..6f02f04 100644
                    free_regs--;
                  }
                  else if((nr=get_reg2(regs[i].regmap,regs[i+1].regmap,-1))>=0&&free_regs>0)
-@@ -11361,10 +13131,10 @@ int new_recompile_block(int addr)
+@@ -11361,10 +13544,10 @@ int new_recompile_block(int addr)
                    regs[i+1].regmap_entry[nr]=MGEN1+((i+1)&1);
                    regs[i].isconst&=~(1<<nr);
                    regs[i+1].isconst&=~(1<<nr);
@@ -6804,7 +8530,7 @@ index 1e8f261..6f02f04 100644
                    free_regs--;
                  }
                }
-@@ -11386,8 +13156,8 @@ int new_recompile_block(int addr)
+@@ -11386,8 +13569,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6815,7 +8541,7 @@ index 1e8f261..6f02f04 100644
                  free_regs--;
                }
              }
-@@ -11405,8 +13175,8 @@ int new_recompile_block(int addr)
+@@ -11405,8 +13588,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -6826,7 +8552,7 @@ index 1e8f261..6f02f04 100644
                  free_regs--;
                }
                else if((nr=get_reg2(regs[i].regmap,regs[i+1].regmap,-1))>=0&&free_regs>0)
-@@ -11421,10 +13191,10 @@ int new_recompile_block(int addr)
+@@ -11421,10 +13604,10 @@ int new_recompile_block(int addr)
                  regs[i+1].regmap_entry[nr]=rs1[i+1];
                  regs[i].isconst&=~(1<<nr);
                  regs[i+1].isconst&=~(1<<nr);
@@ -6841,7 +8567,7 @@ index 1e8f261..6f02f04 100644
                  free_regs--;
                }
              }
-@@ -11443,8 +13213,8 @@ int new_recompile_block(int addr)
+@@ -11443,8 +13626,8 @@ int new_recompile_block(int addr)
                  regmap_pre[i+1][hr]=AGEN1+((i+1)&1);
                  regs[i+1].regmap_entry[hr]=AGEN1+((i+1)&1);
                  regs[i].isconst&=~(1<<hr);
@@ -6852,7 +8578,7 @@ index 1e8f261..6f02f04 100644
                }
              }
            }
-@@ -11453,10 +13223,18 @@ int new_recompile_block(int addr)
+@@ -11453,10 +13636,18 @@ int new_recompile_block(int addr)
      }
    }
  
@@ -6871,7 +8597,7 @@ index 1e8f261..6f02f04 100644
  
    provisional_r32();
  
-@@ -11560,7 +13338,11 @@ int new_recompile_block(int addr)
+@@ -11560,7 +13751,11 @@ int new_recompile_block(int addr)
  
      // Dirty registers which are 32-bit, require 32-bit input
      // as they will be written as 32-bit values
@@ -6883,7 +8609,7 @@ index 1e8f261..6f02f04 100644
      {
        if(regs[i].regmap_entry[hr]>0&&regs[i].regmap_entry[hr]<64) {
          if((regs[i].was32>>regs[i].regmap_entry[hr])&(regs[i].wasdirty>>hr)&1) {
-@@ -11577,6 +13359,7 @@ int new_recompile_block(int addr)
+@@ -11577,6 +13772,7 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 8 - Assembly */
@@ -6891,7 +8617,7 @@ index 1e8f261..6f02f04 100644
    linkcount=0;stubcount=0;
    ds=0;is_delayslot=0;
    cop1_usable=0;
-@@ -11800,6 +13583,7 @@ int new_recompile_block(int addr)
+@@ -11800,6 +13996,7 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 9 - Linker */
@@ -6899,7 +8625,7 @@ index 1e8f261..6f02f04 100644
    for(i=0;i<linkcount;i++)
    {
      assem_debug("%8x -> %8x",link_addr[i][0],link_addr[i][1]);
-@@ -11867,12 +13651,17 @@ int new_recompile_block(int addr)
+@@ -11867,12 +14064,17 @@ int new_recompile_block(int addr)
            // Don't add new entries.  We'll insert the
            // ones that actually get used in check_addr().
            struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
@@ -6917,7 +8643,24 @@ index 1e8f261..6f02f04 100644
          }
          else
          {
-@@ -11933,8 +13722,28 @@ int new_recompile_block(int addr)
+@@ -11922,19 +14124,45 @@ int new_recompile_block(int addr)
+   for(i=start>>12;i<=(int)((start+slen*4-4)>>12);i++) {
+     g_dev.r4300.cached_interp.invalid_code[i]=0;
+     g_dev.r4300.new_dynarec_hot_state.memory_map[i]|=WRITE_PROTECT;
++#if defined(__3DS__)
++    ctr64_protect_aliases(i);
++#endif
+     if((signed int)start>=(signed int)0xC0000000) {
+       assert(using_tlb);
+       assert(g_dev.r4300.new_dynarec_hot_state.memory_map[i]!=-1);
+       j=(((uintptr_t)i<<12)+(uintptr_t)(g_dev.r4300.new_dynarec_hot_state.memory_map[i]<<2)-(uintptr_t)g_dev.rdram.dram+(uintptr_t)0x80000000)>>12;
+       g_dev.r4300.cached_interp.invalid_code[j]=0;
+       g_dev.r4300.new_dynarec_hot_state.memory_map[j]|=WRITE_PROTECT;
++#if defined(__3DS__)
++      ctr64_protect_aliases(j);
++#endif
+       //DebugMessage(M64MSG_VERBOSE, "write protect physical page: %x (virtual %x)",j<<12,start);
+     }
    }
  
    /* Pass 10 - Free memory by expiring oldest blocks */
@@ -6946,7 +8689,7 @@ index 1e8f261..6f02f04 100644
    while(expirep!=end)
    {
      int shift=TARGET_SIZE_2-3; // Divide into 8 blocks
-@@ -11983,5 +13792,7 @@ int new_recompile_block(int addr)
+@@ -11983,5 +14211,7 @@ int new_recompile_block(int addr)
      }
      expirep=(expirep+1)&65535;
    }
@@ -7137,7 +8880,7 @@ index 05ecdd7..e5714cc 100644
      r4300_check_interrupt(mi->r4300, CP0_CAUSE_IP2, mi->regs[MI_INTR_REG] & mi->regs[MI_INTR_MASK_REG]);
  }
 diff --git a/mupen64plus-core/src/device/rcp/rdp/rdp_core.c b/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
-index 3063aa1..3896490 100644
+index 3063aa1..6568e87 100644
 --- a/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
 +++ b/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
 @@ -27,6 +27,11 @@
@@ -7152,7 +8895,7 @@ index 3063aa1..3896490 100644
  
  static void update_dpc_status(struct rdp_core* dp, uint32_t w)
  {
-@@ -145,10 +150,40 @@ void write_dps_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mas
+@@ -145,10 +150,53 @@ void write_dps_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mas
      }
  }
  
@@ -7175,13 +8918,26 @@ index 3063aa1..3896490 100644
 +        if (!ctr64_gfx_pending)
 +            return; /* completed by a save state's quiesce, which raised it */
 +        const uint32_t now = r4300_cp0_regs(&dp->mi->r4300->cp0)[CP0_COUNT_REG];
++        /* Two display lists in flight: the game has not yet acknowledged the previous one's
++         * interrupt, so raising now would merge both into one and the game would wait forever
++         * for the second (Blast Corps intro, HW 2026-11-17). A real RDP renders one after the
++         * other, so wait (at most 2 VIs) for the acknowledgement. */
++        static unsigned ctr64_dp_held;
++        if ((dp->mi->regs[MI_INTR_REG] & MI_INTR_DP) && ctr64_dp_held < 32) {
++            ctr64_dp_held++;
++            ctr64_gfx_dp_checks++;
++            add_interrupt_event(&dp->mi->r4300->cp0, DP_INT, ctr64_gfx_dlist_step());
++            return;
++        }
++        ctr64_dp_held = 0;
 +        if (!ctr64_gfx_dlist_ready(now - ctr64_gfx_start_count)) {
 +            ctr64_gfx_dp_checks++;
 +            add_interrupt_event(&dp->mi->r4300->cp0, DP_INT, ctr64_gfx_dlist_step());
 +            return;
 +        }
 +        ctr64_gfx_pending--;
-+        if (!ctr64_gfx_dlist_finish())
++        const bool ctr64_dp_req = ctr64_gfx_dlist_finish();
++        if (!ctr64_dp_req)
 +            return; /* no full sync in that display list */
 +        if (dp->dpc_regs[DPC_STATUS_REG] & DPC_STATUS_FREEZE) {
 +            dp->do_on_unfreeze |= DELAY_DP_INT;
@@ -7194,18 +8950,20 @@ index 3063aa1..3896490 100644
  }
  
 diff --git a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
-index 99767bc..4a71403 100644
+index 99767bc..f5ea419 100644
 --- a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 +++ b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
-@@ -21,6 +21,7 @@
+@@ -21,7 +21,9 @@
  
  #include "rsp_core.h"
  
 +#include <stdbool.h>
  #include <string.h>
++#include <stdio.h>
  
  #include "device/memory/memory.h"
-@@ -36,6 +37,22 @@
+ #include "device/r4300/r4300_core.h"
+@@ -36,6 +38,22 @@
  #include "plugin/plugin.h"
  #include "api/callbacks.h"
  
@@ -7228,7 +8986,7 @@ index 99767bc..4a71403 100644
  static void do_sp_dma(struct rsp_core* sp, const struct sp_dma* dma)
  {
      unsigned int i,j;
-@@ -55,6 +72,12 @@ static void do_sp_dma(struct rsp_core* sp, const struct sp_dma* dma)
+@@ -55,6 +73,12 @@ static void do_sp_dma(struct rsp_core* sp, const struct sp_dma* dma)
      if (dma->dir == SP_DMA_READ)
      {
          for(j=0; j<count; j++) {
@@ -7241,7 +8999,7 @@ index 99767bc..4a71403 100644
              for(i=0; i<length; i++) {
                  dram[(dramaddr^S8) & 0x7fffff] = spmem[(memaddr^S8) & 0xfff];
                  memaddr++;
-@@ -75,6 +98,12 @@ static void do_sp_dma(struct rsp_core* sp, const struct sp_dma* dma)
+@@ -75,6 +99,12 @@ static void do_sp_dma(struct rsp_core* sp, const struct sp_dma* dma)
              if (dramaddr < 0x800000)
                  pre_framebuffer_read(&sp->dp->fb, dramaddr);
  
@@ -7254,7 +9012,28 @@ index 99767bc..4a71403 100644
              for(i=0; i<length; i++) {
                  spmem[(memaddr^S8) & 0xfff] = dram[(dramaddr^S8) & 0x7fffff];
                  memaddr++;
-@@ -323,9 +352,68 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
+@@ -143,8 +173,20 @@ static void fifo_pop(struct rsp_core* sp)
+     }
+ }
+ 
++#if defined(__3DS__)
++static int ctr64_sp_resume;
++static void ctr64_stream_settle(struct rsp_core* sp, bool force);
++#endif
++
+ static void update_sp_status(struct rsp_core* sp, uint32_t w)
+ {
++#if defined(__3DS__)
++    /* a streamed display list still open: finish it first, as an inline one would be */
++    if (ctr64_sp_resume == 2 && sp->rsp_task_locked) {
++        remove_event(&sp->mi->r4300->cp0.q, SP_INT);
++        ctr64_stream_settle(sp, true);
++    }
++#endif
+     /* clear / set halt */
+     if ((w & 0x3) == 0x1) sp->regs[SP_STATUS_REG] &= ~SP_STATUS_HALT;
+     if ((w & 0x3) == 0x2) sp->regs[SP_STATUS_REG] |= SP_STATUS_HALT;
+@@ -323,9 +365,158 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
          masked_write(&sp->regs2[reg], value, mask);
  }
  
@@ -7269,6 +9048,7 @@ index 99767bc..4a71403 100644
 +extern unsigned ctr64_gfx_dlist_step(void);
 +extern bool ctr64_gfx_dlist_ready(unsigned elapsed);
 +unsigned ctr64_gfx_pending;   /* display lists on the worker not yet completed */
++bool ctr64_gfx_noprevdl;      /* dev switch noprevdl.txt */
 +unsigned ctr64_gfx_dp_checks; /* DP_INT check events in the queue */
 +uint32_t ctr64_gfx_start_count;
 +
@@ -7307,10 +9087,99 @@ index 99767bc..4a71403 100644
 +    ctr64_gfx_drain();
 +}
 +
++/* save states: a display list the CPU is still writing (the RSP waits in a branch to itself, see
++ * do_SP_Task) cannot be saved, since the plugin's place in it is not part of a state; a state
++ * taken then made Gauntlet Legends stop at "FATAL: GAMEFREE LOOP UNKNOWN INTR 400" on load. The
++ * frontend runs on to a moment without one (core_host_save_state). */
++int ctr64_rsp_task_locked(void)
++{
++    extern struct device g_dev;
++    return g_dev.sp.rsp_task_locked;
++}
++
++static int ctr64_sp_resume; /* defined with do_SP_Task */
++/* stats.log when a game has stopped sending tasks: what it may wait for */
++void ctr64_rsp_debug(FILE *f)
++{
++    extern struct device g_dev;
++    extern bool ctr64_gfx_stream;
++    const uint32_t *cp0 = r4300_cp0_regs(&g_dev.r4300.cp0);
++    fprintf(f, "  rsp: locked %u resume %d stream %d | events SP %d DP %d VI %d SI %d PI %d AI %d | SP status %08x DPC status %08x | "
++            "MI intr %08x mask %08x | cp0 status %08x cause %08x epc %08x\n",
++            (unsigned)g_dev.sp.rsp_task_locked, ctr64_sp_resume, (int)ctr64_gfx_stream,
++            get_event(&g_dev.r4300.cp0.q, SP_INT) != NULL, get_event(&g_dev.r4300.cp0.q, DP_INT) != NULL,
++            get_event(&g_dev.r4300.cp0.q, VI_INT) != NULL, get_event(&g_dev.r4300.cp0.q, SI_INT) != NULL,
++            get_event(&g_dev.r4300.cp0.q, PI_INT) != NULL, get_event(&g_dev.r4300.cp0.q, AI_INT) != NULL,
++            (unsigned)g_dev.sp.regs[SP_STATUS_REG],
++            (unsigned)g_dev.dp.dpc_regs[DPC_STATUS_REG], (unsigned)g_dev.mi.regs[MI_INTR_REG],
++            (unsigned)g_dev.mi.regs[MI_INTR_MASK_REG], (unsigned)cp0[CP0_STATUS_REG], (unsigned)cp0[CP0_CAUSE_REG],
++            (unsigned)cp0[CP0_EPC_REG]);
++}
++
++void ctr64_rsp_state_loaded(void)
++{
++    ctr64_sp_resume = 0;
++}
++
 +unsigned int ctr64_sp_tasks[3]; /* ctr64 profiling: gfx, audio, other */
++int ctr64_sp_resume_on = 1;         /* dev switch nospresume.txt (ctr_jit.c) */
++static int ctr64_sp_resume;         /* the pending SP_INT event is a resume check (do_SP_Task) */
++unsigned int ctr64_sp_resumes;      /* stats.log: display lists resumed after their branch changed */
++extern bool ctr64_gfx_infloop_unchanged(void); /* GLideN64 RSP.cpp */
++/* display lists that wait in a branch to themselves, on the worker (gfx_async.c "stream") */
++extern bool ctr64_gfx_stream;
++extern int ctr64_gfx_stream_poll(unsigned elapsed, bool *dp);
++static uint32_t ctr64_stream_start;
++#define CTR64_STREAM_STEP 1000
 +unsigned long long ctr64_sp_ticks[3]; /* ctr64 profiling: time in those tasks */
 +unsigned long long ctr64_ticks(void);
 +#endif
++
++#if defined(__3DS__)
++/* a streamed display list (do_SP_Task): done on the worker? force: wait for it (the game writes
++ * SP_STATUS meanwhile, e.g. to start its audio task, which an open task would swallow) */
++static void ctr64_stream_settle(struct rsp_core* sp, bool force)
++{
++        /* a streamed display list (do_SP_Task): done on the worker? */
++        ctr64_sp_resume = 0;
++        if (!sp->rsp_task_locked)
++            return;
++        bool dp = false;
++        cp0_update_count(sp->mi->r4300);
++        const uint32_t now = r4300_cp0_regs(&sp->mi->r4300->cp0)[CP0_COUNT_REG];
++        const int r = ctr64_gfx_stream_poll(force ? 0xFFFFFFFFu : now - ctr64_stream_start, &dp);
++        if (dp) {
++            /* after the SP's, as for an inline list (do_SP_Task: SP 1000, DP 4000 cycles on) */
++            if (sp->dp->dpc_regs[DPC_STATUS_REG] & DPC_STATUS_FREEZE)
++                sp->dp->do_on_unfreeze |= DELAY_DP_INT;
++            else
++                add_interrupt_event(&sp->mi->r4300->cp0, DP_INT, 3000);
++        }
++        if (r == 0) { /* still on it */
++            ctr64_sp_resume = 2;
++            add_interrupt_event(&sp->mi->r4300->cp0, SP_INT, CTR64_STREAM_STEP);
++            return;
++        }
++        if (r == 2) { /* the list ended: the task is done, as do_SP_Task does for an inline one */
++            /* the done bits and the SP interrupt come from the SP_INT event 1000 cycles on
++             * (rsp_interrupt_event), as for an inline list. Raised here at once, a game write
++             * that brought us here (update_sp_status) could clear the interrupt right after:
++             * Gauntlet's intro then waited forever (HW 2026-11-18). */
++            sp->rsp_task_locked = 0;
++            sp->mi->r4300->cp0.interrupt_unsafe_state &= ~INTR_UNSAFE_RSP;
++            /* the bits at once, as the HLE sets them for an inline list (with HALT clear the
++             * game's next SP_STATUS write would start a task while this one is still ending) */
++            sp->regs[SP_STATUS_REG] |= SP_STATUS_TASKDONE | SP_STATUS_BROKE | SP_STATUS_HALT;
++            add_interrupt_event(&sp->mi->r4300->cp0, SP_INT, 1000);
++            return;
++        }
++        /* waits in a branch to itself: from here as an inline one */
++        ctr64_sp_resume = 1;
++        add_interrupt_event(&sp->mi->r4300->cp0, SP_INT, 1000);
++        return;
++}
++#endif
++
 +
  void do_SP_Task(struct rsp_core* sp)
  {
@@ -7323,13 +9192,26 @@ index 99767bc..4a71403 100644
  
      uint32_t sp_delay_time;
  
-@@ -345,6 +433,17 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -345,6 +536,30 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
          new_frame();
  
 +#if defined(__3DS__)
 +        if (ctr64_gfx_dlist_async)
 +        {
++            /* The previous display list still in flight: as a real RDP, which renders one list
++             * after the other, complete it now (its interrupt too) rather than keep two in
++             * flight, whose interrupts can merge into one; Blast Corps then waits forever in
++             * its intro (HW only: there the worker lags; no other tested game does this). */
++            if (ctr64_gfx_pending && !ctr64_gfx_noprevdl) {
++                ctr64_gfx_pending--;
++                if (ctr64_gfx_dlist_finish()) {
++                    if (sp->dp->dpc_regs[DPC_STATUS_REG] & DPC_STATUS_FREEZE)
++                        sp->dp->do_on_unfreeze |= DELAY_DP_INT;
++                    else
++                        signal_rcp_interrupt(sp->mi, MI_INTR_DP);
++                }
++            }
 +            ctr64_gfx_pending++;
 +            ctr64_gfx_dp_checks++;
 +            cp0_update_count(sp->mi->r4300);
@@ -7341,7 +9223,7 @@ index 99767bc..4a71403 100644
          if (sp->mi->regs[MI_INTR_REG] & MI_INTR_DP)
          {
              sp->mi->regs[MI_INTR_REG] &= ~MI_INTR_DP;
-@@ -361,6 +460,20 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -361,6 +576,20 @@ void do_SP_Task(struct rsp_core* sp)
      }
      else if (sp->mem[0xfc0/4] == 2)
      {
@@ -7362,7 +9244,7 @@ index 99767bc..4a71403 100644
          //audio.processAList();
          sp->regs2[SP_PC_REG] &= 0xfff;
  #if defined(PROFILE)
-@@ -373,6 +486,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -373,6 +602,9 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
  
          sp_delay_time = 4000;
@@ -7372,7 +9254,7 @@ index 99767bc..4a71403 100644
      }
      else
      {
-@@ -382,6 +498,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -382,6 +614,9 @@ void do_SP_Task(struct rsp_core* sp)
  
          sp_delay_time = 0;
      }
@@ -7382,7 +9264,40 @@ index 99767bc..4a71403 100644
  
      sp->rsp_task_locked = 0;
      sp->mi->r4300->cp0.interrupt_unsafe_state &= ~INTR_UNSAFE_RSP;
-@@ -406,6 +525,18 @@ void rsp_interrupt_event(void* opaque)
+@@ -391,6 +626,32 @@ void do_SP_Task(struct rsp_core* sp)
+         sp->mi->r4300->cp0.interrupt_unsafe_state |= INTR_UNSAFE_RSP;
+         sp->mi->regs[MI_INTR_REG] |= MI_INTR_SP;
+     }
++#if defined(__3DS__)
++    /* A display list waiting in a branch to itself (GLideN64 RSP.infloop: Gauntlet Legends). On an
++     * N64 the RSP spins there, with no interrupt, until the CPU rewrites the branch. Here such a
++     * task ended "locked" and raised an SP interrupt 1000 cycles later; the game's handler wrote
++     * SP_STATUS, which ran the list again: ~28000 tasks and interrupts a second (HW gameplay
++     * 25%). Instead the list is looked at every 1000 cycles, without an interrupt, and run again
++     * only once the branch has changed (rsp_interrupt_event). Dev switch nospresume.txt. */
++    ctr64_sp_resume = 0;
++    if (sp->rsp_task_locked && sp->mem[0xfc0/4] == 1 && ctr64_gfx_stream)
++    {
++        /* streamed: the worker has the list; whether it ends or waits in a branch to itself is
++         * known once it is done (rsp_interrupt_event, ctr64_gfx_stream_poll) */
++        ctr64_sp_resume = 2;
++        sp->mi->regs[MI_INTR_REG] &= ~MI_INTR_SP;
++        cp0_update_count(sp->mi->r4300);
++        ctr64_stream_start = r4300_cp0_regs(&sp->mi->r4300->cp0)[CP0_COUNT_REG];
++        add_interrupt_event(&sp->mi->r4300->cp0, SP_INT, CTR64_STREAM_STEP);
++    }
++    else if (sp->rsp_task_locked && ctr64_sp_resume_on && sp->mem[0xfc0/4] == 1 && ctr64_gfx_infloop_unchanged())
++    {
++        ctr64_sp_resume = 1;
++        sp->mi->regs[MI_INTR_REG] &= ~MI_INTR_SP;
++        cp0_update_count(sp->mi->r4300);
++        add_interrupt_event(&sp->mi->r4300->cp0, SP_INT, 1000);
++    }
++#endif
+     if (sp->mi->regs[MI_INTR_REG] & MI_INTR_SP)
+     {
+         cp0_update_count(sp->mi->r4300);
+@@ -406,6 +667,39 @@ void rsp_interrupt_event(void* opaque)
  {
      struct rsp_core* sp = (struct rsp_core*)opaque;
  
@@ -7398,6 +9313,27 @@ index 99767bc..4a71403 100644
 +    }
 +#endif
 +
++#if defined(__3DS__)
++    if (ctr64_sp_resume == 2) {
++        ctr64_stream_settle(sp, false);
++        return;
++    }
++    if (ctr64_sp_resume) {
++        /* a display list waiting in a branch to itself (do_SP_Task): run it again once the game
++         * has rewritten the branch, else look again later; no interrupt either way */
++        ctr64_sp_resume = 0;
++        if (!sp->rsp_task_locked || (sp->regs[SP_STATUS_REG] & SP_STATUS_HALT))
++            return;
++        if (ctr64_gfx_infloop_unchanged()) {
++            ctr64_sp_resume = 1;
++            add_interrupt_event(&sp->mi->r4300->cp0, SP_INT, 1000);
++            return;
++        }
++        ctr64_sp_resumes++;
++        do_SP_Task(sp);
++        return;
++    }
++#endif
      if (!sp->rsp_task_locked)
      {
          sp->regs[SP_STATUS_REG] |=
@@ -7461,7 +9397,7 @@ index 6a90cf0..3e2f1f0 100644
      /* add some useful properties to ROM_PARAMS */
      ROM_PARAMS.systemtype = rom_country_code_to_system_type(ROM_HEADER.Country_code);
 diff --git a/mupen64plus-core/src/main/savestates.c b/mupen64plus-core/src/main/savestates.c
-index ef31870..f82f1c8 100644
+index ef31870..6f2ca6a 100644
 --- a/mupen64plus-core/src/main/savestates.c
 +++ b/mupen64plus-core/src/main/savestates.c
 @@ -197,7 +197,20 @@ static void savestates_clear_job(void)
@@ -7581,7 +9517,16 @@ index ef31870..f82f1c8 100644
  
      *r4300_llbit(&dev->r4300) = GETDATA(curr, uint32_t);
      COPYARRAY(r4300_regs(&dev->r4300), curr, int64_t, 32);
-@@ -1048,7 +1088,10 @@ int savestates_load_m64p(struct device* dev, const void *data)
+@@ -1045,10 +1085,19 @@ int savestates_load_m64p(struct device* dev, const void *data)
+ 
+     dev->sp.rsp_task_locked = 0;
+     dev->r4300.cp0.interrupt_unsafe_state = 0;
++#if defined(__3DS__)
++    {
++        extern void ctr64_rsp_state_loaded(void);
++        ctr64_rsp_state_loaded();
++    }
++#endif
  
      *r4300_cp0_last_addr(&dev->r4300.cp0) = *r4300_pc(&dev->r4300);
  
@@ -7592,7 +9537,7 @@ index ef31870..f82f1c8 100644
  
  #ifndef __LIBRETRO__
      main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State loaded from: %s", namefrompath(filepath));
-@@ -1645,6 +1688,10 @@ int savestates_save_m64p(const struct device* dev, char *filepath)
+@@ -1645,6 +1694,10 @@ int savestates_save_m64p(const struct device* dev, char *filepath)
  int savestates_save_m64p(const struct device* dev, void *data)
  #endif
  {
@@ -7603,7 +9548,7 @@ index ef31870..f82f1c8 100644
      unsigned char outbuf[4];
      int i;
  
-@@ -1676,7 +1723,12 @@ int savestates_save_m64p(const struct device* dev, void *data)
+@@ -1676,7 +1729,12 @@ int savestates_save_m64p(const struct device* dev, void *data)
  
      // Allocate memory for the save state data
      save->size = 16788288 + sizeof(queue) + 4 + 4096;
@@ -7616,7 +9561,7 @@ index ef31870..f82f1c8 100644
      if (save->data == NULL)
      {
          free(save->filepath);
-@@ -1686,7 +1738,11 @@ int savestates_save_m64p(const struct device* dev, void *data)
+@@ -1686,7 +1744,11 @@ int savestates_save_m64p(const struct device* dev, void *data)
          return 0;
      }
  
@@ -7628,7 +9573,7 @@ index ef31870..f82f1c8 100644
  
      // Write the save state data to memory
      PUTARRAY(savestate_magic, curr, unsigned char, 8);
-@@ -1839,15 +1895,15 @@ int savestates_save_m64p(const struct device* dev, void *data)
+@@ -1839,15 +1901,15 @@ int savestates_save_m64p(const struct device* dev, void *data)
      PUTDATA(curr, uint32_t, dev->dp.dps_regs[DPS_BUFTEST_ADDR_REG]);
      PUTDATA(curr, uint32_t, dev->dp.dps_regs[DPS_BUFTEST_DATA_REG]);
  
@@ -7647,7 +9592,7 @@ index ef31870..f82f1c8 100644
  
      /* OK to cast away const qualifier */
      PUTDATA(curr, uint32_t, *r4300_llbit((struct r4300_core*)&dev->r4300));
-@@ -2045,6 +2101,13 @@ int savestates_save_m64p(const struct device* dev, void *data)
+@@ -2045,6 +2107,13 @@ int savestates_save_m64p(const struct device* dev, void *data)
      PUTDATA(curr, uint64_t, *r4300_cp0_latch((struct cp0*)&dev->r4300.cp0));
      PUTDATA(curr, uint64_t, *r4300_cp2_latch((struct cp2*)&dev->r4300.cp2));
  

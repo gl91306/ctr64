@@ -69,6 +69,12 @@ void ui_set_console(PrintConsole *c)
         c->frameBuffer = g_fb;
 }
 
+const u16 *ui_canvas(unsigned *bytes)
+{
+    *bytes = sizeof(g_canvas);
+    return g_canvas;
+}
+
 PrintConsole *ui_console(void)
 {
     return g_console;
@@ -694,8 +700,8 @@ int ui_footer_button(int x, const char *glyph_s, const char *label, bool right)
 /* ---- input, and the development script ----------------------------------------------------------
  * sdmc:/3ds/ctr64/uiscript.txt (development aid): one command per line, run one per ui_scan call
  * ("wait N" spends N calls): key NAME (A B X Y L R ZL ZR START SELECT UP DOWN LEFT RIGHT) presses
- * and releases a key, touch X Y taps the screen there, drag X Y DY N presses at (X, Y) and moves
- * DY pixels down over N calls, dump NAME writes the bottom screen to
+ * and releases a key (NAME+NAME: several at once), touch X Y taps the screen there, drag X Y DY N
+ * presses at (X, Y) and moves DY pixels down over N calls, dump NAME writes the bottom screen to
  * sdmc:/3ds/ctr64/ui_NAME.tga. Lets screens be checked in an emulator without a person. */
 
 static FILE *g_script;
@@ -756,7 +762,9 @@ void ui_scan(u32 *down, u32 *held, u32 *up)
             return;
         }
         if (!strcmp(cmd, "key") && sscanf(line, "%*s %31s", a) == 1) {
-            const u32 k = key_by_name(a);
+            u32 k = 0; /* "key L+ZL": several at once */
+            for (char *t = strtok(a, "+"); t; t = strtok(NULL, "+"))
+                k |= key_by_name(t);
             *down |= k;
             *held |= k;
             g_inj_up = k;

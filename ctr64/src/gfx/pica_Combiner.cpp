@@ -469,6 +469,12 @@ void compile(u64 mux, u32 cycle_type, Program &out)
             cycle1_last = stage - 1;
     }
     out.n = (u8)stage;
+    if (ncycles == 2 && cycle2_first >= 0 && cycle2_first < stage) {
+        out.cycle2_first = (s8)cycle2_first;
+        /* (A - B) * C + COMBINED with A == B or C == 0 leaves alpha1 */
+        const bool pass = ac[1][3] == G_GCI_COMBINED && (ac[1][0] == ac[1][1] || ac[1][2] == G_GCI_ZERO);
+        out.alpha2_differs = !pass;
+    }
     if (comb_buf) {
         /* written by stage k, the buffer is visible from stage k + 2: cycle 2's first stage
          * reads COMBINED as PREVIOUS instead */

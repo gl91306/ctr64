@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 Settings g_settings;
 
@@ -36,6 +37,7 @@ void settings_defaults(Settings *s)
     s->anti_aliasing = false;
     s->aspect = ASPECT_43;
     s->stick_range = 100;
+    s->swap_dpad = false;
     s->map[IN_A] = KEY_A;
     s->map[IN_B] = KEY_B;
     s->map[IN_Z] = KEY_L;
@@ -76,25 +78,154 @@ void settings_publish(void)
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-static uint32_t key_by_name(const char *n)
+/* "L+ZL": the 3DS buttons of one N64 input, joined by '+' */
+static uint32_t keys_by_name(const char *v)
 {
-    for (int i = 0; i < k_map_key_count; i++)
-        if (!strcmp(n, k_map_key_names[i]))
-            return k_map_keys[i];
-    return 0;
+    uint32_t k = 0;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s", v);
+    for (char *t = strtok(buf, "+"); t; t = strtok(NULL, "+"))
+        for (int i = 1; i < k_map_key_count; i++)
+            if (!strcmp(t, k_map_key_names[i]))
+                k |= k_map_keys[i];
+    return k;
 }
 
-static const char *key_name(uint32_t k)
+void settings_keys_name(uint32_t k, char *out, int size)
 {
-    for (int i = 0; i < k_map_key_count; i++)
-        if (k_map_keys[i] == k)
-            return k_map_key_names[i];
-    return "none";
+    int n = 0;
+    out[0] = 0;
+    for (int i = 1; i < k_map_key_count && n < size; i++)
+        if (k & k_map_keys[i])
+            n += snprintf(out + n, size - n, "%s%s", n ? "+" : "", k_map_key_names[i]);
+    if (!out[0])
+        snprintf(out, size, "none");
+}
+
+/* the controls part of the settings (per-game files hold only these) */
+typedef struct {
+    uint32_t map[IN_COUNT];
+    int stick_range;
+    bool swap_dpad;
+} Controls;
+static Controls g_shared_ctrl;    /* settings.txt's controls while a game's own are in use */
+static bool g_game_ctrl;          /* the running game has its own controls file */
+static char g_game_ctrl_path[96];
+
+static void ctrl_get(Controls *c, const Settings *s)
+{
+    memcpy(c->map, s->map, sizeof(c->map));
+    c->stick_range = s->stick_range;
+    c->swap_dpad = s->swap_dpad;
+}
+
+static void ctrl_put(Settings *s, const Controls *c)
+{
+    memcpy(s->map, c->map, sizeof(c->map));
+    s->stick_range = c->stick_range;
+    s->swap_dpad = c->swap_dpad;
+}
+
+/* one key=value of the controls; false: not a controls key */
+static bool ctrl_parse(Settings *s, const char *k, const char *v)
+{
+    if (!strcmp(k, "stick_range")) {
+        s->stick_range = clampi(atoi(v), 50, 150);
+        return true;
+    }
+    if (!strcmp(k, "swap_dpad")) {
+        s->swap_dpad = atoi(v) != 0;
+        return true;
+    }
+    if (!strncmp(k, "map_", 4)) {
+        for (int i = 0; i < IN_COUNT; i++)
+            if (!strcmp(k + 4, k_input_names[i]))
+                s->map[i] = keys_by_name(v);
+        return true;
+    }
+    return false;
+}
+
+static void ctrl_write(FILE *f, const Controls *c)
+{
+    fprintf(f, "stick_range=%d\nswap_dpad=%d\n", c->stick_range, c->swap_dpad);
+    for (int i = 0; i < IN_COUNT; i++) {
+        char n[64];
+        settings_keys_name(c->map[i], n, sizeof(n));
+        fprintf(f, "map_%s=%s\n", k_input_names[i], n);
+    }
+}
+
+static bool game_ctrl_save(void)
+{
+    if (!g_game_ctrl_path[0])
+        return false;
+    mkdir("sdmc:/3ds/ctr64/controls", 0777);
+    FILE *f = fopen(g_game_ctrl_path, "w");
+    if (!f)
+        return false;
+    Controls c;
+    ctrl_get(&c, &g_settings);
+    ctrl_write(f, &c);
+    return fclose(f) == 0;
+}
+
+void settings_game_controls_load(const char *rom_id)
+{
+    g_game_ctrl = false;
+    g_game_ctrl_path[0] = 0;
+    if (!rom_id || !rom_id[0] || !strcmp(rom_id, "unknown"))
+        return;
+    snprintf(g_game_ctrl_path, sizeof(g_game_ctrl_path), "sdmc:/3ds/ctr64/controls/%s.txt", rom_id);
+    FILE *f = fopen(g_game_ctrl_path, "r");
+    if (!f)
+        return;
+    ctrl_get(&g_shared_ctrl, &g_settings);
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (!eq)
+            continue;
+        *eq = 0;
+        ctrl_parse(&g_settings, line, eq + 1);
+    }
+    fclose(f);
+    g_game_ctrl = true;
+}
+
+bool settings_game_controls_active(void)
+{
+    return g_game_ctrl;
+}
+
+bool settings_game_controls_set(bool on)
+{
+    if (on == g_game_ctrl)
+        return true;
+    if (on) {
+        if (!g_game_ctrl_path[0])
+            return false;
+        Controls cur;
+        ctrl_get(&cur, &g_settings);
+        g_shared_ctrl = cur; /* the shared controls stay as they are now */
+        g_game_ctrl = true;
+        if (!game_ctrl_save()) {
+            g_game_ctrl = false;
+            return false;
+        }
+        return true;
+    }
+    remove(g_game_ctrl_path);
+    ctrl_put(&g_settings, &g_shared_ctrl);
+    g_game_ctrl = false;
+    return true;
 }
 
 void settings_load(const char *path)
 {
     settings_defaults(&g_settings);
+    g_game_ctrl = false;
     FILE *f = fopen(path, "r");
     if (!f)
         return;
@@ -137,12 +268,10 @@ void settings_load(const char *path)
             s->aspect = clampi(atoi(v), 0, ASPECT_COUNT - 1);
         else if (!strcmp(k, "dark_mode"))
             s->dark_mode = atoi(v) != 0;
-        else if (!strcmp(k, "stick_range"))
-            s->stick_range = clampi(atoi(v), 50, 150);
-        else if (!strncmp(k, "map_", 4))
-            for (int i = 0; i < IN_COUNT; i++)
-                if (!strcmp(k + 4, k_input_names[i]))
-                    s->map[i] = key_by_name(v);
+        else if (!strcmp(k, "bottom_screen"))
+            s->bottom_screen = clampi(atoi(v), 0, BOTTOM_COUNT - 1);
+        else
+            ctrl_parse(s, k, v);
     }
     fclose(f);
 }
@@ -152,14 +281,21 @@ bool settings_save(const char *path)
     FILE *f = fopen(path, "w");
     if (!f)
         return false;
-    const Settings *s = &g_settings;
+    /* a game's own controls go to its file; settings.txt keeps the shared ones */
+    Settings shared = g_settings;
+    if (g_game_ctrl) {
+        game_ctrl_save();
+        ctrl_put(&shared, &g_shared_ctrl);
+    }
+    const Settings *s = &shared;
     fprintf(f, "volume=%d\naudio=%d\nframeskip=%d\nspeed_limit=%d\nthreaded_video=%d\nthreaded_audio=%d\n"
-            "debug_info=%d\nfb_copy=%d\nfb_emulation=%d\nstick_range=%d\nremember_blocks=%d\nfast_compile=%d\n"
-            "anti_aliasing=%d\naspect=%d\nprofiler=%d\ndark_mode=%d\n", s->volume,
+            "debug_info=%d\nfb_copy=%d\nfb_emulation=%d\nremember_blocks=%d\nfast_compile=%d\n"
+            "anti_aliasing=%d\naspect=%d\nprofiler=%d\ndark_mode=%d\nbottom_screen=%d\n", s->volume,
             s->audio, s->frameskip, s->speed_limit, s->threaded_video, s->threaded_audio, s->debug_info, s->fb_copy,
-            s->fb_emulation, s->stick_range, s->remember_blocks, s->fast_compile, s->anti_aliasing, s->aspect,
-            s->profiler, s->dark_mode);
-    for (int i = 0; i < IN_COUNT; i++)
-        fprintf(f, "map_%s=%s\n", k_input_names[i], key_name(s->map[i]));
+            s->fb_emulation, s->remember_blocks, s->fast_compile, s->anti_aliasing, s->aspect,
+            s->profiler, s->dark_mode, s->bottom_screen);
+    Controls c;
+    ctrl_get(&c, s);
+    ctrl_write(f, &c);
     return fclose(f) == 0;
 }

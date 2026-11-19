@@ -9,6 +9,7 @@
 
 #include "audio_ndsp.h"
 #include "core_host.h"
+#include "remote.h"
 #include "rom_browser.h"
 #include "settings.h"
 #include "ui/icons_img.h"
@@ -65,8 +66,39 @@ int menu_debug_row(void)
     return DEBUG_ROW + 1; /* 1-based screen row: libctru's cursor positions ignore the window */
 }
 
+/* "Bottom screen: Off" turns the bottom backlight off while the game runs (gsp::Lcd) */
+static bool g_backlight_off;
+static void bottom_backlight(bool on)
+{
+    if (on != g_backlight_off)
+        return;
+    if (R_SUCCEEDED(gspLcdInit())) {
+        if (on)
+            GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM);
+        else
+            GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM);
+        gspLcdExit();
+    }
+    g_backlight_off = !on;
+}
+
+/* the game runs with the card and speed hidden (Debug info shows its counters anyway) */
+static bool running_hidden(void) { return g_settings.bottom_screen != BOTTOM_MENU && !g_settings.debug_info; }
+
+void menu_screen_suspend(bool suspend)
+{
+    if (suspend)
+        bottom_backlight(true);
+    else if (g_running_drawn && running_hidden() && g_settings.bottom_screen == BOTTOM_OFF)
+        bottom_backlight(false);
+}
+
 static void draw_stats_card(void)
 {
+    if (running_hidden()) {
+        g_stats_dirty = false;
+        return;
+    }
     const int y = g_settings.debug_info ? RUN_CARD_Y : STATS_Y;
     ui_clip(0, y - 2, UI_W, STATS_H + 5);
     ui_background(y - 2, STATS_H + 5);
@@ -89,7 +121,10 @@ static void draw_stats_card(void)
             snprintf(skip, sizeof(skip), "  \xC2\xB7  skipped %u", s->skipped);
         ui_textf(96, y + 6, UI_SMALL, UI_TEXT, UI_LEFT, "%.1f of %.2f VI/s  \xC2\xB7  CPU %.1f ms", s->vi_per_s,
                  s->vi_target, s->cpu_ms);
-        ui_textf(96, y + 24, UI_SMALL, UI_TEXT, UI_LEFT, "%s%s", game, skip);
+        /* below its usual frame rate: the game is slowed down even at 100% VI speed */
+        const float gpct = s->game_fps_full > 0 ? 100.0f * s->game_fps / s->game_fps_full : 100.0f;
+        const UiCol gc = gpct >= 90.0f ? UI_TEXT : gpct >= 75.0f ? UI_WARN : UI_RED;
+        ui_textf(96, y + 24, UI_SMALL, gc, UI_LEFT, "%s%s", game, skip);
     }
     ui_noclip();
     ui_present();
@@ -99,6 +134,14 @@ static void draw_stats_card(void)
 static void draw_running(void)
 {
     console_window();
+    if (running_hidden()) {
+        ui_rrect(0, 0, UI_W, UI_H, 0, UI_RGB(0, 0, 0), UI_RGB(0, 0, 0));
+        ui_present();
+        g_running_drawn = true;
+        if (g_settings.bottom_screen == BOTTOM_OFF)
+            bottom_backlight(false);
+        return;
+    }
     ui_background(0, UI_H);
     ui_header(game_title(), "ctr64");
     if (!g_settings.debug_info) {
@@ -123,6 +166,7 @@ void menu_init(const char *settings_path)
 {
     snprintf(g_settings_path, sizeof(g_settings_path), "%s", settings_path);
     settings_load(settings_path);
+    settings_game_controls_load(core_host_rom_id()); /* the game's own controls, if saved */
     settings_publish();
     menu_apply_settings();
     ui_init();
@@ -147,8 +191,8 @@ void menu_draw_running(void)
 
 bool menu_running_touched(u32 down)
 {
-    if (!(down & KEY_TOUCH) || g_settings.debug_info)
-        return (down & KEY_TOUCH) && g_settings.debug_info; /* debug screen: any touch */
+    if (!(down & KEY_TOUCH) || g_settings.debug_info || running_hidden())
+        return (down & KEY_TOUCH) && (g_settings.debug_info || running_hidden()); /* any touch */
     touchPosition tp;
     hidTouchRead(&tp);
     return ui_hit(tp.px, tp.py, 8, RUN_CARD_Y, UI_W - 16, RUN_CARD_H) ||
@@ -161,7 +205,7 @@ typedef enum { PAGE_MAIN, PAGE_AUDIO, PAGE_VIDEO, PAGE_CONTROLS } Page;
 
 enum { M_RESUME, M_SAVE, M_LOAD, M_SLOT, M_AUDIO, M_VIDEO, M_CONTROLS, M_RESET, M_GAME_LIST, M_EXIT, M_COUNT };
 enum { A_VOLUME, A_SOUND, A_COUNT };
-enum { V_FRAMESKIP, V_LIMIT, V_AA, V_ASPECT, V_DARK, V_FB_EMU, V_FB_COPY, V_THREADED, V_THREADED_AUDIO, V_PRECOMPILE,
+enum { V_FRAMESKIP, V_LIMIT, V_AA, V_ASPECT, V_DARK, V_BOTTOM, V_FB_EMU, V_FB_COPY, V_THREADED, V_THREADED_AUDIO, V_PRECOMPILE,
        V_FAST_COMPILE, V_PROFILER, V_DEBUG, V_COUNT };
 #define PAD_N ((int)(sizeof(k_n64pad_hot) / sizeof(k_n64pad_hot[0])))
 #define PAD_STICK -1
@@ -177,6 +221,7 @@ static int g_scroll;          /* list pages */
 static int g_capture = -1;    /* controls: N64 input waiting for a 3DS button */
 static bool g_adjust;         /* controls: the Circle Pad range has focus */
 static u64 g_capture_until;
+static u32 g_capture_keys;    /* controls: 3DS buttons pressed so far while capturing */
 static Rect g_w[32];
 static int g_nw;
 static struct { Rect r; u32 key; } g_foot[4];
@@ -210,12 +255,12 @@ static const char *game_title(void)
 
 static const char *onoff(bool b) { return b ? "On" : "Off"; }
 
-static const char *map_name(u32 key)
+/* one or more 3DS buttons: "L+ZL" */
+static const char *map_name(u32 keys)
 {
-    for (int i = 0; i < k_map_key_count; i++)
-        if (k_map_keys[i] == key)
-            return k_map_key_names[i];
-    return "?";
+    static char n[64];
+    settings_keys_name(keys, n, sizeof(n));
+    return n;
 }
 
 /* N64 input of a controller hotspot (or PAD_STICK / PAD_DPAD) */
@@ -337,6 +382,12 @@ static void list_item(int i, const char **label, char *v, size_t vn, bool *dim)
         *label = "Dark mode";
         snprintf(v, vn, "%s", onoff(g_settings.dark_mode));
         break;
+    case V_BOTTOM: {
+        static const char *const bs[] = {"Menu", "Blank", "Off"};
+        *label = "Bottom screen in game";
+        snprintf(v, vn, "%s", bs[g_settings.bottom_screen]);
+        break;
+    }
     case V_FB_EMU:
         *label = "Frame buffer emulation";
         snprintf(v, vn, "%s%s", onoff(g_settings.fb_emulation),
@@ -581,21 +632,25 @@ static void draw_panel(void)
     draw_n64_button(g_sel, cx, STAGE_Y + 38);
     ui_text_fit(cx, ui_text_y(UI_BODY, STAGE_Y + 67), UI_BODY, UI_TEXT, UI_CENTER, PANEL_W - 8, pad_title(g_sel));
     ui_fill(PANEL_X + 12, STAGE_Y + 81, PANEL_W - 24, 1, UI_DIVIDER);
-    ui_text(cx, STAGE_Y + 86, UI_SMALL, UI_TEXT_DIM, UI_CENTER, in == PAD_STICK ? "Circle Pad range" : "3DS");
+    ui_text_fit(cx, STAGE_Y + 86, UI_SMALL, UI_TEXT_DIM, UI_CENTER, PANEL_W - 6,
+                in == PAD_STICK ? (g_settings.swap_dpad ? "3DS D-Pad" : "Circle Pad range") : "3DS");
     const UiCol ac = UI_SEL;
     const int hint_y = STAGE_Y + STAGE_H - 30;
     if (g_capture >= 0) {
         chip(cx, CHIP_Y, PANEL_W - 20, "?", true, false);
-        ui_text(cx, hint_y, UI_SMALL, UI_SEL, UI_CENTER, "Press a");
-        ui_text(cx, hint_y + 12, UI_SMALL, UI_SEL, UI_CENTER, "3DS button");
+        ui_text_fit(cx, hint_y, UI_SMALL, UI_SEL, UI_CENTER, PANEL_W - 6, "Press a button");
+        ui_text_fit(cx, hint_y + 12, UI_SMALL, UI_SEL, UI_CENTER, PANEL_W - 6, "(hold 2 = both)");
     } else if (in == PAD_DPAD) {
-        chip(cx, CHIP_Y, PANEL_W - 20, "D-Pad", false, false);
+        /* swap_dpad: the Circle Pad is the N64 D-pad and the 3DS D-pad the stick (racing games) */
+        const bool sw = g_settings.swap_dpad;
+        chip(cx, CHIP_Y, PANEL_W - 20, sw ? "Circle Pad" : "D-Pad", false, false);
         u32 used = 0;
         for (int i = 0; i < IN_COUNT; i++)
             used |= g_settings.map[i];
-        const bool shared = (used & (KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT)) != 0;
-        ui_text(cx, hint_y, UI_SMALL, UI_TEXT_DIM, UI_CENTER, shared ? "3DS D-Pad, but" : "Always the");
-        ui_text(cx, hint_y + 12, UI_SMALL, UI_TEXT_DIM, UI_CENTER, shared ? "not where mapped" : "3DS D-Pad");
+        const bool shared = !sw && (used & (KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT)) != 0;
+        ui_text(cx, hint_y, UI_SMALL, UI_TEXT_DIM, UI_CENTER,
+                sw ? "D-Pad = stick" : shared ? "Not where mapped" : "A: swap with");
+        ui_text(cx, hint_y + 12, UI_SMALL, UI_TEXT_DIM, UI_CENTER, sw ? "A: swap back" : shared ? "A: swap" : "Circle Pad");
     } else if (in == PAD_STICK) {
         char v[16];
         snprintf(v, sizeof(v), "%d%%", g_settings.stick_range);
@@ -660,13 +715,15 @@ static void draw_footer(void)
         FOOT(UI_GLYPH_A, "Done", KEY_A);
     } else if (g_page == PAGE_CONTROLS) {
         const int in = pad_input(g_sel);
-        if (in != PAD_DPAD)
-            FOOT(UI_GLYPH_A, in == PAD_STICK ? "Change" : "Set", KEY_A);
+        FOOT(UI_GLYPH_A, in == PAD_DPAD ? "Swap" : in == PAD_STICK ? "Change" : "Set", KEY_A);
         FOOT(UI_GLYPH_B, "Back", KEY_B);
         if (!g_status[0]) {
             if (in >= 0)
                 FOOT(UI_GLYPH_X, "Clear", KEY_X);
-            FOOT(UI_GLYPH_Y, "Defaults", KEY_Y);
+            FOOT(UI_GLYPH_Y, "Reset", KEY_Y);
+            /* per-game controls: START saves these for the running game / goes back to the shared */
+            if (!g_no_game)
+                FOOT(NULL, settings_game_controls_active() ? "START All" : "START Game", KEY_START);
         }
     } else {
         FOOT(UI_GLYPH_B, "Back", KEY_B);
@@ -760,7 +817,8 @@ static void draw_page(void)
         else
             ui_header(game_title(), "Paused");
     } else {
-        ui_header(titles[g_page], g_no_game ? "Settings" : game_title());
+        const bool own = g_page == PAGE_CONTROLS && !g_no_game && settings_game_controls_active();
+        ui_header(own ? "Controls (this game)" : titles[g_page], g_no_game ? "Settings" : game_title());
         if (g_page == PAGE_CONTROLS)
             draw_pad();
         else
@@ -840,6 +898,8 @@ static bool change(int i, int dir)
             s->dark_mode = !s->dark_mode;
             ui_set_dark(s->dark_mode);
             g_repaint = true; /* every colour changes */
+        } else if (i == V_BOTTOM) {
+            s->bottom_screen = (s->bottom_screen + (dir ? dir : 1) + BOTTOM_COUNT) % BOTTOM_COUNT;
         } else if (i == V_FB_EMU) {
             s->fb_emulation = !s->fb_emulation;
             settings_publish();
@@ -1052,16 +1112,21 @@ MenuResult menu_run(void)
     UiTouch touch = {0};
 
     audio_ndsp_pause(true);
+    bottom_backlight(true);
     core_host_block_input(true);
     hidSetRepeatParameters(18, 5);
     console_window();
     consoleSetWindow(ui_console(), 0, 29, 40, 1);
     go_page(PAGE_MAIN, g_no_game ? M_VIDEO : M_RESUME);
 
+    if (!g_no_game)
+        remote_pause_begin(); /* remote runs only (remote.c) */
     bool alive;
     while ((alive = aptMainLoop())) {
         ctr64_heartbeat++;
         gspWaitForVBlank();
+        if (!g_no_game)
+            remote_pause_poll();
         u32 down, held, up;
         ui_scan(&down, &held, &up);
         u32 rep = hidKeysDownRepeat() | (down & (KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT));
@@ -1069,12 +1134,12 @@ MenuResult menu_run(void)
 
         /* controls: waiting for the 3DS button of an N64 input */
         if (g_capture >= 0) {
+            /* every button pressed until all are released again: holding two (L and ZL) maps both */
             const u64 now = svcGetSystemTick();
-            u32 got = 0;
             for (int i = 1; i < k_map_key_count; i++)
-                if (down & k_map_keys[i])
-                    got = k_map_keys[i];
-            if (got || touch.tap || (down & KEY_SELECT) || now > g_capture_until) {
+                g_capture_keys |= down & k_map_keys[i];
+            const u32 got = g_capture_keys;
+            if ((got && !(held & got)) || touch.tap || (down & KEY_SELECT) || now > g_capture_until) {
                 if (got) {
                     g_settings.map[g_capture] = got;
                     snprintf(g_status, sizeof(g_status), "N64 %s = %s", k_n64pad_hot[g_sel].name, map_name(got));
@@ -1203,11 +1268,22 @@ MenuResult menu_run(void)
                 after_change();
             }
         }
+        if (g_page == PAGE_CONTROLS && (down & KEY_START) && !g_no_game && g_capture < 0 && !g_adjust) {
+            const bool on = !settings_game_controls_active();
+            if (settings_game_controls_set(on))
+                snprintf(g_status, sizeof(g_status), on ? "Controls saved for this game" : "This game uses the shared controls");
+            else
+                snprintf(g_status, sizeof(g_status), "Could not save the controls");
+            draw_page();
+            ui_present();
+            continue;
+        }
         if (g_page == PAGE_CONTROLS && (down & KEY_Y)) {
             Settings d;
             settings_defaults(&d);
             memcpy(g_settings.map, d.map, sizeof(d.map));
             g_settings.stick_range = d.stick_range;
+            g_settings.swap_dpad = d.swap_dpad;
             snprintf(g_status, sizeof(g_status), "Controls reset to defaults");
             draw_pad();
             draw_footer();
@@ -1227,8 +1303,15 @@ MenuResult menu_run(void)
             const int in = pad_input(g_sel);
             if (in >= 0) {
                 g_capture = in;
+                g_capture_keys = 0;
                 g_capture_until = svcGetSystemTick() + 5ULL * SYSCLOCK_ARM11;
                 g_status[0] = 0;
+                draw_pad();
+                draw_footer();
+                ui_present();
+            } else if (in == PAD_DPAD) {
+                g_settings.swap_dpad = !g_settings.swap_dpad;
+                snprintf(g_status, sizeof(g_status), g_settings.swap_dpad ? "D-Pad is the stick now" : "Circle Pad is the stick again");
                 draw_pad();
                 draw_footer();
                 ui_present();
@@ -1308,6 +1391,7 @@ MenuResult menu_run(void)
         }
     }
 done:
+    remote_pause_end();
     if (memcmp(&before, &g_settings, sizeof(before)) != 0)
         settings_save(g_settings_path);
     g_status[0] = 0;

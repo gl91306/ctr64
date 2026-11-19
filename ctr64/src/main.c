@@ -28,6 +28,7 @@
 #include "pica/pica.h"
 #include "prof.h"
 #include "rom_browser.h"
+#include "remote.h"
 #include "video.h"
 
 /* JIT profiling counters (platform/ctr_jit.c) */
@@ -107,6 +108,13 @@ void __wrap___system_allocateHeaps(void)
     if (remaining >= __ctru_linear_heap_size + XRES_BYTES + XRES_MIN_HEAP) {
         __ctru_heap_size = remaining - __ctru_linear_heap_size - XRES_BYTES;
         g_xres = true;
+        /* New 3DS 178 MB mode: the main heap's address window holds only 96 MB (the kernel refuses
+         * more: svcBreak in libctru at start; Azahar allows it). The rest becomes linear heap. */
+        const u32 heap_max = OS_HEAP_AREA_END - OS_HEAP_AREA_BEGIN;
+        if (__ctru_heap_size > heap_max) {
+            __ctru_linear_heap_size += __ctru_heap_size - heap_max;
+            __ctru_heap_size = heap_max;
+        }
     }
     __real___system_allocateHeaps();
 }
@@ -376,6 +384,8 @@ static void wait_for_start(void)
 }
 
 const char *volatile ctr64_crumb = "start";
+const char *volatile ctr64_gcrumb = "start";
+void *volatile ctr64_gret[2];
 volatile u32 ctr64_heartbeat; /* also advanced by the menu (menu.c) */
 static volatile bool g_watchdog_quit;
 static FILE *g_stats; /* <data dir>/stats.log: one line per second, for unattended test runs */
@@ -393,7 +403,15 @@ static void watchdog(void *arg)
                 if (g_settings.debug_info)
                     printf("\x1b[26;0Hstall %lus at: %s          \n", stuck, ctr64_crumb ? ctr64_crumb : "?");
                 if (g_stats) {
-                    fprintf(g_stats, "stall %lus at: %s\n", stuck, ctr64_crumb ? ctr64_crumb : "?");
+                    fprintf(g_stats, "stall %lus at: %s | video: %s | called from %p %p\n", stuck,
+                            ctr64_crumb ? ctr64_crumb : "?", ctr64_gcrumb ? ctr64_gcrumb : "?", ctr64_gret[0],
+                            ctr64_gret[1]);
+                    if (stuck == 10) { /* DEV hang diagnosis: once per real hang (loads stall ~3 s) */
+                        mkdir(DATA_DIR "/hang", 0777);
+                        pica_debug_dump(g_stats, DATA_DIR "/hang", false);
+                    }
+                    if (stuck == 12)
+                        pica_debug_dump(g_stats, DATA_DIR "/hang", true);
                     extern void ctr64_audio_debug(FILE *f); /* audio_async.c */
                     ctr64_audio_debug(g_stats);
                     fflush(g_stats);
@@ -414,7 +432,30 @@ static void watchdog(void *arg)
  * VIs behind restarts the schedule instead of catching up. <data dir>/nolimit.txt turns it off
  * (profiling headroom). */
 static bool g_nolimit, g_halfspeed;
-#define AUDIO_TARGET_MS 60
+/* The audio queue target: 100 ms, raised by 20 ms (up to 160) each time the queue ran dry - a
+ * stall longer than the queue (new code compiled at a room change, a ROM read) is a gap in the
+ * sound - and lowered by 5 ms after each 10 s without one. stats.log "audio underruns". */
+#define AUDIO_TARGET_MS 100
+#define AUDIO_TARGET_MAX_MS 160
+static unsigned g_audio_target = AUDIO_TARGET_MS;
+unsigned ctr64_audio_underruns, ctr64_audio_target_ms = AUDIO_TARGET_MS;
+
+static void audio_target_update(unsigned queued_ms)
+{
+    static bool was_dry = true; /* the start of a game: nothing queued yet */
+    static unsigned calm;
+    const bool dry = queued_ms < 5;
+    if (dry && !was_dry) {
+        ctr64_audio_underruns++;
+        g_audio_target = g_audio_target + 20 > AUDIO_TARGET_MAX_MS ? AUDIO_TARGET_MAX_MS : g_audio_target + 20;
+        calm = 0;
+    } else if (!dry && ++calm >= 600 && g_audio_target > AUDIO_TARGET_MS) {
+        g_audio_target -= 5;
+        calm = 0;
+    }
+    was_dry = dry;
+    ctr64_audio_target_ms = g_audio_target;
+}
 
 static void limit_speed(void)
 {
@@ -424,7 +465,9 @@ static void limit_speed(void)
     const double fps = (core_host_fps() > 55 ? 59.826 : 50.0) / (g_halfspeed ? 2 : 1);
     double trim = 1.0;
     if (audio_ndsp_active() && audio_ndsp_rate()) {
-        trim += ((double)audio_ndsp_queued_ms() - AUDIO_TARGET_MS) * (0.01 / 64);
+        const unsigned q = audio_ndsp_queued_ms();
+        audio_target_update(q);
+        trim += ((double)q - g_audio_target) * (0.01 / 64);
         trim = trim < 0.99 ? 0.99 : trim > 1.01 ? 1.01 : trim;
     }
     const u64 period = (u64)(SYSCLOCK_ARM11 / fps * trim);
@@ -686,11 +729,43 @@ static void run_game(void)
             float wall = (float)(now - t_last) * 1000.0f / SYSCLOCK_ARM11;
             const PicaStats *s = pica_stats();
             const float vi_target = core_host_fps() > 55 ? 59.83f : 50.0f;
+            /* the game's own frame rate at full speed now, and its usual one: the best of the
+             * last 10 s, snapped to a whole VI count per frame (60, 30, 20, 15...). A game that
+             * drops from 20 to 15 frames/s because we draw too slowly (JFG on HW: GPU 53 ms a
+             * frame) keeps 100% VI speed; "Game 15 of 15" hid that, "15 of 20" shows it. */
+            const float full_now = (ctr64_gfx_stats[3] + ctr64_frames_skipped) * vi_target / 60.0f;
+            static float best_hist[10];
+            static unsigned best_at;
+            /* Only while we are the limit (GPU busy most of the time, the video thread or the CPU
+             * near full, or below full VI speed) can the game have dropped its rate because of
+             * us; otherwise the rate is the game's own choice (a scene at a steady 30 after one at
+             * 60 is not "30 of 60") and becomes the usual one at once. */
+            {
+                extern unsigned ctr64_gfx_worker_ticks[3];
+                const float vi_ms = 1000.0f / vi_target;
+                const float idle_ms = (float)ctr64_gfx_worker_ticks[0] * 1000.0f / SYSCLOCK_ARM11 / 60;
+                const bool busy_worker = g_stats && g_settings.threaded_video && idle_ms < 0.15f * vi_ms;
+                const bool limited = s->cpu_ms * full_now > 700.0f || emu_ms / 60 > 0.9f * vi_ms ||
+                                     60.0f * 1000.0f / wall < 0.97f * vi_target || busy_worker;
+                if (!limited)
+                    for (int i = 0; i < 10; i++)
+                        best_hist[i] = 0;
+            }
+            best_hist[best_at++ % 10] = full_now;
+            float usual = 0;
+            for (int i = 0; i < 10; i++)
+                if (best_hist[i] > usual)
+                    usual = best_hist[i];
+            if (usual > 0) {
+                const float per = vi_target / usual; /* VIs per frame */
+                const float whole = per < 1.0f ? 1.0f : (float)(int)(per + 0.5f);
+                usual = vi_target / whole;
+            }
             MenuStats ms = {
                 .vi_per_s = 60.0f * 1000.0f / wall,
                 .vi_target = vi_target,
                 .game_fps = ctr64_gfx_stats[3] * 1000.0f / wall,
-                .game_fps_full = (ctr64_gfx_stats[3] + ctr64_frames_skipped) * vi_target / 60.0f,
+                .game_fps_full = usual,
                 .skipped = ctr64_frames_skipped,
                 .cpu_ms = emu_ms / 60,
             };
@@ -704,6 +779,15 @@ static void run_game(void)
                 fprintf(g_stats, "  texture hashes over 256 bytes: %u, %u KB\n", ctr64_crc_long[0],
                         ctr64_crc_long[1]);
                 ctr64_crc_long[0] = ctr64_crc_long[1] = 0;
+                extern unsigned ctr64_dl_runaway; /* GLideN64 RSP.cpp */
+                if (ctr64_dl_runaway)
+                    fprintf(g_stats, "  display lists stopped as endless: %u\n", ctr64_dl_runaway);
+                extern unsigned ctr64_fpscr_seen[4];
+                fprintf(g_stats, "  fpscr at thread start: cpu %08x video %08x audio %08x compile %08x\n",
+                        ctr64_fpscr_seen[0], ctr64_fpscr_seen[1], ctr64_fpscr_seen[2], ctr64_fpscr_seen[3]);
+                extern unsigned ctr64_gd_stat[4];
+                fprintf(g_stats, "  get_dirty cache: %u hits, %u slot taken, %u key, %u list changed\n", ctr64_gd_stat[0], ctr64_gd_stat[1], ctr64_gd_stat[2], ctr64_gd_stat[3]);
+                ctr64_gd_stat[0] = ctr64_gd_stat[1] = ctr64_gd_stat[2] = ctr64_gd_stat[3] = 0;
             }
             ctr64_frames_drawskip = 0;
             ctr64_frames_skipped = 0;
@@ -766,24 +850,69 @@ static void run_game(void)
                     fprintf(g_stats, "  game frames %.1f/s, draws into FCRAM targets: color %u depth %u\n",
                             (ctr64_vi_frames - frames_seen) * 1000.0f / wall, ctr64_gfx_fcram[0], ctr64_gfx_fcram[1]);
                     ctr64_gfx_fcram[0] = ctr64_gfx_fcram[1] = 0;
-                    extern unsigned int ctr64_gfx_vram_moves[2];
+                    {
+                        extern unsigned int ctr64_sp_tasks[3];
+                        static unsigned int last_tasks[3];
+                        extern unsigned int ctr64_sp_resumes; /* rsp_core.c */
+                        extern unsigned int ctr64_gfx_dp_forced; /* gfx_async.c */ extern unsigned int ctr64_gfx_stream_parts;
+                        fprintf(g_stats, "  rsp tasks: gfx %u audio %u other %u (display lists resumed %u; "
+                                "lists without a full sync %u; streamed parts %u)\n",
+                                ctr64_sp_tasks[0] - last_tasks[0], ctr64_sp_tasks[1] - last_tasks[1],
+                                ctr64_sp_tasks[2] - last_tasks[2], ctr64_sp_resumes, ctr64_gfx_dp_forced, ctr64_gfx_stream_parts);
+                        if (ctr64_sp_tasks[0] == last_tasks[0] && ctr64_sp_tasks[1] == last_tasks[1]) {
+                            /* no task at all for a while: what the game may be waiting for */
+                            extern void ctr64_rsp_debug(FILE *f), ctr64_audio_debug(FILE *f);
+                            ctr64_rsp_debug(g_stats);
+                            ctr64_audio_debug(g_stats);
+                        }
+                        ctr64_sp_resumes = ctr64_gfx_dp_forced = ctr64_gfx_stream_parts = 0;
+                        memcpy(last_tasks, ctr64_sp_tasks, sizeof(last_tasks));
+                    }
+                    extern unsigned int ctr64_gfx_vram_moves[2], ctr64_gfx_fb_reads[2];
                     if (ctr64_gfx_vram_moves[0] || ctr64_gfx_vram_moves[1])
                         fprintf(g_stats, "  render targets moved: %u KB into VRAM, %u KB out\n", ctr64_gfx_vram_moves[0],
                                 ctr64_gfx_vram_moves[1]);
                     ctr64_gfx_vram_moves[0] = ctr64_gfx_vram_moves[1] = 0;
+                    if (ctr64_gfx_fb_reads[0] || ctr64_gfx_fb_reads[1])
+                        fprintf(g_stats, "  frame buffer reads: %u from VRAM, %u from FCRAM\n", ctr64_gfx_fb_reads[0],
+                                ctr64_gfx_fb_reads[1]);
+                    ctr64_gfx_fb_reads[0] = ctr64_gfx_fb_reads[1] = 0;
                     extern char ctr64_rt_mode[64];
                     if (ctr64_rt_mode[0])
                         fprintf(g_stats, "  frame buffer storage: %s\n", ctr64_rt_mode);
-                    extern unsigned int ctr64_gfx_shadow[3];
+                    extern unsigned int ctr64_gfx_shadow[6];
                     if (ctr64_gfx_shadow[0] || ctr64_gfx_shadow[2])
-                        fprintf(g_stats, "  shadow copies for sampling: %u (%u KB), copies by transfer: %u\n",
-                                ctr64_gfx_shadow[0], ctr64_gfx_shadow[1], ctr64_gfx_shadow[2]);
-                    ctr64_gfx_shadow[0] = ctr64_gfx_shadow[1] = ctr64_gfx_shadow[2] = 0;
+                        fprintf(g_stats, "  shadow copies for sampling: %u (%u KB in %u GPU copies + %u draws), copies by transfer: %u\n",
+                                ctr64_gfx_shadow[0], ctr64_gfx_shadow[1], ctr64_gfx_shadow[3], ctr64_gfx_shadow[4],
+                                ctr64_gfx_shadow[2]);
+                    ctr64_gfx_shadow[0] = ctr64_gfx_shadow[1] = ctr64_gfx_shadow[2] = ctr64_gfx_shadow[3] = 0;
+                    ctr64_gfx_shadow[4] = 0;
                     extern unsigned int ctr64_gfx_reused;
                     if (ctr64_gfx_reused)
                         fprintf(g_stats, "  render target storage reused: %u\n", ctr64_gfx_reused);
                     ctr64_gfx_reused = 0;
+                    if (ctr64_audio_underruns || ctr64_audio_target_ms != AUDIO_TARGET_MS)
+                        fprintf(g_stats, "  audio underruns: %u, queue target %u ms\n", ctr64_audio_underruns,
+                                ctr64_audio_target_ms);
+                    ctr64_audio_underruns = 0;
                     frames_seen = ctr64_vi_frames;
+                }
+                { /* DEV ONLY - remove: commands that ended triangle batches (count, same words as before) */
+                    extern unsigned ctr64_flushcmd[256], ctr64_flushsame[256];
+                    fprintf(g_stats, "  batch ends:");
+                    for (int k = 0; k < 8; k++) {
+                        int best = -1;
+                        for (int c = 0; c < 256; c++)
+                            if (ctr64_flushcmd[c] && (best < 0 || ctr64_flushcmd[c] > ctr64_flushcmd[best]))
+                                best = c;
+                        if (best < 0)
+                            break;
+                        fprintf(g_stats, " %02X:%u/%u", best, ctr64_flushcmd[best], ctr64_flushsame[best]);
+                        ctr64_flushcmd[best] = 0;
+                    }
+                    fprintf(g_stats, "\n");
+                    memset(ctr64_flushcmd, 0, sizeof(ctr64_flushcmd));
+                    memset(ctr64_flushsame, 0, sizeof(ctr64_flushsame));
                 }
                 {
                     /* GLideN64 scopes (Ctr64Prof.h ids), ms per frame and calls per frame */
@@ -857,6 +986,15 @@ static void run_game(void)
                         fprintf(g_stats, "\n  overwritten code: %u blocks reused, %u changed, %u expiring, %u never compiled",
                                 ctr64_dirty_stat[0], ctr64_dirty_stat[1], ctr64_dirty_stat[2], ctr64_dirty_stat[3]);
                         memset(ctr64_dirty_stat, 0, sizeof(ctr64_dirty_stat));
+                        extern unsigned ctr64_quick_restores;
+                        fprintf(g_stats, " (%u back to clean at once)", ctr64_quick_restores);
+                        ctr64_quick_restores = 0;
+                        extern unsigned ctr64_hot_stat[2]; /* new_dynarec.c ctr64_page_hot */
+                        fprintf(g_stats, "; writable code pages: %u new, %u entries", ctr64_hot_stat[0], ctr64_hot_stat[1]);
+                        ctr64_hot_stat[0] = ctr64_hot_stat[1] = 0;
+                        extern unsigned ctr64_soft_evicts[2]; /* new_dynarec.c ctr64_tlb_soft_evict */
+                        fprintf(g_stats, "; TLB evictions kept %u, old path %u", ctr64_soft_evicts[0], ctr64_soft_evicts[1]);
+                        ctr64_soft_evicts[0] = ctr64_soft_evicts[1] = 0;
                         extern unsigned int ctr64_dyn_cnt[8], ctr64_icache_absorbs; /* new_dynarec.c, ctr_jit.c */
                         fprintf(g_stats, "\n  dynarec events: get_addr %u, feeds %u, invalidations %u (%u pages, %u whole), blocks invalidated %u, I-cache absorbs %u, flushes %u",
                                 ctr64_dyn_cnt[0], ctr64_dyn_cnt[1], ctr64_dyn_cnt[2], ctr64_dyn_cnt[3], ctr64_dyn_cnt[4],
@@ -898,6 +1036,11 @@ static void run_game(void)
                         if (pica_queue_drains)
                             fprintf(g_stats, " (full GX queue drains %u)", pica_queue_drains);
                         pica_queue_drains = 0;
+                    }
+                    { /* DEV ONLY: gputime.txt */
+                        extern void pica_gputime_report(FILE *f);
+                        fputc('\n', g_stats);
+                        pica_gputime_report(g_stats);
                     }
                     {
                         extern bool ctr64_gfx_dlist_async;
@@ -954,13 +1097,18 @@ static void run_game(void)
 /* VFP RunFast mode: flush denormals to zero and use default NaNs. Without it the ARM11 VFP
  * traps to slow support code on denormal operands, which float-heavy emulation hits constantly.
  * FPSCR is per thread; the core's coroutine runs on this thread. */
-static void vfp_enable_runfast(void)
+unsigned ctr64_fpscr_seen[4]; /* FPSCR found at thread start: 0 CPU, 1 video, 2 audio, 3 compile */
+void ctr64_vfp_runfast(int who)
 {
     u32 fpscr;
     __asm__ volatile("vmrs %0, fpscr" : "=r"(fpscr));
+    if (who >= 0 && who < 4)
+        ctr64_fpscr_seen[who] = fpscr | 1; /* bit 0 (a sticky flag) marks "seen" */
     fpscr |= (1u << 24) | (1u << 25); /* FZ | DN */
+    fpscr &= ~0x9F00u;                 /* no exception traps (RunFast needs them all off) */
     __asm__ volatile("vmsr fpscr, %0" : : "r"(fpscr));
 }
+#define vfp_enable_runfast() ctr64_vfp_runfast(0)
 
 /* HOME menu, sleep: the system takes the GPU from the app, so the video worker must be idle */
 static void apt_hook(APT_HookType hook, void *param)
@@ -969,6 +1117,11 @@ static void apt_hook(APT_HookType hook, void *param)
     extern void ctr64_gfx_drain(void);
     if (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONSLEEP || hook == APTHOOK_ONEXIT)
         ctr64_gfx_drain();
+    /* "Bottom screen: Off": the backlight on while away from the game */
+    if (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONSLEEP || hook == APTHOOK_ONEXIT)
+        menu_screen_suspend(true);
+    else if (hook == APTHOOK_ONRESTORE || hook == APTHOOK_ONWAKEUP)
+        menu_screen_suspend(false);
     /* new precompile-list blocks (no periodic saves during play). Not on sleep: that hook runs
      * on libctru's APT thread while the emulation and compile threads keep using the list. */
     if (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONEXIT) {
@@ -985,6 +1138,7 @@ static void crash_extra(FILE *f)
             ctr64_heartbeat != 0);
 }
 
+/* DEV ONLY - remove: the app's thread count (resource limit) appended to threads.txt */
 int main(void)
 {
     char rom[300];
@@ -1033,7 +1187,16 @@ int main(void)
     }
     settings_load(SETTINGS_PATH); /* the theme for the game list (loaded again for the game) */
     ui_set_dark(g_settings.dark_mode);
-    if (choice != ROM_BROWSER_PICKED)
+    /* development: remote test mode (remote.txt): the PC sends files and starts tests */
+    bool remote_restart = false;
+    if (choice != ROM_BROWSER_PICKED && !gpu_test && remote_wanted(DATA_DIR)) {
+        const RemoteAction ra = remote_serve(DATA_DIR, rom, sizeof(rom));
+        if (ra == REMOTE_RUN)
+            choice = ROM_BROWSER_PICKED;
+        else if (ra == REMOTE_RELAUNCH)
+            remote_restart = true;
+    }
+    if (choice != ROM_BROWSER_PICKED && !remote_restart)
         choice = gpu_test ? ROM_BROWSER_GPU_TEST : rom_browser_pick(ROM_DIR, rom, sizeof(rom));
 
     if (choice == ROM_BROWSER_GPU_TEST) {
@@ -1058,6 +1221,22 @@ int main(void)
             static aptHookCookie apt_cookie;
             aptHook(&apt_cookie, apt_hook, NULL);
             Thread wd = threadCreate(watchdog, NULL, 4096, prio - 4, -2, false);
+            {   /* core.log: the app's thread budget (on hardware thread creation has failed after
+                 * many launches - C860180C - until a power cycle) */
+                extern void ctr64_log_line(const char *line);
+                Handle rl = 0;
+                ResourceLimitType types[2] = {RESLIMIT_THREAD, RESLIMIT_COMMIT};
+                s64 cur[2] = {0, 0}, lim[2] = {0, 0};
+                char line[128];
+                if (R_SUCCEEDED(svcGetResourceLimit(&rl, CUR_PROCESS_HANDLE))) {
+                    svcGetResourceLimitCurrentValues(cur, rl, types, 2);
+                    svcGetResourceLimitLimitValues(lim, rl, types, 2);
+                    svcCloseHandle(rl);
+                }
+                snprintf(line, sizeof(line), "resource limit: threads %lld of %lld, memory %lld of %lld KB",
+                         (long long)cur[0], (long long)lim[0], (long long)(cur[1] / 1024), (long long)(lim[1] / 1024));
+                ctr64_log_line(line);
+            }
             run_game();
             g_watchdog_quit = true;
             if (wd) {
@@ -1079,7 +1258,9 @@ int main(void)
                     fclose(dn);
             }
         } else {
-            if (rom_browser_error(rom))
+            if (remote_active()) /* no one to press a button: back to remote mode */
+                g_quit = MENU_GAME_LIST;
+            else if (rom_browser_error(rom))
                 g_quit = MENU_GAME_LIST;
         }
         core_host_shutdown();
@@ -1095,6 +1276,8 @@ int main(void)
             fclose(rf);
         }
     }
+    if (remote_active()) /* a remote test ended (or a restart was asked for): back to remote mode */
+        g_quit = MENU_GAME_LIST;
     if ((g_quit == MENU_GAME_LIST || g_quit == MENU_RESTART) && !envIsHomebrew())
         aptSetChainloaderToSelf();
     pica_wait_idle();

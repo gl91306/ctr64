@@ -107,6 +107,8 @@ static void wait_fence(u64 fence)
         return;
     const char *prev = ctr64_crumb;
     CRUMB("pica: wait_fence");
+    const char *gprev = ctr64_gcrumb;
+    ctr64_gcrumb = "pica: wait_fence";
     u64 t0 = svcGetSystemTick();
     int n = 0;
     while (queue_completed() < fence) {
@@ -122,6 +124,7 @@ static void wait_fence(u64 fence)
     P.stats.fence_ms += ticks_to_ms(svcGetSystemTick() - t0);
     note_wait(prev ? prev : "?", ticks_to_ms(svcGetSystemTick() - t0));
     ctr64_crumb = prev;
+    ctr64_gcrumb = gprev;
 }
 
 /* Drops completed entries so the fixed-size queue never overflows. Only legal when idle. */
@@ -168,16 +171,74 @@ unsigned pica_prof_presents(void)
     return P.stats.frames;
 }
 
-static void queue_reserve(int entries)
+/* DEV ONLY (gputime.txt): every GX job runs alone - the GPU is idle before it is queued and
+ * waited for before the next one - and its time is added up per submitting function + crumb
+ * (stats: "gputime"). Serialises CPU and GPU: only for finding what the GPU spends time on. */
+bool pica_gputime;
+static struct {
+    const char *fn, *crumb;
+    u32 count;
+    u64 ticks;
+} g_gt[24];
+static const char *g_gt_fn, *g_gt_crumb;
+static u64 g_gt_t0;
+static void gt_settle(void)
 {
+    /* done = when the queue went empty (queue_done_cb), not now: the CPU may have worked since */
+    const u64 spin0 = svcGetSystemTick();
+    while ((queue_completed() < queue_enqueued() || !g_gpu_idle) && svcGetSystemTick() - spin0 < SYSCLOCK_ARM11 / 5)
+        ;
+    if (!g_gt_fn)
+        return;
+    const u64 t = g_gpu_idle ? g_idle_since - g_gt_t0 : svcGetSystemTick() - g_gt_t0;
+    for (int i = 0; i < 24; i++)
+        if (!g_gt[i].fn || (g_gt[i].fn == g_gt_fn && g_gt[i].crumb == g_gt_crumb)) {
+            g_gt[i].fn = g_gt_fn;
+            g_gt[i].crumb = g_gt_crumb;
+            g_gt[i].count++;
+            g_gt[i].ticks += t;
+            break;
+        }
+    g_gt_fn = NULL;
+}
+void pica_gputime_report(FILE *f)
+{
+    if (!pica_gputime)
+        return;
+    fprintf(f, "  gputime (ms/s):");
+    for (int i = 0; i < 24 && g_gt[i].fn; i++)
+        fprintf(f, " %s[%s] %lu/%.2f", g_gt[i].fn, g_gt[i].crumb ? g_gt[i].crumb : "-",
+                (unsigned long)g_gt[i].count, ticks_to_ms(g_gt[i].ticks));
+    fprintf(f, "\n");
+    memset(g_gt, 0, sizeof(g_gt));
+}
+
+static bool g_fill_vram;
+static const char *g_fill_who; /* DEV ONLY gputime: the fill's caller */
+static void queue_reserve_tag(int entries, const char *fn);
+#define queue_reserve(n) queue_reserve_tag((n), __func__)
+static void queue_reserve_tag(int entries, const char *fn)
+{
+    if (pica_gputime) {
+        gt_settle();
+        g_gt_fn = fn;
+        g_gt_crumb = ctr64_crumb;
+        if (!strcmp(fn, "fill_any_impl") && g_fill_who) { /* fills: caller, and V(RAM)/F(CRAM) target */
+            g_gt_fn = g_fill_who;
+            g_gt_crumb = g_fill_vram ? "fill V" : "fill F";
+        }
+    }
     gpu_busy_again();
     if (P.queue.numEntries > QUEUE_MAX / 4 && queue_completed() == queue_enqueued())
         queue_recycle(); /* idle: free */
-    if (P.queue.numEntries + entries <= P.queue.maxEntries)
+    if (P.queue.numEntries + entries <= P.queue.maxEntries) {
+        g_gt_t0 = svcGetSystemTick();
         return;
+    }
     pica_queue_drains++;
     wait_fence(queue_enqueued());
     queue_recycle();
+    g_gt_t0 = svcGetSystemTick();
 }
 
 void pica_cache_flush(const void *p, u32 size)
@@ -198,6 +259,14 @@ void pica_cache_invalidate(const void *p, u32 size)
     GSPGPU_InvalidateDataCache(p, size);
 }
 
+/* DEV hang diagnosis: the last command lists handed to the GPU */
+static struct {
+    u32 addr, words;
+    u64 pos; /* queue position of the list */
+    u32 vi;
+} g_subs[16];
+static u32 g_sub_seq;
+
 /* Closes the command list recorded so far and queues it for execution. */
 static void submit_commands(void)
 {
@@ -215,8 +284,89 @@ static void submit_commands(void)
         s->pool_flushed = s->pool_used;
     }
     queue_reserve(1);
+    {
+        extern unsigned ctr64_vi_count;
+        u32 k = g_sub_seq++ & 15;
+        g_subs[k].addr = osConvertVirtToPhys(list);
+        g_subs[k].words = words;
+        g_subs[k].pos = queue_enqueued();
+        g_subs[k].vi = ctr64_vi_count;
+    }
     GX_ProcessCommandList(list, words * 4, GX_CMDLIST_FLUSH);
     P.cmd_bytes += words * 4;
+}
+
+static void dump_file(const char *dir, const char *name, const void *p, u32 bytes)
+{
+    char path[160];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(p, 1, bytes, f);
+        fclose(f);
+    }
+}
+
+void pica_debug_dump(FILE *f, const char *dir, bool regs_only)
+{
+    if (regs_only)
+        goto regs;
+    extern void pica_state_debug(FILE *f);
+    fprintf(f, "GPU queue: completed %llu enqueued %llu (base %llu num %u cur %u last %u max %u)\n",
+            queue_completed(), queue_enqueued(), P.base, P.queue.numEntries, P.queue.curEntry,
+            P.queue.lastEntry, P.queue.maxEntries);
+    for (u32 i = P.queue.lastEntry; i < P.queue.numEntries && i < P.queue.lastEntry + 4u; i++) {
+        const gxCmdEntry_s *e = &P.queue.entries[i];
+        fprintf(f, "  pending entry %lu: type %u args %08lx %08lx %08lx %08lx %08lx %08lx\n", (unsigned long)i,
+                e->type, e->args[0], e->args[1], e->args[2], e->args[3], e->args[4], e->args[5]);
+    }
+    fprintf(f, "slots (cmd phys, pool phys, pool used): cur %d frame %lu\n", P.cur, (unsigned long)P.frame_no);
+    for (int i = 0; i < SLOT_COUNT; i++)
+        fprintf(f, "  %d: %08lx %08lx %lu\n", i, osConvertVirtToPhys(P.slots[i].cmd),
+                osConvertVirtToPhys(P.slots[i].pool), (unsigned long)P.slots[i].pool_used);
+    fprintf(f, "submits (phys words pos vi):\n");
+    for (u32 i = 0; i < 16; i++) {
+        u32 k = (g_sub_seq + i) & 15;
+        if (g_subs[k].words)
+            fprintf(f, "  %08lx %lu %llu %lu\n", g_subs[k].addr, (unsigned long)g_subs[k].words, g_subs[k].pos,
+                    (unsigned long)g_subs[k].vi);
+    }
+    pica_state_debug(f);
+    fflush(f);
+    if (!dir)
+        return;
+    for (int i = 0; i < SLOT_COUNT; i++) {
+        char n[32];
+        snprintf(n, sizeof(n), "cmd%d.bin", i);
+        dump_file(dir, n, P.slots[i].cmd, CMDBUF_BYTES);
+        snprintf(n, sizeof(n), "pool%d.bin", i);
+        dump_file(dir, n, P.slots[i].pool, POOL_BYTES);
+    }
+    fprintf(f, "dump files done\n");
+    fflush(f);
+    return;
+regs:; /* GPU registers: a call of its own, last (Azahar asserts on some; GSP could block) */
+    static const u32 ranges[][2] = {{0x1EF00000, 0x100}, {0x1EF00C00, 0x40}, {0x1EF01000, 0x1000}};
+    u32 *regs = calloc(0x1000 / 4, 4);
+    if (!regs)
+        return;
+    for (int r = 0; r < 3; r++) {
+        for (u32 o = 0; o < ranges[r][1]; o += 0x80)
+            GSPGPU_ReadHWRegs(ranges[r][0] - 0x1EB00000 + o, regs + o / 4, 0x80);
+        char n[32];
+        snprintf(n, sizeof(n), "regs_%08lx.bin", ranges[r][0]);
+        dump_file(dir, n, regs, ranges[r][1]);
+        if (r < 2) {
+            fprintf(f, "regs %08lx:", ranges[r][0]);
+            for (u32 o = 0; o < ranges[r][1]; o += 4)
+                fprintf(f, " %08lx", regs[o / 4]);
+            fprintf(f, "\n");
+            fflush(f);
+        }
+    }
+    free(regs);
+    fprintf(f, "dump done\n");
+    fflush(f);
 }
 
 static void apt_hook(APT_HookType type, void *param)
@@ -335,6 +485,73 @@ static bool top_buffers(void)
     return true;
 }
 
+const void *pica_top_latest(unsigned *bytes)
+{
+    if (!P.top_fb[2])
+        return NULL;
+    /* a transfer still waiting to be presented is the newest; else the one presented last */
+    void *p = P.top_fb[P.swap_pending ? P.top_next : (P.top_next + 2) % 3];
+    GSPGPU_InvalidateDataCache(p, TOP_FB_BYTES);
+    *bytes = TOP_FB_BYTES;
+    return p;
+}
+
+/* DEV: flashwatch.txt - every finished top screen image is sampled (a 50x30 grid); one whose top
+ * third turned black while the middle did not (a "band", Kirby 64 cutscene on hardware) is
+ * written to sdmc:/3ds/ctr64/flash_<vi>.raw (BGR8 LCD columns, up to 8), with the image before
+ * it as flash_<vi>_prev.raw. No waits added: the image is complete when it is presented. */
+int pica_flashwatch = -1;
+static void flash_check(const u8 *fb)
+{
+    extern unsigned ctr64_vi_count;
+    extern bool prof_write_file(const char *path, void *data, unsigned size);
+    static u8 *prev;
+    static int saved;
+    if (pica_flashwatch < 0) {
+        FILE *f = fopen("sdmc:/3ds/ctr64/flashwatch.txt", "r");
+        pica_flashwatch = f != NULL;
+        if (f)
+            fclose(f);
+    }
+    if (!pica_flashwatch || saved >= 8)
+        return;
+    GSPGPU_InvalidateDataCache((void *)fb, TOP_FB_BYTES);
+    /* LCD layout: column x holds 240 pixels, screen row y at index 239 - y */
+    u32 dark[3] = {0, 0, 0}, n[3] = {0, 0, 0};
+    for (u32 x = 4; x < 400; x += 8)
+        for (u32 y = 4; y < 240; y += 8) {
+            const u8 *p = fb + (x * 240 + 239 - y) * 3;
+            const u32 band = y < 80 ? 0 : y < 160 ? 1 : 2;
+            n[band]++;
+            dark[band] += p[0] + p[1] + p[2] < 24;
+        }
+    static u32 last_top = ~0u;
+    const u32 top = dark[0] * 100 / n[0], mid = dark[1] * 100 / n[1];
+    if (last_top != ~0u && top >= last_top + 25 && mid < 80 && prev) {
+        char path[64];
+        u8 *a = malloc(TOP_FB_BYTES), *b = malloc(TOP_FB_BYTES);
+        if (a && b) {
+            memcpy(a, fb, TOP_FB_BYTES);
+            memcpy(b, prev, TOP_FB_BYTES);
+            snprintf(path, sizeof(path), "sdmc:/3ds/ctr64/flash_%u.raw", ctr64_vi_count);
+            if (!prof_write_file(path, a, TOP_FB_BYTES))
+                free(a);
+            snprintf(path, sizeof(path), "sdmc:/3ds/ctr64/flash_%u_prev.raw", ctr64_vi_count);
+            if (!prof_write_file(path, b, TOP_FB_BYTES))
+                free(b);
+            saved++;
+        } else {
+            free(a);
+            free(b);
+        }
+    }
+    last_top = top;
+    if (!prev)
+        prev = malloc(TOP_FB_BYTES);
+    if (prev)
+        memcpy(prev, fb, TOP_FB_BYTES);
+}
+
 void pica_frame_end(const PicaTarget *screen, gfxScreen_t lcd)
 {
     Slot *s = &P.slots[P.cur];
@@ -351,6 +568,8 @@ void pica_frame_end(const PicaTarget *screen, gfxScreen_t lcd)
      * distinct, so the CPU never blocks on VBlank while emulation runs below full speed. */
     if (P.swap_pending) {
         wait_fence(P.present_fence);
+        if (pica_flashwatch)
+            flash_check(P.top_fb[P.top_next]);
         if (gspIsPresentPending(GSP_SCREEN_TOP)) {
             CRUMB("pica: vblank");
             u64 t0 = svcGetSystemTick();
@@ -473,6 +692,13 @@ void pica_reserve(u32 cmd_bytes, size_t pool_bytes)
     s->pool_used = s->pool_flushed = 0;
 }
 
+bool pica_room(u32 cmd_bytes, size_t pool_bytes)
+{
+    Slot *s = &P.slots[P.cur];
+    u32 cmd_used = (u32)(gpuCmdBuf - s->cmd + gpuCmdBufOffset) * 4;
+    return cmd_used + cmd_bytes + 256 <= CMDBUF_BYTES && s->pool_used + pool_bytes + 128 <= POOL_BYTES;
+}
+
 void *pica_frame_alloc(size_t size, size_t align)
 {
     Slot *s = &P.slots[P.cur];
@@ -572,6 +798,7 @@ static u16 fill_control(u32 bytes_per_pixel)
  * untouched, FCRAM is filled by copying instead: a VRAM scratch block is filled, copied to the
  * start of the target, then the filled part is copied after itself, doubling each time. */
 #define FILL_SCRATCH_BYTES (64 * 1024)
+bool pica_noclrdraw; /* dev switch noclrdraw.txt: FCRAM color clears by copies (video_clear_draw) */
 static int g_fcram_fill = 1;   /* 1: GX_MemoryFill works on FCRAM; 0: copy fallback */
 static void *g_fill_scratch;   /* VRAM */
 char pica_fill_report[96] = "fill self-test not run";
@@ -582,10 +809,12 @@ static bool is_vram(const void *p)
 }
 
 /* fills [p, p + bytes) with value in fill_control(bpp) units, queued after the work so far */
-static void fill_any(void *p, u32 bytes, u32 value, u32 bpp)
+#define fill_any(p, b, v, bpp) (g_fill_who = __func__, fill_any_impl((p), (b), (v), (bpp)))
+static void fill_any_impl(void *p, u32 bytes, u32 value, u32 bpp)
 {
     if (!bytes)
         return;
+    g_fill_vram = is_vram(p);
     if (is_vram(p) || g_fcram_fill || !g_fill_scratch) {
         queue_reserve(1);
         GX_MemoryFill((u32 *)p, value, (u32 *)((u8 *)p + bytes), fill_control(bpp), NULL, 0, NULL, 0);
@@ -668,6 +897,10 @@ void pica_clear(const PicaTarget *t, u32 rgba, bool clear_depth, u32 depth24)
             fill_any(c0, pixels * cbpp, rgba, cbpp);
             fill_any(d0, pixels * dbpp, dval, dbpp);
         }
+    } else if (!is_vram(t->color) && !g_fcram_fill && g_fill_scratch && t->color_fmt == GPU_RB_RGBA8 &&
+               !pica_noclrdraw) {
+        extern void video_clear_draw(const PicaTarget *t, u32 rgba);
+        video_clear_draw(t, rgba); /* recorded into the command list: in order with the draws */
     } else {
         fill_any(c0, pixels * cbpp, rgba, cbpp);
     }
@@ -698,6 +931,14 @@ void pica_copy_gap(void *dst, const void *src, u32 bytes, u32 run16, u32 gap16)
     submit_commands();
     queue_reserve(1);
     GX_TextureCopy((u32 *)src, GX_BUFFER_DIM(run16, 0), (u32 *)dst, GX_BUFFER_DIM(run16, gap16), bytes,
+                   GX_TRANSFER_RAW_COPY(1));
+}
+
+void pica_copy_rect(void *dst, const void *src, u32 bytes, u32 run16, u32 in_gap16, u32 out_gap16)
+{
+    submit_commands();
+    queue_reserve(1);
+    GX_TextureCopy((u32 *)src, GX_BUFFER_DIM(run16, in_gap16), (u32 *)dst, GX_BUFFER_DIM(run16, out_gap16), bytes,
                    GX_TRANSFER_RAW_COPY(1));
 }
 

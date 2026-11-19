@@ -75,6 +75,8 @@ void ui_init(void);
 /* the libctru console (consoleInit's result): its text is drawn into the UI canvas */
 void ui_set_console(PrintConsole *c);
 PrintConsole *ui_console(void);
+/* what the bottom screen shows (RGB565, 240x320 as the LCD scans it) */
+const u16 *ui_canvas(unsigned *bytes);
 bool ui_ready(void);
 /* the bottom screen's pixels reach the LCD (data cache flush) */
 void ui_present(void);

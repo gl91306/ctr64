@@ -24,6 +24,7 @@ int ctr64_core1_ready(void); /* platform/ctr_jit.c */
 #include <stdbool.h>
 #include <string.h>
 
+#include "debug_crumb.h"
 #include "api/m64p_plugin.h"
 #include "device/device.h"
 #include "device/r4300/interrupt.h"
@@ -50,6 +51,7 @@ typedef struct {
 typedef struct {
     Regs in, out;
     u64 start; /* system tick when queued */
+    u64 done;  /* system tick when the worker finished it */
 } DlResult;
 
 #define QUEUE 6
@@ -60,6 +62,7 @@ static Regs g_shadow;                 /* what GLideN64's pointers point at */
 static u8 g_shadow_dmem[0x1000] __attribute__((aligned(8)));
 static u8 g_shadow_imem[0x1000] __attribute__((aligned(8)));
 static unsigned char *g_real_dmem, *g_real_imem;
+extern unsigned char *DMEM, *IMEM; /* GLideN64 (N64.cpp): the RSP memory the plugin uses */
 static gfx_plugin_functions g_orig;
 
 static Cmd g_queue[QUEUE];
@@ -67,6 +70,9 @@ static DlResult g_results[RESULTS];
 static unsigned g_put, g_got;               /* commands queued / completed */
 static unsigned g_dlists_put, g_dlists_got; /* display lists queued / completed */
 static unsigned g_dlists_taken;             /* display list results consumed by the core */
+static unsigned g_nodp_score = 64;          /* recent display lists without a full sync (x32); a game starts "mixing" until 64 lists with one */
+bool ctr64_gfx_forcedp;                     /* dev switch forcedp.txt (see ctr64_gfx_dlist_finish) */
+unsigned ctr64_gfx_dp_forced;               /* stats.log: lost full syncs raised anyway */
 static LightLock g_lock;
 /* Waits re-check their condition this often: a wakeup between cores was seen to get lost
  * (Azahar, SM64 with the audio thread: the CPU slept on with the task long done) */
@@ -120,9 +126,12 @@ unsigned ctr64_gfx_worker_ticks[3]; /* worker time: [0] idle, [1] display lists,
 static void worker(void *arg)
 {
     (void)arg;
+    extern void ctr64_vfp_runfast(int who); /* main.c: VFP RunFast, per thread */
+    ctr64_vfp_runfast(1);
     for (;;) {
         LightLock_Lock(&g_lock);
         const u64 t_idle = svcGetSystemTick();
+        ctr64_gcrumb = "worker: idle";
         while (g_got == g_put)
             CondVar_WaitTimeout(&g_changed, &g_lock, WAKE_RECHECK_NS);
         const u64 t_run = svcGetSystemTick();
@@ -141,10 +150,15 @@ static void worker(void *arg)
             res = &g_results[g_dlists_got % RESULTS];
             res->in = g_shadow;
         }
+        static const char *const kn[] = {"worker: dlist", "worker: updateScreen", "worker: viStatus", "worker: viWidth",
+                                         "worker: showCFB", "worker: quit"};
+        ctr64_gcrumb = (unsigned)c->kind < 6 ? kn[c->kind] : "worker: ?";
         run(c->kind);
         ctr64_gfx_worker_ticks[c->kind == C_DLIST ? 1 : 2] += (unsigned)(svcGetSystemTick() - t_run);
-        if (res)
+        if (res) {
             res->out = g_shadow;
+            res->done = svcGetSystemTick();
+        }
 
         LightLock_Lock(&g_lock);
         if (res)
@@ -180,6 +194,15 @@ static bool start_worker(void)
     g_put = g_got = g_dlists_put = g_dlists_got = g_dlists_taken = 0;
     g_thread = threadCreate(worker, NULL, 256 * 1024, prio - 1, core, false);
     g_running = g_thread != NULL;
+    if (!g_running && core == 2 && ctr64_core1_ready()) {
+        /* New 3DS whose core 2 refuses threads (C860180C; seen after many app launches, until the
+         * console is switched off): core 1, shared with the compile thread, instead of none */
+        extern void ctr64_log_line(const char *line);
+        ctr64_log_line("video thread: core 2 refused a thread, trying core 1");
+        core = 1;
+        g_thread = threadCreate(worker, NULL, 256 * 1024, prio - 1, core, false);
+        g_running = g_thread != NULL;
+    }
     {   /* core.log: whether the video thread runs (Smash Remix on a New 3DS once ran without it,
          * with nothing to say why) */
         extern void ctr64_log_line(const char *line);
@@ -212,17 +235,18 @@ static bool start_worker(void)
     return g_running;
 }
 
+/* a start that fails is tried again a second later, a few times per game (until then the graphics
+ * run on the CPU thread, as with the setting off); reset when a game ends (ctr64_gfx_async_stop) */
+static int g_start_tries;
+static unsigned g_start_next_vi;
+
 static bool threaded(void)
 {
-    /* a start that fails is tried again a second later, a few times (until then the graphics
-     * run on the CPU thread, as with the setting off) */
-    static int tries;
-    static unsigned next_vi;
     if (!g_settings.threaded_video)
         return false;
-    if (!g_running && tries < 5 && (int)(ctr64_vi_count - next_vi) >= 0) {
-        tries++;
-        next_vi = ctr64_vi_count + 60;
+    if (!g_running && g_start_tries < 5 && (int)(ctr64_vi_count - g_start_next_vi) >= 0) {
+        g_start_tries++;
+        g_start_next_vi = ctr64_vi_count + 60;
         start_worker();
     }
     return g_running;
@@ -290,15 +314,18 @@ static void run_inline(Kind kind, void (*fn)(void))
     Regs in;
     snapshot(&in);
     g_shadow = in;
-    memcpy(g_shadow_dmem, g_real_dmem, sizeof(g_shadow_dmem));
-    memcpy(g_shadow_imem, g_real_imem, sizeof(g_shadow_imem));
+    /* the worker is idle (drained): the plugin works on the real RSP memory, no copies (Gauntlet
+     * Legends restarts its self-looping display list ~30000 times a second; 16 KB of copies each
+     * time cost more than the rest of the call) */
+    DMEM = g_real_dmem;
+    IMEM = g_real_imem;
     if (fn)
         fn();
     else
         run(kind);
+    DMEM = g_shadow_dmem;
+    IMEM = g_shadow_imem;
     apply_changes(&in, &g_shadow);
-    /* RSP memory written by the plugin (some microcodes) */
-    memcpy(g_real_dmem, g_shadow_dmem, sizeof(g_shadow_dmem));
 }
 
 /* ---- the core's side ---------------------------------------------------------------------------- */
@@ -314,9 +341,31 @@ bool ctr64_gfx_dlist_finish(void)
     const DlResult *res = &g_results[g_dlists_taken % RESULTS];
     g_dlists_taken++;
     apply_changes(&res->in, &res->out);
-    const bool dp = (res->out.r[R_MI] & MI_INTR_DP) != 0;
+    bool dp = (res->out.r[R_MI] & MI_INTR_DP) != 0;
     if (dp && g_real[R_MI])
         *g_real[R_MI] &= ~MI_INTR_DP; /* the core raises it as an event (rdp_core.c) */
+    /* A lost full sync: the game may reuse a display list's memory as soon as its RSP task is
+     * done, before the worker has read it. Rayman 2 once rewrote a list that way (threaded only):
+     * its full sync was gone, no RDP interrupt came and the game waited forever (the forum's
+     * "freezes after ~5 minutes"; music plays on). Holding the task end until the worker has
+     * read the list halved the game's frame rate. So a list without a full sync raises the
+     * interrupt anyway while such lists are rare (a score: +32 per list without, -1 per list
+     * with; Rayman 2 loses about 1 in 400, sometimes two close together). A game whose lists
+     * mix keeps the score high after its first two and is left alone. */
+    if (dp) {
+        if (g_nodp_score)
+            g_nodp_score--;
+    } else {
+        /* raising it anyway (the rule above) hung Blast Corps' intro on HW 2026-11-18: it sends
+         * two lists without a full sync there. Rayman 2's lists run inline since (RSP.cpp), so
+         * only counted now (stats.log); dev switch forcedp.txt: the old rule */
+        if (g_nodp_score < 64) {
+            dp = ctr64_gfx_forcedp;
+            ctr64_gfx_dp_forced++;
+        }
+        if (g_nodp_score < 4096)
+            g_nodp_score += 32;
+    }
     return dp;
 }
 
@@ -337,6 +386,15 @@ bool ctr64_gfx_dlist_finish(void)
  * <data dir>/gfxdelay.txt (quarter VIs, ctr64_gfx_delay_q4) fixes the delay instead. */
 unsigned ctr64_gfx_delay_q4; /* 0 = adaptive */
 bool ctr64_gfx_nodefer;      /* dev switch nodefer.txt */
+/* A finished display list is "done" no earlier in emulated time than the real time the worker
+ * took (queued -> finished, in count cycles at full speed). Before, a finished worker meant done at
+ * once: below full speed little emulated time passes per real millisecond, so the RDP looked
+ * faster than it is and games that pick their frame rate from it chose a higher one, which slowed
+ * emulation further (Conker HW: 30 instead of 20 fps where rendering takes 36 ms a frame, 65%
+ * instead of ~100% speed). At full speed emulated time keeps up and nothing changes. Dev switch
+ * rdpearly.txt: the old rule. */
+bool ctr64_gfx_rdp_early;
+unsigned ctr64_gfx_cap_vi = 2; /* "after 2 VIs: wait in any case"; dev switch rdpcap.txt (VIs) */
 static bool g_slow_game;     /* <= ctr64_gfx_defer_fps game frames/s over the last 30 VIs (w_update_screen) */
 /* 30: also 30 fps games (MK64's races, HW test 2: the CPU waited 13.4 ms per frame mid-VI for the RDP
  * while the worker idled 12.6 ms; 23% of frames shown 10-20 or 45-55 ms apart instead of 33).
@@ -356,10 +414,18 @@ unsigned ctr64_gfx_dlist_step(void)
 /* `elapsed`: emulated count cycles since the newest pending display list started */
 bool ctr64_gfx_dlist_ready(unsigned elapsed)
 {
-    if (ctr64_gfx_delay_q4 || g_dlists_taken == g_dlists_put || g_dlists_got != g_dlists_taken)
+    if (ctr64_gfx_delay_q4 || g_dlists_taken == g_dlists_put)
         return true;
     const unsigned vi = vi_count_cycles();
-    if (elapsed >= 2 * vi)
+    if (g_dlists_got != g_dlists_taken) {
+        if (ctr64_gfx_rdp_early || elapsed >= ctr64_gfx_cap_vi * vi)
+            return true;
+        __sync_synchronize(); /* the result's ticks were written before g_dlists_got */
+        const DlResult *r = &g_results[g_dlists_taken % RESULTS];
+        const u64 took = (r->done - r->start) * (u64)vi * 60 / SYSCLOCK_ARM11;
+        return elapsed >= took;
+    }
+    if (elapsed >= ctr64_gfx_cap_vi * vi)
         return true;
     extern volatile bool ctr64_speed_behind;
     if (ctr64_speed_behind)
@@ -377,9 +443,78 @@ bool ctr64_gfx_dlist_ready(unsigned elapsed)
     return true;
 }
 
+/* A display list that branches to itself (GLideN64 RSP.infloop: the RSP spins until the CPU
+ * patches the list, then goes on) must run on the CPU thread: the game watches the SP status for
+ * it at once, and the worker's answer comes too late (Gauntlet Legends: black screen, waiting
+ * for an RDP that never finished). After the first one the game's display lists run inline. */
+bool ctr64_gfx_infloop_seen; /* set by GLideN64 (RSP.cpp), cleared at game start */
+
+/* Stream mode: such a game's display lists go to the worker after all, but the RSP task stays
+ * open ("locked", as on an N64 where the RSP spins in the branch) until the worker is done with
+ * the part up to the branch; then the core either ends the task or watches the branch and sends
+ * the next part once the CPU has rewritten it (rsp_core.c). The CPU emulation runs on meanwhile:
+ * Gauntlet Legends inline spent ~20 of its 40 ms per VI in GLideN64 (HW). Dev switch
+ * nostream.txt: inline as before. */
+bool ctr64_gfx_stream;   /* the last display list went to the worker in stream mode */
+bool ctr64_gfx_nostream; /* dev switch */
+bool ctr64_gfx_inline_game; /* set by GLideN64 (RSP.cpp) for a game whose lists must stay inline (Rayman 2) */
+unsigned ctr64_gfx_stream_parts; /* stats.log */
+
+static bool stream_wait(unsigned elapsed)
+{
+    const unsigned vi = vi_count_cycles();
+    if (elapsed >= ctr64_gfx_cap_vi * vi)
+        return true;
+    extern volatile bool ctr64_speed_behind;
+    if (ctr64_speed_behind)
+        return false;
+    /* emulation ahead of real time since the part was queued: the game idles; wait */
+    const u64 real = (svcGetSystemTick() - g_results[g_dlists_taken % RESULTS].start) * (u64)vi * 60 / SYSCLOCK_ARM11;
+    return elapsed >= real;
+}
+
+/* the streamed part: 0 = the worker is still on it, 1 = it stopped at a branch to itself, 2 = the
+ * list ended; *dp: it raised the RDP interrupt (the caller raises it in the core) */
+int ctr64_gfx_stream_poll(unsigned elapsed, bool *dp)
+{
+    *dp = false;
+    if (g_dlists_taken == g_dlists_put)
+        return 2; /* nothing queued (cannot happen) */
+    if (g_dlists_got == g_dlists_taken) {
+        if (!stream_wait(elapsed))
+            return 0;
+        g_wait_why = 0;
+        wait_for(&g_dlists_got, g_dlists_taken + 1);
+    }
+    __sync_synchronize(); /* the result was written before g_dlists_got */
+    const DlResult *res = &g_results[g_dlists_taken % RESULTS];
+    g_dlists_taken++;
+    Regs out = res->out;
+    const unsigned sp = out.r[R_SP];
+    out.r[R_SP] = res->in.r[R_SP]; /* the SP status is the core's (task done or not) */
+    *dp = (out.r[R_MI] & MI_INTR_DP) != 0;
+    out.r[R_MI] &= ~MI_INTR_DP;
+    apply_changes(&res->in, &out);
+    return (sp & 0x1 /* SP_STATUS_HALT */) ? 2 : 1;
+}
+
 static void w_process_dlist(void)
 {
-    ctr64_gfx_dlist_async = threaded();
+    ctr64_gfx_stream = false;
+    if (ctr64_gfx_infloop_seen && !ctr64_gfx_nostream && !ctr64_gfx_inline_game && threaded()) {
+        extern unsigned ctr64_gfx_pending; /* rsp_core.c */
+        if (g_dlists_taken == g_dlists_put && !ctr64_gfx_pending) {
+            ctr64_gfx_dlist_async = false;
+            ctr64_gfx_stream = true;
+            ctr64_gfx_stream_parts++;
+            enqueue(C_DLIST);
+            /* open until the worker says otherwise (the HLE set these before the call) */
+            if (g_real[R_SP])
+                *g_real[R_SP] &= ~(0x200u | 0x2u | 0x1u); /* TASKDONE, BROKE, HALT */
+            return;
+        }
+    }
+    ctr64_gfx_dlist_async = threaded() && !ctr64_gfx_infloop_seen;
     if (ctr64_gfx_dlist_async)
         enqueue(C_DLIST);
     else
@@ -437,7 +572,7 @@ static void w_show_cfb(void)
 static void w_process_rdp_list(void) { run_inline(C_QUIT, g_orig.processRDPList); }
 static void w_change_window(void) { ctr64_gfx_drain(); g_orig.changeWindow(); }
 static void w_rom_closed(void) { ctr64_gfx_drain(); g_orig.romClosed(); }
-static int w_rom_open(void) { ctr64_gfx_drain(); return g_orig.romOpen(); }
+static int w_rom_open(void) { ctr64_gfx_drain(); ctr64_gfx_infloop_seen = false; ctr64_gfx_inline_game = false; g_nodp_score = 64; return g_orig.romOpen(); }
 static void w_move_screen(int x, int y) { ctr64_gfx_drain(); g_orig.moveScreen(x, y); }
 static void w_read_screen(void *d, int *w, int *h, int f) { ctr64_gfx_drain(); g_orig.readScreen(d, w, h, f); }
 static void w_resize(int w, int h) { ctr64_gfx_drain(); g_orig.resizeVideoOutput(w, h); }
@@ -490,6 +625,8 @@ void ctr64_gfx_async_install(gfx_plugin_functions *gfx, GFX_INFO *info)
 /* frontend shutdown: stops the worker */
 void ctr64_gfx_async_stop(void)
 {
+    g_start_tries = 0;
+    g_start_next_vi = 0;
     if (!g_running)
         return;
     ctr64_gfx_drain();

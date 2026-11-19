@@ -29,6 +29,9 @@ void prof_vi_run(unsigned long long ticks); /* the CPU thread's emulation time o
 void prof_vi_resync(void);                  /* after a pause (the menu) */
 /* Detailed profiler: a screenshot of the top screen (pica_ContextImpl endVI); rgba is the
  * untiled window texture from the image's top row, rows top-down, `pitch` texels apart */
+/* writes a whole file on the writer thread (takes data, malloc'd); false: not taken */
+bool prof_write_file(const char *path, void *data, unsigned size);
+void prof_files_flush(unsigned ms); /* wait until the handed-over files are written */
 bool prof_shot_ready(void);
 void prof_shot(unsigned vi, const unsigned char *rgba, unsigned pitch);
 /* an event at the next VI ("m <vi> <text>" in the file): state loads, saves, resets */

@@ -44,6 +44,9 @@ void pica_wait_idle(void);
 void pica_frame_begin(void);
 /* Ends the frame, transfers `screen` (a 240x400-style portrait target) to the LCD and swaps. */
 void pica_frame_end(const PicaTarget *screen, gfxScreen_t lcd);
+/* the newest top-screen image (BGR8, 240x400 as the LCD scans it), NULL before the first; for the
+ * remote screenshot while paused */
+const void *pica_top_latest(unsigned *bytes);
 
 /* Per-frame GPU-visible scratch memory (vertices, indices). Valid until this slot is reused. */
 void *pica_frame_alloc(size_t size, size_t align);
@@ -56,6 +59,11 @@ u32 pica_frame_number(void);
  * frame. If the slot is full, work so far is submitted and the slot is recycled once the GPU has
  * caught up (rare: only for very long frames). Register state is preserved. */
 void pica_reserve(u32 cmd_bytes, size_t pool_bytes);
+/* whether cmd_bytes of commands and pool_bytes of pica_frame_alloc fit without a restart */
+bool pica_room(u32 cmd_bytes, size_t pool_bytes);
+/* every register the state layer shadows, saved and put back around a slipped-in draw */
+void pica_state_save(void);
+void pica_state_restore(void);
 /* Submits everything recorded so far without ending the frame (e.g. before a readback). */
 void pica_flush(void);
 /* CPU cache maintenance for memory the GPU reads (flush: clean + invalidate) or wrote
@@ -81,6 +89,9 @@ extern char pica_fill_report[96];
 void pica_copy(void *dst, const void *src, u32 bytes);
 void pica_copy_from_vram(void *dst, const void *src, u32 bytes); /* no CPU cache flush of src */
 void pica_copy_gap(void *dst, const void *src, u32 bytes, u32 run16, u32 gap16);
+/* bytes in lines of run16*16 bytes, skipping in_gap16*16 bytes after each source line and
+ * out_gap16*16 after each destination line */
+void pica_copy_rect(void *dst, const void *src, u32 bytes, u32 run16, u32 in_gap16, u32 out_gap16);
 void pica_downscale2_rgba8(const void *src, u16 width, u16 rows, void *dst); /* tiled -> linear, 2x2 average */
 void pica_tile_rgba8(const void *src, u16 width, u16 rows, void *dst);        /* linear -> tiled */
 
@@ -104,10 +115,16 @@ const PicaStats *pica_stats(void);
 void pica_stats_reset_vblank(void);
 /* prints and clears GPU wait totals per breadcrumb: " where count/ms" */
 void pica_wait_report(FILE *f);
+/* DEV hang diagnosis (main.c watchdog): queue state, last submits and draws into f; command
+ * lists, draw memory and GPU registers as files into dir (NULL: text only) */
+void pica_debug_dump(FILE *f, const char *dir, bool regs_only);
 
 /* ---- state ------------------------------------------------------------------------------ */
 
 void pica_bind_target(const PicaTarget *t);
+/* Framebuffer access (0x112-0x115: color read, color write, depth read, depth write) for the next
+ * draws; binding a target resets it to everything. Bench only (pica_state.c says why). */
+void pica_fb_access(const u32 a[4]);
 void pica_viewport(u16 x, u16 y, u16 w, u16 h);
 void pica_scissor(GPU_SCISSORMODE mode, u16 left, u16 top, u16 right, u16 bottom);
 
@@ -155,7 +172,14 @@ void pica_blend(GPU_BLENDEQUATION eq_rgb, GPU_BLENDEQUATION eq_a, GPU_BLENDFACTO
 void pica_blend_off(void);
 void pica_blend_color(u32 rgba);
 
+/* The next draw only: positions divided by w in the vertex shader (w = 1: colours interpolate
+ * linearly on screen, as on the N64), texture unit 0 perspective-correct by its projection mode
+ * (texcoord0w = 1/w). Texture units 1 and 2 would be affine. Needs pica_proj_bool_bit. */
+void pica_projective(bool on);
+extern int pica_proj_bool_bit;
+
 void pica_draw_arrays(GPU_Primitive_t prim, u32 first, u32 count);
+extern bool pica_direct_arrays; /* dev switch directarrays.txt (pica_state.c) */
 /* indices must come from pica_frame_alloc (or other linear memory). */
 void pica_draw_elements(GPU_Primitive_t prim, const u16 *indices, u32 count);
 

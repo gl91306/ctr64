@@ -97,6 +97,9 @@ extern "C" {
 #include "pica_params.h"
 #include "pica_Combiner.h"
 #include "debug_crumb.h"
+/* all of this runs on the video worker: its own crumb too (DEV hang diagnosis) */
+#undef CRUMB
+#define CRUMB(s) (ctr64_gret[1] = ctr64_gret[0], ctr64_gret[0] = __builtin_return_address(0), ctr64_gcrumb = ctr64_crumb = (s))
 extern "C" bool ctr64_render_skip; /* frameskip.c */
 extern "C" bool ctr64_frameskip_present(bool stale);
 extern "C" bool ctr64_frame_cleared, ctr64_frame_fbtex, ctr64_frame_drew; /* frameskip.c */
@@ -113,11 +116,17 @@ using namespace pica_param;
 
 extern "C" unsigned int ctr64_gfx_stats[8]; /* core_compat/gln64_ctr.c */
 extern "C" unsigned int ctr64_gfx_fcram[2]; /* core_compat/gln64_ctr.c: draws to FCRAM color/depth */
+extern "C" bool pica_gputime; /* DEV ONLY gputime.txt (pica.c) */
+extern int ctr64_stash; /* gSP.cpp: triangle batching (dev switch nostash.txt) */
+extern int ctr64_flat_stash; /* gSP.cpp: flat-shaded triangles stashed (dev switch noflatstash.txt) */
+extern int ctr64_std_fast; /* gSP.cpp: standard vertex fast path (dev switch nostdvtx.txt) */
 extern "C" unsigned int ctr64_gfx_vram_moves[2]; /* KB moved into / out of VRAM (keepInVram) */
+extern "C" unsigned int ctr64_gfx_fb_reads[2];   /* reads of render targets (copies to RDRAM): [0] VRAM, [1] FCRAM */
 extern "C" unsigned int ctr64_gfx_reused;
 extern "C" unsigned int ctr64_game_starts; /* core_host.c */
+extern "C" void ctr64_log_line(const char *line); /* core_host.c: a line to core.log */
 extern "C" char ctr64_rt_mode[64]; /* stats.log: the frame buffer storage this game runs with (init) */
-extern "C" unsigned int ctr64_gfx_shadow[3]; /* shadow copies for sampling (shadowOf): count, KB; [2] copyByTransfer */
+extern "C" unsigned int ctr64_gfx_shadow[6]; /* shadow copies for sampling (shadowOf): count, KB; [2] copyByTransfer; [3] GPU copies; [4] draws (shadowDraw) */
 extern "C" unsigned int ctr64_video_frames;
 /* bytes of texture / render target storage held by the backend: [0] linear, [1] VRAM,
  * [2] the largest single linear allocation, [3] storage pending release */
@@ -137,6 +146,7 @@ struct DrawTimer { /* only with profiling on: a tick read is a kernel call */
 };
 
 extern "C" bool ctr64_crc_nomemo; /* gln64_ctr.c; dev switch nocrcmemo.txt */
+extern "C" bool ctr64_fbcheck_full; /* gln64_ctr.c; dev switch fbcheckfull.txt */
 
 namespace {
 
@@ -164,6 +174,9 @@ struct Tex {
     u32 ndraw_last = ~0u; /* draws in the last present interval it was drawn in (~0: none yet) */
     u32 gen = 0;          /* contents generation: bumped with dirty (shadow copies, shadowOf) */
     u32 nshadow = 0;      /* shadow copies of it in this present interval (rtlog.txt) */
+    u32 sh_gen = ~0u;     /* shadowOf: samples of contents generation sh_gen, of the one before */
+    u16 sh_samples = 0, sh_last = 0;
+    u32 trim_gen = ~0u;   /* the draw at this gen took its rows out of the shadows (noteDrawnRows) */
 };
 
 struct Fbo {
@@ -212,7 +225,20 @@ u16 pot(u32 v)
  * copy (shadowOf). The height stays a power of two: the rows of every target keep their place,
  * and a depth buffer still matches the color buffers it served before. */
 bool g_slowtex; /* dev switch slowtex.txt: texture uploads by the old per-texel paths (A/B) */
+bool g_noguard; /* dev switch noguard.txt: no guard band clipping (A/B) */
+bool g_noshadelin; /* dev switch noshadelin.txt: no screen-linear shade subdivision (A/B) */
+bool g_novramflush; /* dev switch novramflush.txt: no cache flush after CPU texel writes into VRAM */
+bool g_noproj;     /* dev switch noproj.txt: screen-linear shade by subdivision, not projective draws */
+bool g_noidxdraw;  /* dev switch noidxdraw.txt: indexed triangle lists drawn as plain lists (A/B) */
 bool g_potfb; /* dev switch potfb.txt: power-of-two frame buffer storage always (as before 2026-11-10) */
+bool g_fullshadow; /* dev switch fullshadow.txt: shadow copies take every row (shadowOf) */
+bool g_noalpha1;   /* dev switch noalpha1.txt: alpha compare on the output alpha (setupCombiner) */
+bool g_noshdraw;   /* dev switch noshdraw.txt: shadow copies by the transfer engine only (shadowDraw) */
+bool g_shcheck;    /* dev switch shcheck.txt (Azahar): each shadow draw checked against a transfer copy */
+extern char g_shdraw_report[48]; /* shadowDrawTest result, for stats.log */
+bool g_shazflush;  /* dev switch shazflush.txt (Azahar): source rows written back before a shadow draw */
+bool g_shflip;     /* dev switch shflip.txt: shadow draws with the texture rows the other way round */
+bool g_nodrawnrows; /* dev switch nodrawnrows.txt: a draw makes its target's shadows stale (noteDrawnRows) */
 
 /* Hardware (no non-power-of-two sampling): frame buffers at exact widths only with anti-aliasing,
  * where that keeps the 2x targets in VRAM, at the price of a shadow copy per sampled frame buffer.
@@ -220,15 +246,36 @@ bool g_potfb; /* dev switch potfb.txt: power-of-two frame buffer storage always 
  * same scenes): OoT AA 97.2% exact vs 89.2% power-of-two, MK 88.7 vs 89.1, SSB 96.0 vs 97.2 (its
  * CPU freezes dominate). Decided when a frame buffer is created (the game's settings, AA
  * included, are final then; not always at context init). stats.log "frame buffer storage". */
+/* Exact widths cost a shadow copy each time a frame buffer is sampled. A game that does that
+ * every frame (Mario Golf: ~1.3 MB per frame, 40% speed in its menus on HW, 100% with
+ * power-of-two storage) gets power-of-two storage for the frame buffers created from then on:
+ * set once at least one shadow copy per two frames over 120 frames, for the rest of the game
+ * (ContextImplPica::init clears it). Rebuilding the frame buffers that exist then was tried
+ * (Goemon's diary screen samples the frame it draws: 7 copies of 1.25 MB per frame, HW 23 VI/s):
+ * the 2 MB power-of-two buffers no longer fit the VRAM, 2 MB per frame moved there and 20-30
+ * MB/s in gameplay that moved none (Azahar 2026-11-18): not done. */
+static bool g_shadow_heavy;
+static u32 g_shadow_win_start, g_shadow_win_count;
+static void note_shadow_copy()
+{
+    const u32 now = pica_frame_number();
+    if (now - g_shadow_win_start >= 120) {
+        g_shadow_win_start = now;
+        g_shadow_win_count = 0;
+    }
+    if (++g_shadow_win_count >= 60)
+        g_shadow_heavy = true;
+}
+
 static bool pot_storage()
 {
     if (video_npot_ok)
         return false;
     const bool aa = config.frameBufferEmulation.enable && config.frameBufferEmulation.nativeResFactor > 1;
-    const bool pot_choice = !aa || g_potfb;
+    const bool pot_choice = !aa || g_potfb || g_shadow_heavy;
     if (aa)
-        snprintf(ctr64_rt_mode, sizeof(ctr64_rt_mode), "%s",
-                 pot_choice ? "power-of-two widths" : "exact widths + shadow copies");
+        snprintf(ctr64_rt_mode, sizeof(ctr64_rt_mode), "%s%s",
+                 pot_choice ? "power-of-two widths" : "exact widths + shadow copies", g_shdraw_report);
     return pot_choice;
 }
 
@@ -1057,6 +1104,7 @@ private:
     Fbo &drawFbo() { return m_drawFbo == 0 ? m_window : m_fbo[m_drawFbo]; }
     void allocStorage(Tex &t, bool vram, bool reuse = false, bool zero = true);
     void moveToVram(u32 id, bool copy = true);
+    void gtDraw(int kind);
     bool evictToFcram(u32 id);
     void keepInVram(Fbo &f, int use);
     bool inFlight(const Tex &t) const;
@@ -1078,7 +1126,7 @@ private:
     enum { USE_DRAW, USE_COLOR_CLEARED, USE_DEPTH_ONLY }; /* how materialize's caller uses the FBO */
     void materialize(Fbo &f, int use = USE_DRAW);
     float poly_offset_for_draw(const GVtx *v, const u16 *idx, u32 count, GPU_Primitive_t prim);
-    GVtx *linearizeShade(GVtx *v, u32 &n, bool fog_alpha);
+    GVtx *linearizeShade(GVtx *v, u32 &n, const u16 *in, u32 nin, bool fog_alpha, u16 *&idx, u32 &nidx);
     const char *stateString()
     {
         static char b[200];
@@ -1090,7 +1138,21 @@ private:
         return b;
     }
     void texture_xforms(TexXform tx[2]);
-    void *shadowOf(u32 id, Tex &t, bool &copied);
+    struct TileRect {
+        u16 c0, c1, r0, r1; /* tile columns [c0, c1), tile rows [r0, r1) of the storage */
+    };
+    void *shadowOf(u32 id, Tex &t, bool &copied, TileRect need, const void *avoid);
+    bool shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need);
+    int shadowDrawTest();
+    int m_shdrawState = 0; /* shadowDraw self-test: 0 not run, 1 running, 2 passed, 3 failed, 4 no memory yet */
+    u32 m_shdrawRetry = 0, m_shdrawTries = 0;
+    u16 *m_quadIdx = nullptr; /* 0 1 2, 1 3 2 per quad, for shadowDraw */
+    u32 m_shadowUse = 0;                              /* shadowOf LRU clock */
+    const void *m_shadowBound[2] = {nullptr, nullptr}; /* shadow each unit samples in this draw */
+    /* texture rectangles: the s and t ranges each unit samples (drawRects -> bindUnit), so a
+     * shadow copy takes only those tiles */
+    bool m_rowHint[2] = {false, false};
+    float m_rowS[2][2], m_rowT[2][2];
     bool copyByTransfer(const Context::DrawRectParameters &p);
     bool m_xferCopy = true; /* copyByTransfer (dev switch noxfercopy.txt: off) */
     void *m_xferTemp[2] = {nullptr, nullptr};
@@ -1101,6 +1163,9 @@ private:
         u8 bpp;
         u32 owner, gen;
         const void *src;
+        u8 nv; /* parts copied for (owner, gen, src) */
+        TileRect v[8];
+        u32 last_use;
     };
     std::vector<Shadow> m_shadows; /* one per storage size: the GPU copies in queue order */
     void ensureFrame()
@@ -1114,8 +1179,11 @@ private:
     std::unordered_map<u32, Tex> m_tex;
     std::vector<u32> m_scratch; /* upload staging, reused (0xRRGGBBAA texels) */
     std::vector<GVtx> m_shadeScratch; /* linearizeShade() output, reused */
+    std::vector<u16> m_shadeIdx;      /* and its indices */
+    u32 m_shadeFrame = 0, m_shadeTris = 0; /* subdivided triangles this frame (budget) */
     std::vector<GVtx> m_idxScratch;   /* drawTriangles: indexed vertices before the expansion */
     std::vector<u32> m_idxUsed;       /* drawTriangles: m_idxGen = vertex referred to by this draw */
+    std::vector<u16> m_idxRemap;      /* drawTriangles: its place in the compacted vertices */
     u32 m_idxGen = 0;
     std::unordered_map<u32, Fbo> m_fbo;
     u32 m_nextTex = 1, m_nextFbo = 1;
@@ -1150,6 +1218,8 @@ private:
     Kind m_kind = Kind::Noop;
     float m_cover = 0; /* frame buffer area drawn this frame, in pixels (noteCoverage) */
     void noteCoverage(const GVtx *v, u32 n);
+    void noteDrawnRows(const GVtx *v, u32 n);
+    void trimShadows(u32 id, Tex &c);
     bool m_showStale = false; /* the window copied a frame buffer with dropped draws (skipDraw) */
     bool m_showSame = false;  /* the window copied the buffer on screen, unchanged since */
     u32 m_winSrc = 0, m_winCopies = 0; /* this present's window copies */
@@ -1174,12 +1244,22 @@ void ContextImplPica::init()
 {
     CRUMB("gfx: init");
     g_ctx = this;
+    g_shadow_heavy = false;
+    g_shadow_win_start = g_shadow_win_count = 0;
     init_morton();
 
     shaderProgramInit(&m_shader);
     DVLB_s *lib = video_shader_library();
     if (shaderProgramSetVsh(&m_shader, ctru_dvle(lib, 1)) < 0)
         printf("ctr64: gfx.v.pica missing from the shader library\n");
+    /* its "proj" bool uniform (pica_projective); bool registers are uniform table entries
+     * 0x78.., which shaderInstanceGetUniformLocation returns less 0x10 */
+    pica_proj_bool_bit = -1;
+    if (m_shader.vertexShader) {
+        const int loc = shaderInstanceGetUniformLocation(m_shader.vertexShader, "proj");
+        if (loc >= 0x68 && loc < 0x78)
+            pica_proj_bool_bit = loc - 0x68;
+    }
 
     m_half = static_cast<u32 *>(linearMemAlign(8 * 8 * 4, 0x80));
     if (m_half) {
@@ -1200,6 +1280,64 @@ void ContextImplPica::init()
         fclose(pf);
         g_potfb = true;
     }
+    if (FILE *ff = fopen("sdmc:/3ds/ctr64/fullshadow.txt", "r")) {
+        fclose(ff);
+        g_fullshadow = true;
+    }
+    if (FILE *fa = fopen("sdmc:/3ds/ctr64/noalpha1.txt", "r")) {
+        fclose(fa);
+        g_noalpha1 = true;
+    }
+    if (FILE *fd = fopen("sdmc:/3ds/ctr64/nodrawnrows.txt", "r")) {
+        fclose(fd);
+        g_nodrawnrows = true;
+    }
+    if (FILE *fs = fopen("sdmc:/3ds/ctr64/noshdraw.txt", "r")) {
+        fclose(fs);
+        g_noshdraw = true;
+    }
+    if (FILE *fs = fopen("sdmc:/3ds/ctr64/shcheck.txt", "r")) {
+        fclose(fs);
+        g_shcheck = true;
+    }
+    if (FILE *fs = fopen("sdmc:/3ds/ctr64/shazflush.txt", "r")) {
+        fclose(fs);
+        g_shazflush = true;
+    }
+    if (FILE *fs = fopen("sdmc:/3ds/ctr64/shflip.txt", "r")) {
+        fclose(fs);
+        g_shflip = true;
+    }
+    g_noidxdraw = false;
+    if (FILE *ni = fopen("sdmc:/3ds/ctr64/noidxdraw.txt", "r")) {
+        fclose(ni);
+        g_noidxdraw = true;
+    }
+    pica_direct_arrays = false;
+    if (FILE *da = fopen("sdmc:/3ds/ctr64/directarrays.txt", "r")) {
+        fclose(da);
+        pica_direct_arrays = true;
+    }
+    g_novramflush = false;
+    if (FILE *nf = fopen("sdmc:/3ds/ctr64/novramflush.txt", "r")) {
+        fclose(nf);
+        g_novramflush = true;
+    }
+    g_noproj = false;
+    if (FILE *np = fopen("sdmc:/3ds/ctr64/noproj.txt", "r")) {
+        fclose(np);
+        g_noproj = true;
+    }
+    g_noshadelin = false;
+    if (FILE *ns = fopen("sdmc:/3ds/ctr64/noshadelin.txt", "r")) {
+        fclose(ns);
+        g_noshadelin = true;
+    }
+    g_noguard = false;
+    if (FILE *ng = fopen("sdmc:/3ds/ctr64/noguard.txt", "r")) {
+        fclose(ng);
+        g_noguard = true;
+    }
     if (FILE *st = fopen("sdmc:/3ds/ctr64/slowtex.txt", "r")) {
         fclose(st);
         g_slowtex = true;
@@ -1208,6 +1346,22 @@ void ContextImplPica::init()
         fclose(cm);
         ctr64_crc_nomemo = true;
     }
+    if (FILE *fc = fopen("sdmc:/3ds/ctr64/fbcheckfull.txt", "r")) {
+        fclose(fc);
+        ctr64_fbcheck_full = true;
+    }
+    if (FILE *fs = fopen("sdmc:/3ds/ctr64/noflatstash.txt", "r")) { /* gSP.cpp: flat triangles drawn at once */
+        fclose(fs);
+        ctr64_flat_stash = 0;
+    }
+    if (FILE *ns = fopen("sdmc:/3ds/ctr64/nostash.txt", "r")) { /* gSP.cpp: no triangle batching */
+        fclose(ns);
+        ctr64_stash = 0;
+    }
+    if (FILE *sv = fopen("sdmc:/3ds/ctr64/nostdvtx.txt", "r")) { /* gSP.cpp: generic vertex path */
+        fclose(sv);
+        ctr64_std_fast = 0;
+    }
     if (FILE *nv = fopen("sdmc:/3ds/ctr64/novramlru.txt", "r")) {
         fclose(nv);
         m_vramLru = false;
@@ -1215,13 +1369,40 @@ void ContextImplPica::init()
     /* GLideN64's default frame buffer: the 400x240 window, presented to the top LCD. With frame
      * buffer emulation it only receives the finished frame once per present: in FCRAM when
      * anti-aliasing needs the VRAM for the game's 2x targets (keepInVram). */
-    const bool win_vram = !(m_vramLru && config.frameBufferEmulation.enable && config.frameBufferEmulation.nativeResFactor > 1);
+    /* VRAM with anti-aliasing too: the window is drawn every frame (GLideN64's copy of the shown
+     * buffer, scaled) and read by every present; in FCRAM that copy draw cost ~7 ms of GPU time a
+     * frame (HW, MK64 race with anti-aliasing: 82% -> 95% in VRAM). Dev switch nowinvram.txt: the
+     * old rule (FCRAM when anti-aliasing needs the VRAM for the game's 2x targets). */
+    bool win_vram = true;
+    if (FILE *wv = fopen("sdmc:/3ds/ctr64/nowinvram.txt", "r")) {
+        fclose(wv);
+        win_vram = !(m_vramLru && config.frameBufferEmulation.enable && config.frameBufferEmulation.nativeResFactor > 1);
+    }
     Tex &c = m_tex[TEX_WINDOW_COLOR];
     c.w = WINDOW_W; c.h = WINDOW_H; c.tw = 512; c.th = 256;
     allocStorage(c, win_vram);
     Tex &d = m_tex[TEX_WINDOW_DEPTH];
     d.w = WINDOW_W; d.h = WINDOW_H; d.tw = 512; d.th = 256; d.depth = true;
-    allocStorage(d, win_vram);
+    /* With anti-aliasing and frame buffer emulation the window depth buffer goes to FCRAM (the
+     * window only receives copies there): its 512 KB of VRAM kept the game's second 2x color
+     * buffer out (MK64, SSB: one 1.2 MB buffer moved into and one out of VRAM each frame; MK64
+     * 94.5 -> 99.7% on HW). Star Fox 64's edge strips, seen with this on 2026-11-17, came from CPU
+     * texel writes into a VRAM color buffer that were not flushed from the data cache
+     * (writeTexels). Dev switches: winzvram.txt = in VRAM, nowinz.txt = no window depth buffer. */
+    bool winz = true, winz_vram = win_vram;
+    if (config.frameBufferEmulation.enable && config.frameBufferEmulation.nativeResFactor > 1) {
+        winz_vram = false;
+        if (FILE *wz = fopen("sdmc:/3ds/ctr64/winzvram.txt", "r")) {
+            fclose(wz);
+            winz_vram = win_vram;
+        }
+        if (FILE *wz = fopen("sdmc:/3ds/ctr64/nowinz.txt", "r")) {
+            fclose(wz);
+            winz = false;
+        }
+    }
+    if (winz)
+        allocStorage(d, winz_vram);
     m_window.color = TEX_WINDOW_COLOR;
     m_window.depth = TEX_WINDOW_DEPTH;
     rebuildFbo(m_window);
@@ -1244,6 +1425,9 @@ void ContextImplPica::destroy()
     if (m_half)
         linearFree(m_half);
     m_half = nullptr;
+    if (m_quadIdx)
+        linearFree(m_quadIdx);
+    m_quadIdx = nullptr;
     pica_forget_program(&m_shader); /* a later context may be allocated at the same address */
     shaderProgramFree(&m_shader);
     if (g_ctx == this)
@@ -1796,15 +1980,24 @@ void ContextImplPica::writeTexels(Tex &t, const u32 *px, u32 x0, u32 y0, u32 w, 
     const bool padded = x0 == 0 && y0 == 0 && w >= t.w && h >= t.h && (t.w < t.tw || t.h < t.th);
     if (padded)
         pad_edges(t);
-    if (!t.vram) {
-        /* flush the rows of 8x8 tiles written (storage rows run bottom-up) */
+    {
+        /* flush the rows of 8x8 tiles written (storage rows run bottom-up). VRAM too: CPU stores
+         * there go through the data cache like any other (a VRAM color buffer updated from RDRAM
+         * without this showed stale garbage tiles on hardware: Star Fox 64's edge strips) */
         const u32 r_lo = y0 + h >= t.th ? 0 : t.th - (y0 + h), r_hi = y0 >= t.th ? 0 : t.th - 1 - y0;
         const u32 tile_row_bytes = (u32)(t.tw >> 3) * 64 * t.bpp;
-        if (padded || h == 0)
-            pica_cache_flush(t.data, storageBytes(t));
+        u8 *f0 = static_cast<u8 *>(t.data);
+        u32 fn = storageBytes(t);
+        if (!padded && h != 0) {
+            f0 += (r_lo >> 3) * tile_row_bytes;
+            fn = ((r_hi >> 3) - (r_lo >> 3) + 1) * tile_row_bytes;
+        }
+        if (t.vram && g_novramflush)
+            ;
+        else if (t.vram) /* the kernel call only (a refusal must not switch pica_cache_flush to GSP) */
+            svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)f0, fn);
         else
-            pica_cache_flush(static_cast<u8 *>(t.data) + (r_lo >> 3) * tile_row_bytes,
-                                  ((r_hi >> 3) - (r_lo >> 3) + 1) * tile_row_bytes);
+            pica_cache_flush(f0, fn);
     }
     t.dirty = true;
     t.gen++;
@@ -2134,6 +2327,18 @@ GPU_BLENDFACTOR blend_factor(u32 f)
 void ContextImplPica::materialize(Fbo &f, int use)
 {
     ensureStorage(f.color);
+    /* after the switch to power-of-two storage (g_shadow_heavy) a new color buffer can be wider
+     * than the depth buffer made before it, which rebuildFbo would then leave off: the depth
+     * buffer gets the color buffer's width (its contents go once; games clear it per frame) */
+    if (g_shadow_heavy) {
+        Tex *c = tex(f.color), *d = tex(f.depth);
+        if (c && d && d->depth && c->tw > d->tw && d->th >= c->th) {
+            releaseStorage(*d);
+            d->tw = c->tw;
+            d->lazy = true;
+            storageChanged(f.depth);
+        }
+    }
     ensureStorage(f.depth);
     keepInVram(f, use);
 }
@@ -2186,6 +2391,7 @@ bool ContextImplPica::applyState(bool depth_allowed)
 
     if (c) {
         c->dirty = true; /* rendered to: sampling it later must refetch */
+        trimShadows(f.color, *c);
         c->gen++;
         c->used_frame = pica_frame_number();
     }
@@ -2197,6 +2403,7 @@ bool ContextImplPica::applyState(bool depth_allowed)
 void ContextImplPica::bindUnit(int unit, bool n64_filter)
 {
     CRUMB("gfx: bindUnit");
+    m_shadowBound[unit] = nullptr;
     ensureStorage(m_unit[unit]); /* sampling a target never drawn to: zeroed storage */
     Tex *t = tex(m_unit[unit]);
     if (!t || !t->data || t->depth) {
@@ -2239,7 +2446,46 @@ void ContextImplPica::bindUnit(int unit, bool n64_filter)
         ctr64_frame_fbtex = true; /* a frame buffer read as a texture (frameskip.c) */
     bool copied = false;
     if (needs_shadow(*t)) {
-        void *sh = shadowOf(m_unit[unit], *t, copied);
+        /* the tiles a texture rectangle samples (2 texels of margin for filtering); anything else
+         * takes all of them. Past an edge: clamped to the edge, or (repeat) anywhere. */
+        TileRect need = {0, (u16)(t->tw / 8), 0, (u16)(t->th / 8)};
+        if (m_rowHint[unit] && !g_fullshadow) {
+            float w = t->w, h = t->h;
+            if (m_kind != Kind::Copy && m_kind != Kind::Text) {
+                const CachedTexture *ct = textureCache().current[unit];
+                if (!ct || ct->frameBufferTexture == CachedTexture::fbNone || t->w != ct->width)
+                    h = -1.0f; /* coordinates in the cache's scale (drawRects): not mapped here */
+                else
+                    w = ct->width, h = ct->height;
+            }
+            auto range = [](float lo, float hi, float size, bool clamp, u32 tiles, bool flip, u16 &a, u16 &b) {
+                if (!clamp && (lo < 0.0f || hi > 1.0f))
+                    return;
+                lo = lo < 0.0f ? 0.0f : lo > 4.0f ? 4.0f : lo;
+                hi = hi < 0.0f ? 0.0f : hi > 4.0f ? 4.0f : hi;
+                int p0 = (int)(lo * size) - 2, p1 = (int)(hi * size + 1.0f) + 2;
+                if (flip) { /* t runs up from the last storage row (stored bottom row first) */
+                    const int n = (int)tiles * 8, q0 = n - p1;
+                    p1 = n - p0;
+                    p0 = q0;
+                }
+                u32 t0 = p0 < 0 ? 0 : (u32)p0 / 8, t1 = p1 < 1 ? 1 : (u32)(p1 + 7) / 8;
+                if (t1 > tiles)
+                    t1 = tiles;
+                if (t0 >= t1)
+                    t0 = t1 - 1; /* all past the far edge: the last tiles */
+                a = (u16)t0;
+                b = (u16)t1;
+            };
+            if (h > 0.0f) {
+                const bool clamp_s = (param & GPU_TEXTURE_WRAP_S(3)) == GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE);
+                const bool clamp_t = (param & GPU_TEXTURE_WRAP_T(3)) == GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE);
+                range(m_rowS[unit][0], m_rowS[unit][1], w, clamp_s, t->tw / 8, false, need.c0, need.c1);
+                range(m_rowT[unit][0], m_rowT[unit][1], h, clamp_t, t->th / 8, true, need.r0, need.r1);
+            }
+        }
+        void *sh = shadowOf(m_unit[unit], *t, copied, need, unit ? m_shadowBound[0] : nullptr);
+        m_shadowBound[unit] = sh;
         if (!sh) {
             pica_texture(unit, NULL, 0, 0, GPU_RGBA8, 0);
             return;
@@ -2260,40 +2506,454 @@ void ContextImplPica::bindUnit(int unit, bool n64_filter)
  * columns past the storage width stay zero, as in power-of-two storage). One shadow per storage
  * size, shared: the GPU runs copies and draws in queue order, so a copy for another texture
  * comes after the draws that sampled the previous one. */
-void *ContextImplPica::shadowOf(u32 id, Tex &t, bool &copied)
+/* Only the tile rows a texture rectangle samples are copied (tr0..tr1, see bindUnit), the rest
+ * when a later draw needs them: Goemon's diary screen samples strips of the frame it is drawing,
+ * 7 full copies (1.25 MB each) per frame at 23 VI/s on HW. Dev switch fullshadow.txt: always all. */
+static const u16 k_shadow_parts = 8;
+
+/* Shadows are kept per texture, up to k_shadows_per_size of one size (least recently used goes).
+ * One shared shadow per size took turns between two textures sampled by the same draw (Mario
+ * Tennis's ball trail: unit 0 the frame before, unit 1 the frame drawn): both units then read
+ * the second copy, and the unchanged one was copied again 32 times per frame (1.5 MB each). The
+ * shadow the other unit of this draw uses (avoid) is never taken. */
+static const unsigned k_shadows_per_size = 3;
+
+void *ContextImplPica::shadowOf(u32 id, Tex &t, bool &copied, TileRect need, const void *avoid)
 {
     const u16 sw = pot(t.tw);
-    Shadow *s = nullptr;
-    for (Shadow &x : m_shadows)
-        if (x.tw == sw && x.th == t.th && x.bpp == t.bpp) {
+    Shadow *s = nullptr, *lru = nullptr;
+    unsigned nsize = 0;
+    for (Shadow &x : m_shadows) {
+        if (x.tw != sw || x.th != t.th || x.bpp != t.bpp)
+            continue;
+        nsize++;
+        if (x.owner == id && x.p != avoid) {
             s = &x;
             break;
         }
+        if (x.p != avoid && (!lru || (s32)(x.last_use - lru->last_use) < 0))
+            lru = &x;
+    }
+    if (!s && lru && nsize >= k_shadows_per_size)
+        s = lru;
     if (!s) {
         const u32 bytes = (u32)sw * t.th * t.bpp;
         void *p = linear_alloc_safe(bytes, 0x80);
         if (!p)
             p = ctr64_xlinear_alloc(bytes, 0x80);
-        if (!p)
-            return nullptr;
-        memset(p, 0, bytes);
-        pica_cache_flush(p, bytes);
-        ctr64_gfx_mem[0] += bytes;
-        m_shadows.push_back(Shadow{p, sw, t.th, t.bpp, 0, 0, nullptr});
-        s = &m_shadows.back();
+        if (!p) {
+            if (!lru)
+                return nullptr;
+            s = lru;
+        } else {
+            memset(p, 0, bytes);
+            pica_cache_flush(p, bytes);
+            ctr64_gfx_mem[0] += bytes;
+            m_shadows.push_back(Shadow{p, sw, t.th, t.bpp, 0, 0, nullptr, 0, {}, 0});
+            s = &m_shadows.back();
+        }
     }
-    if (s->owner == id && s->gen == t.gen && s->src == t.data)
-        return s->p;
-    const u32 run = (u32)t.tw * 8 * t.bpp, out = (u32)sw * 8 * t.bpp;
-    pica_copy_gap(s->p, t.data, run * (t.th / 8), run / 16, (out - run) / 16);
+    s->last_use = ++m_shadowUse;
+    const u16 cols = t.tw / 8, rows = t.th / 8;
+    if (need.c1 > cols)
+        need.c1 = cols;
+    if (need.r1 > rows)
+        need.r1 = rows;
+    if (need.c1 <= need.c0 || need.r1 <= need.r0)
+        need = {0, cols, 0, rows};
+    const bool same = s->owner == id && s->gen == t.gen && s->src == t.data;
+    /* Each copy is a GPU command between draws. A version sampled many times (Mario Tennis reads
+     * a 4x32 grid of points from one frame: 128 samples) is copied whole, as soon as the one
+     * before had more than k_shadow_parts samples; one with few (Goemon: 3-4 strips) in parts. */
+    if (t.sh_gen != t.gen) {
+        /* decaying: Mario Tennis samples each frame 128 times, then once more for the window */
+        t.sh_last = t.sh_samples > t.sh_last / 2 ? t.sh_samples : t.sh_last / 2;
+        t.sh_samples = 0;
+        t.sh_gen = t.gen;
+    }
+    t.sh_samples += t.sh_samples < 0xFFFF;
+    if (same)
+        for (u32 i = 0; i < s->nv; i++)
+            if (need.c0 >= s->v[i].c0 && need.c1 <= s->v[i].c1 && need.r0 >= s->v[i].r0 && need.r1 <= s->v[i].r1)
+                return s->p;
+    if (t.sh_samples > k_shadow_parts || t.sh_last > k_shadow_parts)
+        need = {0, cols, 0, rows};
+    if (same && s->nv) {
+        /* current but for some rows (a draw since, noteDrawnRows): only the rows of the need
+         * no kept rect covers across its columns (heavy sampling: all such rows, full width;
+         * Mario Tennis draws its trail band 8 rows at a time and samples each version) */
+        int lo = need.r1, hi = (int)need.r0 - 1;
+        for (int r = need.r0; r < need.r1; r++) {
+            bool cov = false;
+            for (u32 i = 0; i < s->nv && !cov; i++)
+                cov = s->v[i].r0 <= r && r < s->v[i].r1 && s->v[i].c0 <= need.c0 && need.c1 <= s->v[i].c1;
+            if (!cov) {
+                lo = r < lo ? r : lo;
+                hi = r > hi ? r : hi;
+            }
+        }
+        if (hi >= lo) {
+            need.r0 = (u16)lo;
+            need.r1 = (u16)(hi + 1);
+        }
+    }
+    /* one strided copy: the needed tiles of each tile row (a tile row is its tiles in order) */
+    const u32 run = (u32)t.tw * 8 * t.bpp, out = (u32)sw * 8 * t.bpp, tile = 64u * t.bpp;
+    const u32 chunk = (u32)(need.c1 - need.c0) * tile, nrows = need.r1 - need.r0;
+    if (shadowDraw(s->p, sw, t, need)) {
+        ctr64_gfx_shadow[4]++;
+    } else {
+        pica_copy_rect(static_cast<u8 *>(s->p) + need.r0 * out + need.c0 * tile,
+                       static_cast<const u8 *>(t.data) + need.r0 * run + need.c0 * tile, chunk * nrows, chunk / 16,
+                       (run - chunk) / 16, (out - chunk) / 16);
+        ctr64_gfx_shadow[3]++;
+    }
+    ctr64_gfx_shadow[1] += (chunk * nrows) >> 10;
+    if (!same) {
+        s->nv = 0;
+        t.nshadow++;
+        note_shadow_copy();
+        ctr64_gfx_shadow[0]++;
+    }
+    if (need.c0 == 0 && need.c1 == cols && need.r0 == 0 && need.r1 == rows)
+        s->nv = 0;
+    if (s->nv == sizeof(s->v) / sizeof(s->v[0])) /* full: the oldest goes */
+        memmove(&s->v[0], &s->v[1], sizeof(s->v) - sizeof(s->v[0])), s->nv--;
+    s->v[s->nv++] = need;
     s->owner = id;
     s->gen = t.gen;
     s->src = t.data;
     copied = true;
-    t.nshadow++;
-    ctr64_gfx_shadow[0]++;
-    ctr64_gfx_shadow[1] += (run * (t.th / 8)) >> 10;
     return s->p;
+}
+
+/* A shadow copy drawn instead of copied: a transfer-engine copy ends the command list there and
+ * goes to the GPU as a job of its own (pica_copy_rect: submit_commands), ~2300 per second in
+ * Mario Tennis's trail scene and ~670 in Goemon's diary screen, which stayed at 16 and 22 VI/s on
+ * hardware however few bytes each copied (2026-11-18). A draw stays in the command list.
+ * The PICA samples only power-of-two widths, but the storage of tile rows is regular: with k the
+ * largest power of two dividing the tiles per row (768 = 96 tiles: k = 32), the storage read as
+ * a texture 8k texels wide has parts = tiles / k texture tile rows per storage tile row, in
+ * order. Each needed (storage tile row, part) is one quad of 8 rows into the shadow (a render
+ * target pot(tw) wide), texel for pixel with nearest sampling: the same bytes as the copy. At
+ * most 1024 texture rows per draw (128 / parts storage tile rows). The gfx program needs no
+ * uniforms (positions in clip space), so only the state layer's registers change, and
+ * pica_state_save/restore put them back for the draw being set up. RGBA8 only. Dev switches:
+ * noshdraw.txt off; shcheck.txt compares each with a transfer copy (shcheck.log); shflip.txt. */
+static const u32 k_shdraw_quads = 4096;
+static const u32 k_shdraw_max_bytes = 192 * 1024; /* larger copies: by transfer */
+
+char g_shdraw_report[48] = "";
+
+/* Before the first shadow draw: one of a 768x64 texture of known texels (written by the CPU, so
+ * Azahar reads it from memory too), whole and a part of it, read back and compared word for word;
+ * rows the other way round (shflip) if not. Shadow draws stay off unless one passes. stats.log
+ * "frame buffer storage". Returns 2 passed, 3 failed. */
+int ContextImplPica::shadowDrawTest()
+{
+    const u16 tw = 768, th = 64, sw = 1024;
+    const u32 sbytes = (u32)tw * th * 4, dbytes = (u32)sw * th * 4;
+    /* where the game's textures go too: the linear heap, else the New 3DS reserve (Banjo-Tooie
+     * with anti-aliasing: the linear heap had no 450 KB left) */
+    u32 *src = static_cast<u32 *>(linear_alloc_safe(sbytes, 0x80));
+    if (!src)
+        src = static_cast<u32 *>(ctr64_xlinear_alloc(sbytes, 0x80));
+    u32 *dst = static_cast<u32 *>(linear_alloc_safe(dbytes, 0x80));
+    if (!dst)
+        dst = static_cast<u32 *>(ctr64_xlinear_alloc(dbytes, 0x80));
+    int result = 3;
+    u32 bad = 0;
+    if (src && dst) {
+        for (u32 i = 0; i < sbytes / 4; i++)
+            src[i] = (i * 2654435761u) ^ 0x5A5A5A5Au;
+        pica_cache_flush(src, sbytes);
+        Tex tt;
+        tt.w = tt.tw = tw;
+        tt.h = tt.th = th;
+        tt.fmt = GPU_RGBA8;
+        tt.bpp = 4;
+        tt.data = src;
+        const bool keep_flip = g_shflip;
+        for (int flip = 0; flip < 2 && result != 2; flip++) {
+            g_shflip = flip ? !keep_flip : keep_flip;
+            bad = 0;
+            for (int part = 0; part < 2; part++) {
+                const TileRect need = part ? TileRect{10, 40, 3, 6} : TileRect{0, 96, 0, 8};
+                memset(dst, 0, dbytes);
+                pica_cache_flush(dst, dbytes);
+                if (!shadowDraw(dst, sw, tt, need)) {
+                    bad = ~0u;
+                    break;
+                }
+                pica_flush(); /* the draw is still in the command list */
+                pica_wait_idle();
+                pica_cache_invalidate(dst, dbytes);
+                for (u32 r = 0; r < th / 8u; r++)
+                    for (u32 c = 0; c < sw / 8u; c++) {
+                        const bool in = c >= need.c0 && c < need.c1 && r >= need.r0 && r < need.r1;
+                        for (u32 m = 0; m < 64; m++) {
+                            const u32 want = in ? src[(r * (tw / 8u) + c) * 64 + m] : 0;
+                            const u32 got = dst[(r * (sw / 8u) + c) * 64 + m];
+                            if (got != want && g_shcheck) { /* shtest.log: where the texel came from */
+                                static FILE *tl;
+                                static int nl;
+                                if (!tl)
+                                    tl = fopen("sdmc:/3ds/ctr64/shtest.log", "w");
+                                if (tl && nl < 60) {
+                                    long at = -1;
+                                    for (u32 i = 0; i < sbytes / 4 && at < 0; i++)
+                                        if (src[i] == got)
+                                            at = (long)i;
+                                    fprintf(tl, "flip %d part %d r %lu c %lu m %lu: got %08lx want %08lx; got = src word %ld (tile %ld m %ld)\n",
+                                            flip, part, (unsigned long)r, (unsigned long)c, (unsigned long)m,
+                                            (unsigned long)got, (unsigned long)want, at, at < 0 ? -1 : at / 64, at < 0 ? -1 : at % 64);
+                                    fflush(tl);
+                                    nl++;
+                                }
+                            }
+                            bad += got != want;
+                        }
+                    }
+            }
+            if (!bad)
+                result = 2;
+        }
+        if (result != 2)
+            g_shflip = keep_flip;
+        if (result == 2)
+            snprintf(g_shdraw_report, sizeof(g_shdraw_report), " + shadow draws%s", g_shflip ? " (flipped)" : "");
+        else
+            snprintf(g_shdraw_report, sizeof(g_shdraw_report), " (shadow draw test: %lu bad)", (unsigned long)bad);
+    } else {
+        snprintf(g_shdraw_report, sizeof(g_shdraw_report), " (shadow draw test: no memory)");
+        result = 4; /* tried again later (shadowDraw) */
+    }
+    if (src && !ctr64_xlinear_free(src))
+        linearFree(src);
+    if (dst && !ctr64_xlinear_free(dst))
+        linearFree(dst);
+    return result;
+}
+
+bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
+{
+    if (g_noshdraw || t.bpp != 4 || t.fmt != GPU_RGBA8 || !m_shader.vertexShader || sw > 1024 || t.th > 1024)
+        return false;
+    /* the test needs ~450 KB of linear memory at once: Banjo-Tooie had none free at its first
+     * copy, and the draws stayed off for the session (82 transfer jobs a second). Without the
+     * memory it is tried again every 2 s, up to 30 times. */
+    if (m_shdrawState == 0 || (m_shdrawState == 4 && pica_frame_number() >= m_shdrawRetry)) {
+        m_shdrawState = 1;
+        m_shdrawState = shadowDrawTest();
+        if (m_shdrawState == 4) {
+            m_shdrawRetry = pica_frame_number() + 120;
+            if (++m_shdrawTries >= 30)
+                m_shdrawState = 3;
+        }
+    }
+    if (m_shdrawState == 3 || m_shdrawState == 4)
+        return false;
+    /* big copies stay transfers: drawing 1.5 MB into the shadow (FCRAM) took longer on hardware
+     * than the transfer job (Mario Tennis whole-frame copies, 2026-11-19: 50 -> 40 VI/s) */
+    if (m_shdrawState == 2 && (u32)(need.c1 - need.c0) * (need.r1 - need.r0) * 256u > k_shdraw_max_bytes)
+        return false;
+    const u32 tiles = t.tw / 8;
+    u32 k = tiles & (0u - tiles);
+    if (k > 128)
+        k = 128;
+    if (!tiles)
+        return false;
+    const u32 parts = tiles / k, W = 8 * k;
+    if (parts > 128)
+        return false;
+    const u32 rpc = 128 / parts; /* storage tile rows per draw */
+    const u32 pa = need.c0 / k, pb = (need.c1 - 1) / k; /* parts touched */
+    const u32 rows = need.r1 - need.r0, per = pb - pa + 1, nq = rows * per, draws = (rows + rpc - 1) / rpc;
+    if (!rows || nq > k_shdraw_quads)
+        return false;
+    if (!m_quadIdx) {
+        m_quadIdx = static_cast<u16 *>(linearMemAlign(k_shdraw_quads * 6 * 2, 0x80));
+        if (!m_quadIdx)
+            return false;
+        for (u32 q = 0; q < k_shdraw_quads; q++) {
+            u16 *i = m_quadIdx + q * 6;
+            const u16 b = (u16)(q * 4);
+            i[0] = b, i[1] = (u16)(b + 1), i[2] = (u16)(b + 2), i[3] = (u16)(b + 1), i[4] = (u16)(b + 3), i[5] = (u16)(b + 2);
+        }
+        pica_cache_flush(m_quadIdx, k_shdraw_quads * 6 * 2);
+    }
+    const u32 vbytes = nq * 4 * sizeof(GVtx);
+    /* this draw's commands and the 4 KB the draw being set up reserved (pica_reserve) */
+    if (!pica_room(4096 + 2048 + draws * 512, vbytes + 64))
+        return false;
+    GVtx *v = static_cast<GVtx *>(pica_frame_alloc(vbytes, 16));
+    if (!v)
+        return false;
+
+    const float sx = 2.0f / sw, sy = 2.0f / t.th;
+    u32 q = 0;
+    for (u32 r = need.r0; r < need.r1; r++) {
+        const u32 base = need.r0 + (r - need.r0) / rpc * rpc;          /* first row of its draw */
+        const u32 n_in = need.r1 - base < rpc ? need.r1 - base : rpc;  /* rows of its draw */
+        const u32 htex = pot(n_in * parts * 8);
+        const float yt = (float)(t.th - 8 * r) * sy - 1.0f, yb = (float)(t.th - 8 * r - 8) * sy - 1.0f;
+        for (u32 p = pa; p <= pb; p++, q++) {
+            const u32 ca = need.c0 > p * k ? need.c0 : p * k, cb = need.c1 < (p + 1) * k ? need.c1 : (p + 1) * k;
+            const float x0 = (float)(8 * ca) * sx - 1.0f, x1 = (float)(8 * cb) * sx - 1.0f;
+            const float s0 = (float)(8 * (ca - p * k)) / W, s1 = (float)(8 * (cb - p * k)) / W;
+            const u32 j0 = ((r - base) * parts + p) * 8;
+            float tt = (float)j0 / htex, tb = (float)(j0 + 8) / htex;
+            if (g_shflip)
+                tt = 1.0f - tt, tb = 1.0f - tb;
+            GVtx *o = v + q * 4;
+            const float xs[4] = {x0, x1, x0, x1}, ys[4] = {yt, yt, yb, yb};
+            const float ss[4] = {s0, s1, s0, s1}, ts[4] = {tt, tt, tb, tb};
+            for (int i = 0; i < 4; i++) {
+                o[i].x = xs[i];
+                o[i].y = ys[i];
+                o[i].z = -0.5f;
+                o[i].w = 1.0f;
+                o[i].c[0] = o[i].c[1] = o[i].c[2] = o[i].c[3] = 0xFF;
+                o[i].s0 = ss[i];
+                o[i].t0 = ts[i];
+                o[i].s1 = o[i].t1 = 0.0f;
+            }
+        }
+    }
+
+    if (g_shazflush) {
+        /* Azahar only: its surface cache does not see the frame buffer it keeps on the host
+         * through a texture of another width and reads stale memory; a transfer of the rows
+         * writes them back first (the hardware reads memory) */
+        static u8 *fl;
+        const u32 run0 = (u32)t.tw * 8 * 4, fb = run0 * (t.th / 8);
+        static u32 fl_bytes;
+        if (fl_bytes < fb) {
+            if (fl)
+                linearFree(fl);
+            fl = static_cast<u8 *>(linearMemAlign(fb, 0x80));
+            fl_bytes = fl ? fb : 0;
+        }
+        (void)fl;
+        /* Azahar writes a host surface back when the CPU touches its pages */
+        pica_flush();
+        pica_wait_idle();
+        const u8 *p0 = static_cast<const u8 *>(t.data) + need.r0 * run0;
+        pica_cache_invalidate(p0, run0 * rows);
+        volatile u32 sink = 0;
+        for (u32 o = 0; o < run0 * rows; o += 4096)
+            sink += *reinterpret_cast<const volatile u32 *>(p0 + o);
+        (void)sink;
+    }
+    pica_state_save();
+    PicaTarget rt{};
+    rt.color = dst;
+    rt.depth = nullptr;
+    rt.width = sw;
+    rt.height = t.th;
+    rt.color_fmt = GPU_RB_RGBA8;
+    pica_bind_target(&rt); /* flushes what the draws so far left in the framebuffer cache */
+    pica_viewport(0, 0, sw, t.th);
+    pica_scissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+    pica_depth_test(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+    pica_depth_map(-1.0f, 0.0f);
+    pica_cull(GPU_CULL_NONE);
+    pica_alpha_test(false, GPU_ALWAYS, 0);
+    pica_blend_off();
+    pica_bind_program(&m_shader);
+    pica_vertex_layout(k_layout, 4, sizeof(GVtx));
+    PicaTev tev;
+    pica_tev_default(&tev);
+    tev.src_rgb = tev.src_alpha = GPU_TEVSOURCES(GPU_TEXTURE0, 0, 0);
+    pica_tev(0, &tev);
+    pica_tev_default(&tev);
+    for (int i = 1; i < 6; i++)
+        pica_tev(i, &tev);
+    pica_texture(1, NULL, 0, 0, GPU_RGBA8, 0);
+    pica_texture(2, NULL, 0, 0, GPU_RGBA8, 0);
+    const u32 run = (u32)t.tw * 8 * 4;
+    for (u32 d = 0; d < draws; d++) {
+        const u32 r0 = need.r0 + d * rpc, n_in = need.r1 - r0 < rpc ? need.r1 - r0 : rpc;
+        const u32 htex = pot(n_in * parts * 8);
+        pica_texture(0, static_cast<const u8 *>(t.data) + r0 * run, (u16)W, (u16)htex, GPU_RGBA8,
+                     GPU_TEXTURE_MAG_FILTER(GPU_NEAREST) | GPU_TEXTURE_MIN_FILTER(GPU_NEAREST) |
+                         GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE));
+        pica_texture_flush_cache(); /* the source was drawn into */
+        pica_projective(false);
+        pica_vertex_buffer(v + d * rpc * per * 4);
+        pica_draw_elements(GPU_TRIANGLES, m_quadIdx, n_in * per * 6);
+    }
+    pica_state_restore();
+
+    if (g_shcheck) { /* Azahar: the same rectangle by the transfer engine, compared */
+        static u8 *chk;
+        static u32 chk_bytes;
+        const u32 out = (u32)sw * 8 * 4, bytes = out * (t.th / 8);
+        if (chk_bytes < 2 * bytes) {
+            if (chk)
+                linearFree(chk);
+            chk = static_cast<u8 *>(linearMemAlign(2 * bytes, 0x80));
+            chk_bytes = chk ? 2 * bytes : 0;
+        }
+        if (chk) {
+            const u32 tile = 64u * 4, chunk = (u32)(need.c1 - need.c0) * tile;
+            pica_copy_rect(chk + need.r0 * out + need.c0 * tile,
+                           static_cast<const u8 *>(t.data) + need.r0 * run + need.c0 * tile, chunk * rows, chunk / 16,
+                           (run - chunk) / 16, (out - chunk) / 16);
+            /* the draw's result read back the same way (Azahar keeps drawn surfaces on the host
+             * until a transfer reads them) */
+            u8 *const got = chk + bytes;
+            pica_copy_rect(got + need.r0 * out + need.c0 * tile, static_cast<const u8 *>(dst) + need.r0 * out + need.c0 * tile,
+                           chunk * rows, chunk / 16, (out - chunk) / 16, (out - chunk) / 16);
+            pica_wait_idle();
+            pica_cache_invalidate(chk, bytes);
+            pica_cache_invalidate(got, bytes);
+            u32 bad = 0, fr = 0, fi = 0;
+            for (u32 r = need.r0; r < need.r1; r++) {
+                const u32 *a = reinterpret_cast<const u32 *>(chk + r * out + need.c0 * tile);
+                const u32 *b = reinterpret_cast<const u32 *>(got + r * out + need.c0 * tile);
+                for (u32 i = 0; i < chunk / 4; i++)
+                    if (a[i] != b[i]) {
+                        if (!bad)
+                            fr = r, fi = i;
+                        bad++;
+                    }
+            }
+            static FILE *lf;
+            static u32 n, nbad;
+            if (!lf)
+                lf = fopen("sdmc:/3ds/ctr64/shcheck.log", "w");
+            n++;
+            nbad += bad != 0;
+            if (lf && ((bad && nbad < 200) || n % 200 == 1)) {
+                fprintf(lf, "draw %u (bad so far %u): %ux%u tw %u parts %u rect %u-%u %u-%u: %u words differ, first r %u i %u\n",
+                        (unsigned)n, (unsigned)nbad, (unsigned)sw, (unsigned)t.th, (unsigned)t.tw, (unsigned)parts,
+                        need.c0, need.c1, need.r0, need.r1, (unsigned)bad, (unsigned)fr, (unsigned)fi);
+                if (bad && nbad < 4) { /* the first tile row of words: transfer copy, draw, source */
+                    const u32 *ca = reinterpret_cast<const u32 *>(chk + fr * out + need.c0 * tile);
+                    const u32 *cb = reinterpret_cast<const u32 *>(got + fr * out + need.c0 * tile);
+                    pica_cache_invalidate(t.data, run * (t.th / 8));
+                    const u32 *cs = reinterpret_cast<const u32 *>(static_cast<const u8 *>(t.data) + fr * run + need.c0 * tile);
+                    for (int w = 0; w < 3; w++) {
+                        const u32 *x = w == 0 ? ca : w == 1 ? cb : cs;
+                        fprintf(lf, "  %s", w == 0 ? "copy" : w == 1 ? "draw" : "src ");
+                        for (int i = 0; i < 16; i++)
+                            fprintf(lf, " %08lx", (unsigned long)x[i]);
+                        fputc('\n', lf);
+                    }
+                    /* where does the draw's first word occur in the source tile row? */
+                    const u32 *row = reinterpret_cast<const u32 *>(static_cast<const u8 *>(t.data) + fr * run);
+                    int at = -1;
+                    for (u32 i = 0; i < run / 4 && at < 0; i++)
+                        if (row[i] == cb[0])
+                            at = (int)i;
+                    fprintf(lf, "  draw word 0 found at src row word %d\n", at);
+                }
+                fflush(lf);
+            }
+        }
+    }
+    return true;
 }
 
 /* Texture coordinate transform of one tile (UTextureParamsFast + calcTexCoord + the
@@ -2380,13 +3040,251 @@ void log_draw(const char *what, const CombinerProgram *prog, int kind, const GVt
             gDP.envColor.r, gDP.envColor.g, gDP.envColor.b, gDP.envColor.a);
     /* addresses: color image, depth image, and texture 0 (fb: a frame buffer texture) */
     const CachedTexture *t0 = textureCache().current[0];
+    fprintf(f, "  clamp %d non %d zbuf %d\n", g_ctx ? (int)g_ctx->getClampMode() : -1, (int)GBI.isNoN(),
+            (int)((gSP.geometryMode & G_ZBUFFER) != 0));
     fprintf(f, "  ci %08x zi %08x t0 %08x fb %d\n", (unsigned)gDP.colorImage.address, (unsigned)gDP.depthImageAddress,
             t0 ? (unsigned)t0->address : 0u, t0 ? (int)t0->frameBufferTexture : -1);
+    if (t0 && gSP.textureTile[0]) {
+        const gDPTile *tl = gSP.textureTile[0];
+        float s0 = 1e9f, s1 = -1e9f, q0 = 1e9f, q1 = -1e9f;
+        for (u32 i = 0; i < n; i++) {
+            s0 = v[i].s0 < s0 ? v[i].s0 : s0; s1 = v[i].s0 > s1 ? v[i].s0 : s1;
+            q0 = v[i].t0 < q0 ? v[i].t0 : q0; q1 = v[i].t0 > q1 ? v[i].t0 : q1;
+        }
+        fprintf(f, "  tex %ux%u scale %g,%g off %g,%g clamp %d,%d mask %d,%d mirror %d,%d | tile uls %u lrs %u ult %u lrt %u "
+                   "masks %u maskt %u cs %u ct %u ms %u mt %u shifts %u | s %g..%g t %g..%g\n",
+                t0->width, t0->height, t0->scaleS, t0->scaleT, t0->offsetS, t0->offsetT, t0->clampS, t0->clampT,
+                t0->maskS, t0->maskT, t0->mirrorS, t0->mirrorT, (unsigned)tl->uls, (unsigned)tl->lrs,
+                (unsigned)tl->ult, (unsigned)tl->lrt, (unsigned)tl->masks, (unsigned)tl->maskt, (unsigned)tl->clamps,
+                (unsigned)tl->clampt, (unsigned)tl->mirrors, (unsigned)tl->mirrort, (unsigned)tl->shifts, s0, s1, q0, q1);
+        bool odd = false;
+        for (u32 i = 0; i < n; i++)
+            if (v[i].w <= 0.0f || v[i].z < -v[i].w || v[i].z > 0.0f || fabsf(v[i].x) > 4.0f * v[i].w)
+                odd = true;
+        if (odd)
+            fprintf(f, "  odd vertices\n");
+        if (t0->frameBufferTexture != CachedTexture::fbNone || odd) {
+            fprintf(f, "  fbtex size %u fmt %u tile size %u fmt %u\n", (unsigned)t0->size, (unsigned)t0->format,
+                    (unsigned)tl->size, (unsigned)tl->format);
+            for (u32 i = 0; i < n && i < 12; i++)
+                fprintf(f, "  v %g %g %g %g c %u %u %u %u st %g %g\n", v[i].x, v[i].y, v[i].z, v[i].w, v[i].c[0],
+                        v[i].c[1], v[i].c[2], v[i].c[3], v[i].s0, v[i].t0);
+        }
+    }
+}
+
+/* Guard band. The hardware rasterizer drops triangles that reach far outside the render target
+ * (Azahar draws them): Blast Corps' ground triangles reach 3x the screen width; at 1x (640 px)
+ * they draw, with anti-aliasing (1280 px) whole patches of ground were missing on HW only
+ * (2026-11-17). A triangle with a vertex outside the window band [GB_MIN, GB_MAX] (or w <= 0) is
+ * clipped against that band (and w > 0) here, in clip space with all attributes interpolated;
+ * the others go as they are. Returns a flat triangle list in frame memory, or null when no
+ * triangle needed it. */
+static const float GB_MIN = -256.0f, GB_MAX = 1016.0f, GB_W = 1e-5f;
+struct ClipV {
+    float p[4], c[4], st[4];
+};
+static inline ClipV to_clip(const GVtx &g)
+{
+    return ClipV{{g.x, g.y, g.z, g.w}, {(float)g.c[0], (float)g.c[1], (float)g.c[2], (float)g.c[3]},
+                 {g.s0, g.t0, g.s1, g.t1}};
+}
+static inline GVtx from_clip(const ClipV &c)
+{
+    GVtx g;
+    g.x = c.p[0]; g.y = c.p[1]; g.z = c.p[2]; g.w = c.p[3];
+    for (int i = 0; i < 4; i++) {
+        const float x = c.c[i] + 0.5f;
+        g.c[i] = (u8)(x < 0.0f ? 0.0f : x > 255.0f ? 255.0f : x);
+    }
+    g.s0 = c.st[0]; g.t0 = c.st[1]; g.s1 = c.st[2]; g.t1 = c.st[3];
+    return g;
+}
+/* plane k: d = A*x + B*y + C*w >= 0 inside */
+static void guard_planes(const s32 vp[4], float pl[5][3])
+{
+    /* window x = vp0 + (x/w + 1) / 2 * vp2 <= GB_MAX  <=>  x <= ax * w */
+    const float axh = 2.0f * (GB_MAX - vp[0]) / (vp[2] ? vp[2] : 1) - 1.0f;
+    const float axl = 2.0f * (GB_MIN - vp[0]) / (vp[2] ? vp[2] : 1) - 1.0f;
+    const float ayh = 2.0f * (GB_MAX - vp[1]) / (vp[3] ? vp[3] : 1) - 1.0f;
+    const float ayl = 2.0f * (GB_MIN - vp[1]) / (vp[3] ? vp[3] : 1) - 1.0f;
+    const float t[5][3] = {{-1, 0, axh}, {1, 0, -axl}, {0, -1, ayh}, {0, 1, -ayl}, {0, 0, 1}};
+    memcpy(pl, t, sizeof t);
+}
+static inline float guard_dist(const float pl[5][3], int k, const float *p)
+{
+    return pl[k][0] * p[0] + pl[k][1] * p[1] + pl[k][2] * p[3] - (k == 4 ? GB_W : 0.0f);
+}
+/* a vertex outside the band (or w <= 0) */
+static inline bool guard_out(const float pl[5][3], const GVtx &g)
+{
+    const float p[4] = {g.x, g.y, g.z, g.w};
+    for (int k = 0; k < 5; k++)
+        if (guard_dist(pl, k, p) < 0.0f)
+            return true;
+    return false;
+}
+GVtx *guard_clip(GVtx *v, u32 &count, const void *elements, u32 nidx, bool bytes, const s32 vp[4])
+{
+    float pl[5][3];
+    guard_planes(vp, pl);
+    auto dist = [&](int k, const float *p) { return guard_dist(pl, k, p); };
+    const u32 ntri = (nidx ? nidx : count) / 3;
+    auto vidx = [&](u32 i) -> u32 {
+        if (!nidx)
+            return i;
+        return bytes ? static_cast<const u8 *>(elements)[i] : static_cast<const u16 *>(elements)[i];
+    };
+    /* quick test: any vertex outside the band? */
+    bool any = false;
+    for (u32 i = 0; i < count && !any; i++)
+        any = guard_out(pl, v[i]);
+    if (!any)
+        return nullptr;
+    /* worst case: a triangle clipped by 5 planes is a polygon of 8 vertices = 6 triangles */
+    GVtx *out = static_cast<GVtx *>(pica_frame_alloc(ntri * 18 * sizeof(GVtx), 16));
+    if (!out)
+        return nullptr;
+    u32 n = 0;
+    for (u32 t = 0; t < ntri; t++) {
+        const GVtx &a = v[vidx(t * 3)], &b = v[vidx(t * 3 + 1)], &c = v[vidx(t * 3 + 2)];
+        ClipV poly[2][9];
+        int m = 3, cur = 0;
+        poly[0][0] = to_clip(a);
+        poly[0][1] = to_clip(b);
+        poly[0][2] = to_clip(c);
+        bool clipped = false;
+        for (int k = 0; k < 5 && m >= 3; k++) {
+            float d[9];
+            bool out_any = false;
+            for (int i = 0; i < m; i++) {
+                d[i] = dist(k, poly[cur][i].p);
+                out_any |= d[i] < 0.0f;
+            }
+            if (!out_any)
+                continue;
+            clipped = true;
+            int m2 = 0;
+            for (int i = 0; i < m && m2 < 9; i++) {
+                const int j = (i + 1) % m;
+                const ClipV &P = poly[cur][i], &Q = poly[cur][j];
+                if (d[i] >= 0.0f)
+                    poly[cur ^ 1][m2++] = P;
+                if ((d[i] >= 0.0f) != (d[j] >= 0.0f) && m2 < 9) {
+                    const float s = d[i] / (d[i] - d[j]);
+                    ClipV &R = poly[cur ^ 1][m2++];
+                    for (int e = 0; e < 4; e++) {
+                        R.p[e] = P.p[e] + (Q.p[e] - P.p[e]) * s;
+                        R.c[e] = P.c[e] + (Q.c[e] - P.c[e]) * s;
+                        R.st[e] = P.st[e] + (Q.st[e] - P.st[e]) * s;
+                    }
+                }
+            }
+            m = m2;
+            cur ^= 1;
+        }
+        if (!clipped) {
+            out[n++] = a;
+            out[n++] = b;
+            out[n++] = c;
+            continue;
+        }
+        for (int i = 1; i + 1 < m; i++) {
+            out[n++] = from_clip(poly[cur][0]);
+            out[n++] = from_clip(poly[cur][i]);
+            out[n++] = from_clip(poly[cur][i + 1]);
+        }
+    }
+    count = n;
+    return out;
 }
 
 /* Adds a draw's screen bounding box to the area drawn this frame; once that reaches 90% of the
  * frame buffer, the frame counts as redrawing its whole image (frameskip.c). SM64 never clears,
  * its skybox covers the screen; Paper Mario's name entry only redraws what changes. */
+/* Shadows of a frame buffer that is drawn into between samples. Every draw starts a new
+ * contents generation (applyState); a shadow copied at gen G holds the contents before the draw
+ * made at G (copies are queued before that draw). Here, at the end of that draw, the rows it can
+ * touch are taken out of the gen-G shadows; at the next generation (trimShadows) they stay
+ * current with the rest, so the next sample copies only what changed. Mario Tennis' court
+ * effect draws a strip and samples the band above it ~35 times a frame: 3 tile rows each copied
+ * before, 1 now. Dev switches fullshadow.txt, nodrawnrows.txt: off. */
+void ContextImplPica::noteDrawnRows(const GVtx *v, u32 n)
+{
+    if (m_drawFbo == 0)
+        return;
+    const u32 id = drawFbo().color;
+    Tex *c = tex(id);
+    if (!c)
+        return;
+    c->trim_gen = ~0u;
+    if (c->sh_gen == ~0u || !needs_shadow(*c))
+        return; /* never sampled through a shadow */
+    /* rows unknown: this generation's shadows miss this draw entirely (a sample before the next
+     * generation starts, as drawTriangles makes, must copy again) */
+    auto stale = [&]() {
+        for (Shadow &x : m_shadows)
+            if (x.owner == id && x.gen == c->gen)
+                x.gen = c->gen - 1;
+    };
+    if (g_fullshadow || g_nodrawnrows || !c->w || !c->h || !v || !n) {
+        stale();
+        return;
+    }
+    float y0 = 1e9f, y1 = -1e9f;
+    for (u32 i = 0; i < n; i++) {
+        if (v[i].w <= 0.0f) { /* crosses the eye plane */
+            stale();
+            return;
+        }
+        const float y = v[i].y / v[i].w;
+        y0 = y < y0 ? y : y0;
+        y1 = y > y1 ? y : y1;
+    }
+    /* window pixels (GL: y up), then storage rows (stored bottom row first: row = th - y) */
+    const float p0 = m_vp[1] + (y0 + 1.0f) * 0.5f * m_vp[3], p1 = m_vp[1] + (y1 + 1.0f) * 0.5f * m_vp[3];
+    const int th = c->th, rows = th / 8;
+    /* pixel rows whose centers the primitive can cover, half a pixel wider each way (the GPU
+     * snaps vertices to 1/16 px and anti-aliasing scales: a tight bound missed edge pixels in
+     * Goemon's diary screen); 8-row strips on tile boundaries (Mario Tennis) stay one tile row */
+    const int a = (int)floorf(p0), b = (int)ceilf(p1);
+    const int s0 = th - b, s1 = th - a;
+    int d0 = s0 < 0 ? 0 : s0 / 8, d1 = s1 <= 0 ? 0 : (s1 + 7) / 8;
+    d1 = d1 > rows ? rows : d1;
+    d0 = d0 > d1 ? d1 : d0;
+    for (Shadow &x : m_shadows) {
+        if (x.owner != id || x.src != c->data || x.gen != c->gen)
+            continue;
+        TileRect keep[8];
+        u32 nk = 0;
+        for (u32 i = 0; i < x.nv; i++) {
+            const TileRect r = x.v[i];
+            if ((int)r.r1 <= d0 || (int)r.r0 >= d1) {
+                if (nk < 8) keep[nk++] = r;
+                continue;
+            }
+            if ((int)r.r0 < d0 && nk < 8)
+                keep[nk++] = TileRect{r.c0, r.c1, r.r0, (u16)d0};
+            if ((int)r.r1 > d1 && nk < 8)
+                keep[nk++] = TileRect{r.c0, r.c1, (u16)d1, r.r1};
+        }
+        memcpy(x.v, keep, sizeof(TileRect) * nk);
+        x.nv = (u8)nk;
+    }
+    c->trim_gen = c->gen;
+}
+
+/* applyState, about to start the next generation of target `id`: if the one draw of this
+ * generation took its rows out of the shadows, the shadows of this generation carry over. */
+void ContextImplPica::trimShadows(u32 id, Tex &c)
+{
+    if (c.trim_gen != c.gen)
+        return;
+    for (Shadow &x : m_shadows)
+        if (x.owner == id && x.src == c.data && x.gen == c.gen)
+            x.gen = c.gen + 1;
+}
+
 void ContextImplPica::noteCoverage(const GVtx *v, u32 n)
 {
     if (m_drawFbo == 0)
@@ -2522,6 +3420,7 @@ void ContextImplPica::texture_xforms(TexXform tx[2])
 bool ContextImplPica::setupCombiner(bool rect)
 {
     CRUMB("gfx: setupCombiner");
+    m_shadowBound[0] = m_shadowBound[1] = nullptr;
     (void)rect;
     PicaTev tev[pica_cmb::MAX_STAGES];
     for (auto &t : tev)
@@ -2561,6 +3460,28 @@ bool ContextImplPica::setupCombiner(bool rect)
             t.scale_rgb = s.scale_rgb;
             t.scale_alpha = s.scale_a;
             t.color = pica_cmb::constant(s.k_rgb, s.k_a);
+        }
+        /* GLSL backend's uFbMonochrome mode 1: an 8-bit frame buffer sampled as a texture reads
+         * its red channel into all four (vec4(name.r)), alpha included. Blast Corps renders its
+         * light pools into 8-bit buffers that way; read as RGBA their black became opaque black
+         * squares on the ground. Every operand on that unit selects R instead. (Mode 2/3,
+         * luminance, and the fixed alpha 0.825 for imageRead off are not done.) */
+        for (u32 u = 0; u < 2; u++) {
+            const CachedTexture *ct = textureCache().current[u];
+            if (!pr.uses_tex[u] || !ct || ct->frameBufferTexture == CachedTexture::fbNone ||
+                ct->size != G_IM_SIZ_8b)
+                continue;
+            const u8 src = u ? GPU_TEXTURE1 : GPU_TEXTURE0;
+            for (int i = 0; i < n; i++) {
+                const pica_cmb::Stage &s = pr.st[i];
+                u8 orgb[3], oa[3];
+                for (int k = 0; k < 3; k++) {
+                    orgb[k] = s.src_rgb[k] == src ? (u8)(GPU_TEVOP_RGB_SRC_R | (s.op_rgb[k] & 1)) : s.op_rgb[k];
+                    oa[k] = s.src_a[k] == src ? (u8)(GPU_TEVOP_A_SRC_R | (s.op_a[k] & 1)) : s.op_a[k];
+                }
+                tev[i].op_rgb = GPU_TEVOPERANDS(orgb[0], orgb[1], orgb[2]);
+                tev[i].op_alpha = GPU_TEVOPERANDS(oa[0], oa[1], oa[2]);
+            }
         }
         buf_rgb = pr.buf_rgb_mask;
         buf_a = pr.buf_a_mask;
@@ -2607,6 +3528,24 @@ bool ContextImplPica::setupCombiner(bool rect)
         if (ref > 0.0f) {
             alpha_test = true;
             alpha_ref = to_u8(ref);
+        }
+        /* GLideN64 (ShaderAlphaTest) compares alpha1, cycle 1's alpha, not the output alpha;
+         * the PICA tests the TEV output. When cycle 2 computes another alpha and the blender
+         * does not read the source alpha, cycle 2 passes alpha1 through instead (the alpha
+         * written to the buffer is then alpha1). Gauntlet Legends' HUD gauges: alpha1 = the
+         * IA4 gauge shape, alpha2 = a 1-bit RGBA16 mask that is 1 everywhere -> opaque black
+         * boxes over the heart and score. */
+        if (alpha_test && pr.alpha2_differs && !cvg_alpha && !g_noalpha1) {
+            const auto reads_src_alpha = [](u32 b) { return b == BL_SRC_ALPHA || b == BL_ONE_MINUS_SRC_ALPHA; };
+            if (!m_enBlend || !(reads_src_alpha(m_blend[0]) || reads_src_alpha(m_blend[1]) ||
+                                reads_src_alpha(m_blend[2]) || reads_src_alpha(m_blend[3]))) {
+                for (int i = pr.cycle2_first; i < pr.n; i++) {
+                    tev[i].src_alpha = GPU_TEVSOURCES(GPU_PREVIOUS, 0, 0);
+                    tev[i].op_alpha = GPU_TEVOPERANDS(GPU_TEVOP_A_SRC_ALPHA, 0, 0);
+                    tev[i].func_alpha = GPU_REPLACE;
+                    tev[i].scale_alpha = GPU_TEVSCALE_1;
+                }
+            }
         }
         break;
     }
@@ -2661,13 +3600,41 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
         if (c && !c->vram) ctr64_gfx_fcram[0]++;
         if (f.rt.depth && d && !d->vram) ctr64_gfx_fcram[1]++;
     }
-    /* Indexed triangle lists (renderAndDrawTriangles: each kept vertex once) are converted once
-     * per vertex into m_idxScratch, then expanded into a plain list in the pool (below), so the GPU
-     * gets the same non-indexed draws as before. */
-    const bool expand = p.elementsCount && p.elements && u32(p.elementsType) == DT_UNSIGNED_SHORT &&
-                        mode == DM_TRIANGLES;
+    /* Indexed triangle lists (renderAndDrawTriangles: each kept vertex once): the vertices the
+     * triangles use are converted once each, into the pool in the order of first use, and drawn
+     * with the triangles' indices remapped to them (the GPU's post-vertex cache; a vertex is
+     * written once instead of once per triangle). Dev switch noidxdraw.txt: converted into
+     * m_idxScratch and expanded into a plain list in the pool (below), as before. */
+    const bool indexedIn = p.elementsCount && p.elements && u32(p.elementsType) == DT_UNSIGNED_SHORT &&
+                           mode == DM_TRIANGLES;
+    const bool compact = indexedIn && !g_noidxdraw && p.verticesCount <= 0xFFFF;
+    const bool expand = indexedIn && !compact;
     GVtx *v;
-    if (expand) {
+    u16 *compactIdx = nullptr;
+    u32 compactCount = 0;
+    if (compact) {
+        pica_reserve(4096, p.verticesCount * sizeof(GVtx) + p.elementsCount * 2 + 256);
+        if (m_idxUsed.size() < p.verticesCount) {
+            m_idxUsed.resize(p.verticesCount, 0u);
+            m_idxRemap.resize(p.verticesCount);
+        }
+        if (++m_idxGen == 0) {
+            std::fill(m_idxUsed.begin(), m_idxUsed.end(), 0u);
+            m_idxGen = 1;
+        }
+        const u16 *e = static_cast<const u16 *>(p.elements);
+        for (u32 i = 0; i < p.elementsCount; i++)
+            if (m_idxUsed[e[i]] != m_idxGen) {
+                m_idxUsed[e[i]] = m_idxGen;
+                m_idxRemap[e[i]] = u16(compactCount++);
+            }
+        v = static_cast<GVtx *>(pica_frame_alloc(compactCount * sizeof(GVtx), 16));
+        compactIdx = static_cast<u16 *>(pica_frame_alloc(p.elementsCount * 2, 16));
+        if (!v || !compactIdx)
+            return;
+        for (u32 i = 0; i < p.elementsCount; i++)
+            compactIdx[i] = m_idxRemap[e[i]];
+    } else if (expand) {
         pica_reserve(4096, p.elementsCount * sizeof(GVtx) + 256);
         if (m_idxScratch.size() < p.verticesCount) {
             m_idxScratch.resize(p.verticesCount);
@@ -2702,12 +3669,13 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
     const bool persp = (RSP.LLE || GBI.isTexturePersp()) ? gDP.otherMode.texturePersp != 0 : true;
     const float tscale_s = gSP.texture.scales, tscale_t = gSP.texture.scalet;
 
+    bool wPos = true; /* every converted vertex in front of the eye (projective draws) */
     Ctr64ProfScope vtx_scope(33);
     for (u32 i = 0; i < p.verticesCount; i++) {
-        if (expand && m_idxUsed[i] != m_idxGen)
+        if ((expand || compact) && m_idxUsed[i] != m_idxGen)
             continue;
         const SPVertex &s = i < p.verticesBase ? p.vertices[i] : p.vertices2[i - p.verticesBase];
-        GVtx &o = v[i];
+        GVtx &o = compact ? v[m_idxRemap[i]] : v[i];
         float x = s.x, y = s.y, z = s.z, w = s.w;
         const u32 mod = s.modify;
 
@@ -2733,6 +3701,8 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
         }
         o.z = zp;
         o.w = w;
+        if (!(w > 1e-4f)) /* 1/w in the shader: no infinities (float24) */
+            wPos = false;
 
         const float *col = p.flatColors ? &s.flat_r : &s.r;
         o.c[0] = to_u8(col[0]); o.c[1] = to_u8(col[1]); o.c[2] = to_u8(col[2]); o.c[3] = to_u8(col[3]);
@@ -2754,8 +3724,25 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
     }
 
     vtx_scope.end();
-    u32 count = p.verticesCount;
-    const void *elements = p.elements;
+    /* Any vertex outside the guard band? Tested here on the converted vertices (each once):
+     * the band's planes are linear in clip space, and every vertex made below (index expansion,
+     * shade subdivision: points between two vertices with w > 0) lies inside when these do, so
+     * guard_clip need not look at the many more vertices drawn. */
+    bool guardAny = false;
+    if (mode == DM_TRIANGLES && !g_noguard) {
+        float pl[5][3];
+        guard_planes(m_vp, pl);
+        if (compact) {
+            for (u32 i = 0; i < compactCount && !guardAny; i++)
+                guardAny = guard_out(pl, v[i]);
+        } else {
+            for (u32 i = 0; i < p.verticesCount && !guardAny; i++)
+                if (!expand || m_idxUsed[i] == m_idxGen)
+                    guardAny = guard_out(pl, v[i]);
+        }
+    }
+    u32 count = compact ? compactCount : p.verticesCount;
+    const void *elements = compact ? compactIdx : p.elements;
     u32 elementsCount = p.elementsCount;
     if (expand) { /* room reserved above (no pica_reserve between: it may restart the pool) */
         const u16 *e = static_cast<const u16 *>(elements);
@@ -2769,25 +3756,64 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
         elements = nullptr;
         elementsCount = 0;
     }
-    if (!(elementsCount && elements) && mode == DM_TRIANGLES && m_kind == Kind::Combiner && m_program &&
-        m_program->usesShade()) {
+    bool idxBytes = u32(p.elementsType) == DT_UNSIGNED_BYTE && !compact;
+    u16 *idxPool = compactIdx; /* indices already in frame memory (compacted, shade subdivision) */
+    /* Screen-linear shade (see linearizeShade): a draw without texture unit 1 is drawn projective
+     * instead (pica_projective: the GPU interpolates colour linearly on screen, exactly, and
+     * texture 0 stays perspective-correct), with no subdivision. */
+    bool proj = false;
+    /* not for decals (polygon offset): the shader's z / w in 24-bit floats loses the few depth
+     * units the offset gives them, so shadows on the ground z-fought into fragments (Mario
+     * Tennis on the court, Conker; Azahar and HW 2026-11-18) */
+    if (mode == DM_TRIANGLES && m_kind == Kind::Combiner && m_program && !g_noshadelin && !g_noproj && wPos &&
+        !(m_enPolyOffset && m_enDepth) &&
+        pica_proj_bool_bit >= 0 && m_program->usesShade() &&
+        !static_cast<const PicaCombinerProgram *>(m_program)->tev().uses_tex[1])
+        proj = true;
+    if (!proj && (!(elementsCount && elements) || idxPool) && mode == DM_TRIANGLES && m_kind == Kind::Combiner &&
+        m_program && !g_noshadelin && m_program->usesShade()) {
         CTR64_PROF(34);
-        v = linearizeShade(v, count, fogUsage == 1 && config.generalEmulation.enableLegacyBlending != 0);
+        CRUMB("gfx: tri shade");
+        u16 *si;
+        u32 sn;
+        v = linearizeShade(v, count, idxPool, idxPool ? elementsCount : 0,
+                           fogUsage == 1 && config.generalEmulation.enableLegacyBlending != 0, si, sn);
+        if (si) {
+            elements = idxPool = si;
+            elementsCount = sn;
+            idxBytes = false;
+        }
     }
     CTR64_PROF(35);
+
+    if (guardAny) {
+        CRUMB("gfx: tri guard");
+        u32 n_idx = (elementsCount && elements) ? elementsCount : 0;
+        if (GVtx *c = guard_clip(v, count, n_idx ? elements : nullptr, n_idx, idxBytes, m_vp)) {
+            idxPool = nullptr;
+            v = c;
+            elements = nullptr;
+            elementsCount = 0;
+            if (!count)
+                return; /* every triangle outside the band: nothing to draw */
+            for (u32 i = 0; i < count && proj; i++)
+                proj = c[i].w > 1e-4f;
+        }
+    }
 
     if (draw_log())
         log_draw("tri", m_program, (int)m_kind, v, count, m_vp, stateString());
     noteCoverage(v, count);
+    noteDrawnRows(v, count);
     pica_vertex_buffer(v);
 
     GPU_Primitive_t prim_type = mode == DM_TRIANGLE_STRIP ? GPU_TRIANGLE_STRIP : mode == DM_TRIANGLE_FAN ? GPU_TRIANGLE_FAN : GPU_TRIANGLES;
-    u16 *idx = nullptr;
-    if (elementsCount && elements) {
+    u16 *idx = idxPool;
+    if (elementsCount && elements && !idx) {
         idx = static_cast<u16 *>(pica_frame_alloc(elementsCount * 2, 16));
         if (!idx)
             return;
-        if (u32(p.elementsType) == DT_UNSIGNED_BYTE) {
+        if (idxBytes) {
             const u8 *e = static_cast<const u8 *>(elements);
             for (u32 i = 0; i < elementsCount; i++)
                 idx[i] = e[i];
@@ -2797,10 +3823,13 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
     }
     if (m_enPolyOffset && m_enDepth)
         pica_depth_map(-1.0f, poly_offset_for_draw(v, idx, idx ? elementsCount : count, prim_type));
+    pica_projective(proj);
+    CRUMB("gfx: tri draw");
     if (idx)
         pica_draw_elements(prim_type, idx, elementsCount);
     else
         pica_draw_arrays(prim_type, 0, count);
+    gtDraw(0);
 }
 
 /* ---- screen-linear shade -------------------------------------------------------------------
@@ -2815,6 +3844,14 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
  * shade error is bounded by that times the largest channel difference between the vertices. */
 const float k_shade_max_error = 1.5f; /* colour levels (of 255) */
 const int k_shade_max_depth = 4;
+/* A piece this small on screen (pixels of the render target, both directions) is not split: the
+ * shade error inside it is a level or two over a few pixels. Without it every floor triangle of
+ * Donkey Kong 64's intro went to 256 pieces (HW: 1 M triangles/s, 60-70 ms/frame, 25% speed). */
+const float k_shade_min_px = 16.0f;
+/* at most this many triangles a frame come out of the subdivision; past it draws go as they are */
+const u32 k_shade_frame_budget = 6000;
+
+struct ShadeView { float hw, hh; }; /* half the viewport in pixels */
 
 inline GVtx screen_midpoint(const GVtx &a, const GVtx &b, bool fog_alpha)
 {
@@ -2836,7 +3873,7 @@ inline GVtx screen_midpoint(const GVtx &a, const GVtx &b, bool fog_alpha)
 
 /* Whether perspective-correct shade can be off by more than k_shade_max_error over the triangle
  * (alpha ignored when it carries the fog factor, which GL interpolates perspective-correctly too). */
-inline bool shade_needs_split(const GVtx &a, const GVtx &b, const GVtx &c, bool fog_alpha)
+inline bool shade_needs_split(const GVtx &a, const GVtx &b, const GVtx &c, bool fog_alpha, const ShadeView &sv)
 {
     const float lo = std::min(a.w, std::min(b.w, c.w)), hi = std::max(a.w, std::max(b.w, c.w));
     if (lo <= 0.0f)
@@ -2846,51 +3883,94 @@ inline bool shade_needs_split(const GVtx &a, const GVtx &b, const GVtx &c, bool 
         const int mn = std::min(a.c[k], std::min(b.c[k], c.c[k])), mx = std::max(a.c[k], std::max(b.c[k], c.c[k]));
         dc = std::max(dc, mx - mn);
     }
-    return dc * (hi - lo) > 2.0f * k_shade_max_error * (hi + lo);
+    if (dc * (hi - lo) <= 2.0f * k_shade_max_error * (hi + lo))
+        return false;
+    const float xa = a.x / a.w * sv.hw, xb = b.x / b.w * sv.hw, xc = c.x / c.w * sv.hw;
+    const float ya = a.y / a.w * sv.hh, yb = b.y / b.w * sv.hh, yc = c.y / c.w * sv.hh;
+    const float ex = std::max(xa, std::max(xb, xc)) - std::min(xa, std::min(xb, xc));
+    const float ey = std::max(ya, std::max(yb, yc)) - std::min(ya, std::min(yb, yc));
+    return ex > k_shade_min_px || ey > k_shade_min_px;
 }
 
-void subdivide_for_shade(const GVtx &a, const GVtx &b, const GVtx &c, int depth, bool fog_alpha,
-                         std::vector<GVtx> &out)
+/* Splits a triangle at its screen-space edge midpoints (recursively, while shade_needs_split):
+ * the pieces share the vertices their parent made (the same
+ * values, so the same pieces in the same order as the flat list); about a third of the vertices
+ * to write, and the GPU's post-vertex cache */
+void subdivide_for_shade_idx(u32 ia, u32 ib, u32 ic, int depth, bool fog_alpha, const ShadeView &sv,
+                             std::vector<GVtx> &ov, std::vector<u16> &oi)
 {
-    if (depth == 0 || !shade_needs_split(a, b, c, fog_alpha)) {
-        out.push_back(a);
-        out.push_back(b);
-        out.push_back(c);
+    const GVtx a = ov[ia], b = ov[ib], c = ov[ic]; /* copies: ov grows below */
+    if (depth == 0 || !shade_needs_split(a, b, c, fog_alpha, sv)) {
+        oi.push_back(u16(ia));
+        oi.push_back(u16(ib));
+        oi.push_back(u16(ic));
         return;
     }
-    const GVtx ab = screen_midpoint(a, b, fog_alpha), bc = screen_midpoint(b, c, fog_alpha),
-               ca = screen_midpoint(c, a, fog_alpha);
-    subdivide_for_shade(a, ab, ca, depth - 1, fog_alpha, out);
-    subdivide_for_shade(ab, b, bc, depth - 1, fog_alpha, out);
-    subdivide_for_shade(ca, bc, c, depth - 1, fog_alpha, out);
-    subdivide_for_shade(ab, bc, ca, depth - 1, fog_alpha, out);
+    const u32 iab = (u32)ov.size();
+    ov.push_back(screen_midpoint(a, b, fog_alpha));
+    ov.push_back(screen_midpoint(b, c, fog_alpha));
+    ov.push_back(screen_midpoint(c, a, fog_alpha));
+    const u32 ibc = iab + 1, ica = iab + 2;
+    subdivide_for_shade_idx(ia, iab, ica, depth - 1, fog_alpha, sv, ov, oi);
+    subdivide_for_shade_idx(iab, ib, ibc, depth - 1, fog_alpha, sv, ov, oi);
+    subdivide_for_shade_idx(ica, ibc, ic, depth - 1, fog_alpha, sv, ov, oi);
+    subdivide_for_shade_idx(iab, ibc, ica, depth - 1, fog_alpha, sv, ov, oi);
 }
 
 /* Replaces v[0..n) (a triangle list) by its subdivision when any triangle needs it; returns the
- * vertex buffer to draw and its count. */
-GVtx *ContextImplPica::linearizeShade(GVtx *v, u32 &n, bool fog_alpha)
+ * vertex buffer to draw and its count, and in idx/nidx the triangles' indices into it (in frame
+ * memory; null when the list is drawn as it is). */
+GVtx *ContextImplPica::linearizeShade(GVtx *v, u32 &n, const u16 *in, u32 nin, bool fog_alpha, u16 *&idx,
+                                      u32 &nidx)
 {
+    idx = nullptr;
+    nidx = 0;
+    const u32 frame = pica_frame_number();
+    if (m_shadeFrame != frame) {
+        m_shadeFrame = frame;
+        m_shadeTris = 0;
+    }
+    if (m_shadeTris >= k_shade_frame_budget)
+        return v;
+    const ShadeView sv{0.5f * m_vp[2], 0.5f * m_vp[3]};
+    /* the triangles: v[0..n) in threes, or v[in[0..nin)] */
+    const u32 nv3 = in ? nin : n;
+    auto at = [&](u32 k) -> const GVtx & { return in ? v[in[k]] : v[k]; };
     bool any = false;
-    for (u32 i = 0; i + 2 < n && !any; i += 3)
-        any = shade_needs_split(v[i], v[i + 1], v[i + 2], fog_alpha);
+    for (u32 i = 0; i + 2 < nv3 && !any; i += 3)
+        any = shade_needs_split(at(i), at(i + 1), at(i + 2), fog_alpha, sv);
     if (!any)
         return v;
-    std::vector<GVtx> &out = m_shadeScratch;
-    out.clear();
-    for (u32 i = 0; i + 2 < n; i += 3) {
-        subdivide_for_shade(v[i], v[i + 1], v[i + 2], k_shade_max_depth, fog_alpha, out);
+    std::vector<GVtx> &ov = m_shadeScratch;
+    std::vector<u16> &oi = m_shadeIdx;
+    ov.clear();
+    oi.clear();
+    for (u32 i = 0; i + 2 < nv3; i += 3) {
+        const u32 base = (u32)ov.size();
+        ov.push_back(at(i));
+        ov.push_back(at(i + 1));
+        ov.push_back(at(i + 2));
+        subdivide_for_shade_idx(base, base + 1, base + 2, k_shade_max_depth, fog_alpha, sv, ov, oi);
+        if (ov.size() > 0xFFFF)
+            break;
     }
-    /* far more than any real draw: drawn as it is (a restarted pool could not hold it, and v
-     * would then point into reused memory) */
-    if (out.size() * sizeof(GVtx) > 1024 * 1024)
+    /* far more than any real draw (as a flat list): drawn as it is (a restarted pool could not
+     * hold it, and v would then point into reused memory) */
+    if (oi.size() * sizeof(GVtx) > 1024 * 1024 || ov.size() > 0xFFFF)
         return v;
-    pica_reserve(512, out.size() * sizeof(GVtx) + 256); /* may restart the pool: v is not used below */
-    GVtx *nv = static_cast<GVtx *>(pica_frame_alloc(out.size() * sizeof(GVtx), 16));
-    if (!nv)
+    /* may restart the pool: v is not used below */
+    pica_reserve(512, ov.size() * sizeof(GVtx) + oi.size() * 2 + 256);
+    GVtx *nv = static_cast<GVtx *>(pica_frame_alloc(ov.size() * sizeof(GVtx), 16));
+    u16 *ni = nv ? static_cast<u16 *>(pica_frame_alloc(oi.size() * 2, 16)) : nullptr;
+    if (!nv || !ni)
         return v;
-    memcpy(nv, out.data(), out.size() * sizeof(GVtx));
-    n = (u32)out.size();
-    ctr64_gfx_stats[ST_SUBDIV] += n / 3;
+    memcpy(nv, ov.data(), ov.size() * sizeof(GVtx));
+    memcpy(ni, oi.data(), oi.size() * 2);
+    n = (u32)ov.size();
+    idx = ni;
+    nidx = (u32)oi.size();
+    ctr64_gfx_stats[ST_SUBDIV] += nidx / 3;
+    m_shadeTris += nidx / 3;
     return nv;
 }
 
@@ -2959,11 +4039,12 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
     }
     if (m_kind == Kind::Copy && copyByTransfer(p)) {
         ctr64_gfx_stats[ST_RECT]++;
+        noteDrawnRows(nullptr, 0); /* rows unknown here: this generation's shadows go stale */
         return;
     }
     if (m_rtLog && p.verticesCount >= 4) { /* rtlog.txt: draws sampling a frame buffer that needs a shadow */
         const Tex *s = tex(m_unit[0]), *d = tex(drawFbo().color);
-        if (s && s->rt && needs_shadow(*s))
+        if (s && ((s->rt && needs_shadow(*s)) || (d && !d->vram)))
             fprintf(m_rtLog, "  S kind %d src %u %ux%u/%ux%u dst %u %ux%u/%ux%u blend %d depth %d sc %d %d,%d,%d,%d vp %d,%d,%d,%d"
                              " v %.3f,%.3f %.3f,%.3f w %.3f st %.4f,%.4f %.4f,%.4f\n",
                     (int)m_kind, (unsigned)m_unit[0], s->w, s->h, s->tw, s->th, (unsigned)drawFbo().color, d ? d->w : 0,
@@ -2972,7 +4053,28 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
                     p.vertices[0].x, p.vertices[0].y, p.vertices[3].x, p.vertices[3].y, p.vertices[0].w,
                     p.vertices[0].s0, p.vertices[0].t0, p.vertices[3].s0, p.vertices[3].t0);
     }
-    if (!setupCombiner(true))
+    for (u32 u = 0; u < 2; u++) { /* the t range per unit, for shadow copies (bindUnit) */
+        float lo = 1e30f, hi = -1e30f;
+        for (u32 i = 0; i < p.verticesCount; i++) {
+            const float tc = u ? p.vertices[i].t1 : p.vertices[i].t0;
+            lo = tc < lo ? tc : lo;
+            hi = tc > hi ? tc : hi;
+        }
+        m_rowT[u][0] = lo;
+        m_rowT[u][1] = hi;
+        lo = 1e30f, hi = -1e30f;
+        for (u32 i = 0; i < p.verticesCount; i++) {
+            const float sc = u ? p.vertices[i].s1 : p.vertices[i].s0;
+            lo = sc < lo ? sc : lo;
+            hi = sc > hi ? sc : hi;
+        }
+        m_rowS[u][0] = lo;
+        m_rowS[u][1] = hi;
+        m_rowHint[u] = true;
+    }
+    const bool combined = setupCombiner(true);
+    m_rowHint[0] = m_rowHint[1] = false;
+    if (!combined)
         return;
     ctr64_gfx_stats[ST_RECT]++;
     pica_reserve(4096, p.verticesCount * sizeof(GVtx) + 256);
@@ -3034,10 +4136,29 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
         log_draw("rect", m_program, (int)m_kind, v, p.verticesCount, m_vp, stateString());
     if (!special)
         noteCoverage(v, p.verticesCount);
+    noteDrawnRows(v, p.verticesCount);
     pica_vertex_buffer(v);
     const u32 mode = u32(p.mode);
     pica_draw_arrays(mode == DM_TRIANGLES ? GPU_TRIANGLES : mode == DM_TRIANGLE_FAN ? GPU_TRIANGLE_FAN : GPU_TRIANGLE_STRIP,
                      0, p.verticesCount);
+    gtDraw(special ? 2 : 1);
+}
+
+/* DEV ONLY (gputime.txt, pica.c): each draw submitted alone, tagged by kind, target memory
+ * (V/F), depth test and blending, so the GPU time per kind of draw shows in stats */
+void ContextImplPica::gtDraw(int kind)
+{
+    if (!pica_gputime)
+        return;
+    static char tags[3][2][2][2][16];
+    static const char *const kinds[3] = {"tri", "rect", "special"};
+    const Tex *c = tex(drawFbo().color);
+    const int f = c && !c->vram, d = m_enDepth ? 1 : 0, b = m_enBlend ? 1 : 0;
+    char *t = tags[kind][f][d][b];
+    if (!t[0])
+        snprintf(t, 16, "%s %s%s%s", kinds[kind], f ? "F" : "V", d ? " z" : "", b ? " b" : "");
+    CRUMB(t);
+    pica_flush();
 }
 
 /* A copy draw of a frame buffer at exactly half size into a tile-aligned rectangle - the window
@@ -3052,6 +4173,7 @@ bool ContextImplPica::copyByTransfer(const Context::DrawRectParameters &p)
 {
     if (!m_xferCopy || p.verticesCount != 4 || m_enBlend || m_enDepth)
         return false;
+    CRUMB("gfx: copyByTransfer");
     Tex *s = tex(m_unit[0]);
     Tex *d = tex(drawFbo().color);
     if (!s || !d || s == d || !s->data || !d->data || s->depth || d->depth || s->fmt != GPU_RGBA8 ||
@@ -3157,7 +4279,10 @@ static void write_tga(const Tex &t0, const char *path)
     void *lin = nullptr;
     if (t0.vram) {
         const u32 bytes = (u32)t0.tw * t0.th * 4;
+        CRUMB("dump: linearAlloc");
         lin = linearAlloc(bytes);
+        if (!lin) /* the linear heap can be full (Goemon with nonpot.txt: 256 KB left): the reserve */
+            lin = ctr64_xlinear_alloc(bytes, 0x80);
         if (!lin)
             return;
         pica_copy_from_vram(lin, t0.data, bytes);
@@ -3167,27 +4292,33 @@ static void write_tga(const Tex &t0, const char *path)
         t.data = lin;
         t.vram = false;
     }
-    FILE *f = fopen(path, "wb");
-    if (!f) {
+    /* built here, written by the profiler's writer thread: SD writes on this thread stopped for
+     * good mid-file after a state load on HW (prof_write_file) */
+    CRUMB("dump: build");
+    const unsigned size = 18 + (unsigned)t.w * t.h * 4;
+    u8 *buf = (u8 *)malloc(size);
+    if (!buf) {
         if (lin)
-            linearFree(lin);
+            if (!ctr64_xlinear_free(lin)) linearFree(lin);
         return;
     }
     const u8 hdr[18] = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, (u8)t.w, (u8)(t.w >> 8), (u8)t.h, (u8)(t.h >> 8), 32, 8};
-    fwrite(hdr, 1, sizeof(hdr), f);
+    memcpy(buf, hdr, sizeof(hdr));
     /* TGA rows are bottom-up like GL rows */
-    std::vector<u8> row(t.w * 4);
-    for (u32 y = 0; y < t.h; y++) {
-        for (u32 x = 0; x < t.w; x++) {
+    u8 *d = buf + 18;
+    for (u32 y = 0; y < t.h; y++)
+        for (u32 x = 0; x < t.w; x++, d += 4) {
             u32 v = load_texel(t, gl_index(x, y, t.tw, t.th));
-            u8 *d = &row[x * 4];
             d[0] = v >> 8; d[1] = v >> 16; d[2] = v >> 24; d[3] = v; /* BGRA */
         }
-        fwrite(row.data(), 1, row.size(), f);
-    }
-    fclose(f);
+    CRUMB("dump: hand over");
+    if (!prof_write_file(path, buf, size))
+        free(buf);
+    CRUMB("dump: flush");
+    prof_files_flush(3000);
+    CRUMB("dump: done");
     if (lin)
-        linearFree(lin);
+        if (!ctr64_xlinear_free(lin)) linearFree(lin);
 }
 
 void ContextImplPica::present()
@@ -3252,6 +4383,19 @@ void ContextImplPica::endVI()
         char path[64];
         snprintf(path, sizeof(path), "sdmc:/3ds/ctr64/frame_%u.tga", (unsigned)vi);
         write_tga(*c, path);
+        { /* the top screen buffer transferred last, as the LCD shows it (BGR8, 240x400 columns):
+           * frame_<n>_top.raw; tools/remote ctr64remote.py lcd_png converts it */
+            unsigned bytes = 0;
+            if (const void *top = pica_top_latest(&bytes)) {
+                if (u8 *b = static_cast<u8 *>(malloc(bytes))) {
+                    memcpy(b, top, bytes);
+                    snprintf(path, sizeof(path), "sdmc:/3ds/ctr64/frame_%u_top.raw", (unsigned)vi);
+                    if (!prof_write_file(path, b, bytes))
+                        free(b);
+                    prof_files_flush(3000);
+                }
+            }
+        }
         static int with_fbos = -1; /* sdmc:/3ds/ctr64/dumpfbo.txt: also dump every FBO */
         if (with_fbos < 0) {
             FILE *f = fopen("sdmc:/3ds/ctr64/dumpfbo.txt", "r");
@@ -3407,6 +4551,7 @@ bool AsyncReadback::reserve(size_t need)
 void AsyncReadback::finish()
 {
     if (pending) {
+        CRUMB("gfx: readback finish");
         pica_wait_fence(fence);
         pica_cache_invalidate(lin, (u32)read_bytes(job));
         pending = false;
@@ -3435,6 +4580,7 @@ const u8 *ContextImplPica::readTextureAsync(CachedTexture *ct, s32 x0, s32 y0, u
         return readTexture(ct, x0, y0, w, h, out);
     }
     ctr64_fb_copies++;
+    ctr64_gfx_fb_reads[t->vram ? 0 : 1]++;
     const u8 *result = nullptr;
     if (a.pending || a.valid) {
         a.finish();
@@ -3460,6 +4606,7 @@ const u8 *ContextImplPica::readTextureAsync(CachedTexture *ct, s32 x0, s32 y0, u
 const u8 *ContextImplPica::readTexture(CachedTexture *ct, s32 x0, s32 y0, u32 w, u32 h, std::vector<u8> &out)
 {
     CTR64_PROF(19);
+    CRUMB("gfx: readTexture");
     ctr64_fb_copies++;
     Tex *t = ct ? tex(u32(ct->name)) : nullptr;
     const bool rgba16 = g_ctr64ReadRgba16;

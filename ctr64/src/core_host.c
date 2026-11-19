@@ -338,13 +338,17 @@ static int16_t RETRO_CALLCONV input_state(unsigned port, unsigned device, unsign
         u32 used = 0;
         for (int i = 0; i < IN_COUNT; i++)
             used |= m[i];
+        /* swap_dpad: the Circle Pad (pushed past the system's threshold) is the N64 D-pad */
+        const bool sw = g_settings.swap_dpad;
         const struct { unsigned id; u32 key; } map[] = {
             {RETRO_DEVICE_ID_JOYPAD_B, m[IN_A]},     {RETRO_DEVICE_ID_JOYPAD_Y, m[IN_B]},
             {RETRO_DEVICE_ID_JOYPAD_L2, m[IN_Z]},
             {RETRO_DEVICE_ID_JOYPAD_L, m[IN_L]},     {RETRO_DEVICE_ID_JOYPAD_R, m[IN_R]},
             {RETRO_DEVICE_ID_JOYPAD_START, m[IN_START]},
-            {RETRO_DEVICE_ID_JOYPAD_UP, KEY_DUP & ~used},     {RETRO_DEVICE_ID_JOYPAD_DOWN, KEY_DDOWN & ~used},
-            {RETRO_DEVICE_ID_JOYPAD_LEFT, KEY_DLEFT & ~used}, {RETRO_DEVICE_ID_JOYPAD_RIGHT, KEY_DRIGHT & ~used},
+            {RETRO_DEVICE_ID_JOYPAD_UP, sw ? KEY_CPAD_UP : KEY_DUP & ~used},
+            {RETRO_DEVICE_ID_JOYPAD_DOWN, sw ? KEY_CPAD_DOWN : KEY_DDOWN & ~used},
+            {RETRO_DEVICE_ID_JOYPAD_LEFT, sw ? KEY_CPAD_LEFT : KEY_DLEFT & ~used},
+            {RETRO_DEVICE_ID_JOYPAD_RIGHT, sw ? KEY_CPAD_RIGHT : KEY_DRIGHT & ~used},
         };
         if (id == RETRO_DEVICE_ID_JOYPAD_MASK) {
             int16_t mask = 0;
@@ -361,7 +365,18 @@ static int16_t RETRO_CALLCONV input_state(unsigned port, unsigned device, unsign
     if ((device & RETRO_DEVICE_MASK) == RETRO_DEVICE_ANALOG) {
         if (index == RETRO_DEVICE_INDEX_ANALOG_LEFT) {
             circlePosition c;
-            hidCircleRead(&c);
+            if (g_settings.swap_dpad) {
+                /* swap_dpad: the 3DS D-pad (directions not mapped to N64 buttons) is the stick,
+                 * at the deflection of the Circle Pad's edge */
+                u32 used = 0;
+                for (int i = 0; i < IN_COUNT; i++)
+                    used |= m[i];
+                const u32 d = k & ~used;
+                c.dx = (s16)(((d & KEY_DRIGHT) ? 150 : 0) - ((d & KEY_DLEFT) ? 150 : 0));
+                c.dy = (s16)(((d & KEY_DUP) ? 150 : 0) - ((d & KEY_DDOWN) ? 150 : 0));
+            } else {
+                hidCircleRead(&c);
+            }
             int v = id == RETRO_DEVICE_ID_ANALOG_X ? c.dx : -c.dy;
             v = v * 32767 * g_settings.stick_range / (150 * 100);
             return v > 32767 ? 32767 : v < -32767 ? -32767 : (int16_t)v;
@@ -387,6 +402,11 @@ static int16_t RETRO_CALLCONV input_state(unsigned port, unsigned device, unsign
 }
 
 /* ---- lifecycle --------------------------------------------------------------------------------- */
+
+const char *core_host_rom_id(void)
+{
+    return H.rom_id;
+}
 
 bool core_host_init(const char *data_dir)
 {
@@ -547,7 +567,10 @@ static void srm_flush(bool sync)
     memcpy(H.srm_shadow, mem, size); /* the copy being written (unchanged until the write ends) */
     if (!sync) {
         g_srm_busy = true;
-        g_srm_thread = threadCreate(srm_thread, NULL, 8 * 1024, 0x3F, 1, false);
+        extern int ctr64_core1_ready(void);
+        /* core 1 only with CPU time there (a refused thread kept a slot of the app's thread
+         * limit on hardware, see prof.c start_writer) */
+        g_srm_thread = ctr64_core1_ready() ? threadCreate(srm_thread, NULL, 8 * 1024, 0x3F, 1, false) : NULL;
         if (!g_srm_thread)
             g_srm_thread = threadCreate(srm_thread, NULL, 8 * 1024, 0x3F, -2, false);
         if (g_srm_thread)
@@ -646,10 +669,16 @@ bool core_host_load(const char *rom_path)
         if (!data)
             return false;
     } else {
-        if (fread(data, 1, size, f) != (size_t)size) {
-            fclose(f);
-            free(data);
-            return false;
+        /* in 1 MB pieces: one 64 MB read (Conker, 178 MB mode) crashed the system's fs process
+         * (Luma dump: kernel abort in fs); 32 MB reads were fine */
+        for (long done = 0; done < size;) {
+            const size_t n = size - done < (1 << 20) ? (size_t)(size - done) : (size_t)(1 << 20);
+            if (fread((u8 *)data + done, 1, n, f) != n) {
+                fclose(f);
+                free(data);
+                return false;
+            }
+            done += (long)n;
         }
         fclose(f);
     }
@@ -839,6 +868,11 @@ static void state_path(int slot, char *out, size_t n)
     snprintf(out, n, "%s/states/%s.state%d", H.data_dir, H.rom_base, slot);
 }
 
+void core_host_state_path(int slot, char *out, size_t n)
+{
+    state_path(slot, out, n);
+}
+
 bool core_host_state_exists(int slot)
 {
     char path[400];
@@ -852,6 +886,14 @@ bool core_host_save_state(int slot)
     char path[400], tmp[410];
     if (!H.loaded)
         return false;
+    /* not while the CPU is still writing a display list the RSP waits on (rsp_core.c): run on,
+     * a few frames at most (Gauntlet Legends: usually the next one) */
+    extern int ctr64_rsp_task_locked(void);
+    int waited = 0;
+    while (ctr64_rsp_task_locked() && waited < 300) {
+        core_host_run_frame();
+        waited++;
+    }
     state_path(slot, path, sizeof(path));
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     g_put_file = fopen(tmp, "wb");
@@ -872,7 +914,7 @@ bool core_host_save_state(int slot)
     }
     prof_mark("save state %d", slot);
     if (H.log) {
-        fprintf(H.log, "save state %d: %s\n", slot, g_put_ok ? "written" : "FAILED");
+        fprintf(H.log, "save state %d: %s (%d frames run on first)\n", slot, g_put_ok ? "written" : "FAILED", waited);
         fflush(H.log);
     }
     return g_put_ok;
@@ -928,6 +970,10 @@ void core_host_unload(void)
     core_host_rb_save();
     free(H.srm_shadow);
     H.srm_shadow = NULL;
+    {
+        extern void ctr_jit_thread_stop(void);
+        ctr_jit_thread_stop();
+    }
     retro_unload_game();
     ctr64_gfx_async_stop();
     ctr64_audio_async_stop();

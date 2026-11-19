@@ -8,6 +8,8 @@ extern "C" {
 #endif
 
 extern const char *volatile ctr64_crumb;
+extern const char *volatile ctr64_gcrumb; /* the video worker's own (the main thread overwrites ctr64_crumb) */
+extern void *volatile ctr64_gret[2];     /* return addresses of the last backend calls with a crumb: [0] newest */
 
 #ifdef __cplusplus
 }

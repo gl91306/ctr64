@@ -46,6 +46,11 @@ struct Program {
     bool uses_half = false; /* texture unit 2 must sample the constant 0.5 texture */
     bool uses_shade = false;
     bool lossy = false; /* something had to be approximated (diagnostics) */
+    /* 2-cycle: first stage of cycle 2 (-1: one cycle), and whether cycle 2 computes an alpha
+     * other than cycle 1's. GLideN64's alpha compare tests cycle 1's alpha (alpha1), the PICA's
+     * the TEV output: setupCombiner passes alpha1 through cycle 2 when that matters. */
+    s8 cycle2_first = -1;
+    bool alpha2_differs = false;
 };
 
 /* Compiles the combiner for `mux` in `cycle_type` (G_CYC_*), with GLideN64's parameter

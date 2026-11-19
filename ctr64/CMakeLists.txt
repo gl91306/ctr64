@@ -15,6 +15,7 @@ add_executable(ctr64
   src/main.c
   src/prof.c
   src/bench.c
+  src/remote.c
   src/memcpy_prof.c
   src/crash.c
   src/frameskip.c

@@ -39,6 +39,38 @@ static void cpu_benches(void)
     g_sink = x;
     report("cpu_alu", svcGetSystemTick() - t0, 4000000, "iterations");
 
+    /* the profiler's clock: one kernel call per read (two per CTR64_PROF scope) */
+    t0 = svcGetSystemTick();
+    u64 acc = 0;
+    for (u32 i = 0; i < 100000; i++)
+        acc += svcGetSystemTick();
+    g_sink = (u32)acc;
+    report("cpu_systemtick", svcGetSystemTick() - t0, 100000, "reads");
+
+    {   /* GLideN64's Conker vertex path (gSP.cpp): generic 1 and 4 at a time, and the fast path;
+         * the video thread is drained first (the bench borrows the gSP state) */
+        extern void ctr64_gfx_drain(void);
+        extern int ctr64_bench_cbfd(unsigned long long ticks[3], unsigned reps);
+        ctr64_gfx_drain();
+        unsigned long long t[3];
+        const unsigned reps = 300; /* 32 vertices each */
+        const int same = ctr64_bench_cbfd(t, reps);
+        report("vtx_cbfd_generic1", t[0], reps * 32.0, "vertices");
+        report("vtx_cbfd_generic4", t[1], reps * 32.0, "vertices");
+        report(same ? "vtx_cbfd_fast_same" : "vtx_cbfd_fast_DIFFERENT", t[2], reps * 32.0, "vertices");
+    }
+    {   /* GLideN64's standard vertex path (gSP.cpp): generic 4 at a time against the fast path,
+         * unlit and lit (2 lights) */
+        extern int ctr64_bench_std(unsigned long long ticks[4], unsigned reps);
+        unsigned long long t[4];
+        const unsigned reps = 300;
+        const int same = ctr64_bench_std(t, reps);
+        report("vtx_std_generic_unlit", t[0], reps * 32.0, "vertices");
+        report("vtx_std_fast_unlit", t[1], reps * 32.0, "vertices");
+        report("vtx_std_generic_lit", t[2], reps * 32.0, "vertices");
+        report(same ? "vtx_std_fast_lit_same" : "vtx_std_fast_lit_DIFFERENT", t[3], reps * 32.0, "vertices");
+    }
+
     const u32 mb = 1024 * 1024;
     u8 *a = malloc(2 * mb);
     if (a) {
@@ -206,6 +238,18 @@ static void gpu_benches(void)
         quads(32);
         report("gpu_draw_blend_vram", gpu_run(), frags, "fragments");
         pica_blend_off();
+        {   /* opaque with the framebuffer reads off (PICA200 report V.1): what skipping them saves */
+            const u32 noread[4] = {0, 0xF, 0, 0};
+            pica_fb_access(noread);
+            quads(32);
+            report("gpu_draw_flat_vram_noread", gpu_run(), frags, "fragments");
+            const u32 nodepth[4] = {0xF, 0xF, 0, 0};
+            pica_fb_access(nodepth);
+            quads(32);
+            report("gpu_draw_flat_vram_nodepth", gpu_run(), frags, "fragments");
+            const u32 all[4] = {0xF, 0xF, 0x3, 0x3};
+            pica_fb_access(all);
+        }
         pica_depth_test(true, GPU_LESS, GPU_WRITE_ALL);
         quads(32);
         report("gpu_draw_depth_vram", gpu_run(), frags, "fragments");
@@ -248,6 +292,44 @@ static void gpu_benches(void)
             for (int i = 0; i < 8; i++)
                 video_batch_draw(&b);
             report("gpu_vertices", gpu_run(), 8.0 * 3 * 4000, "vertices");
+            /* the same vertices read from VRAM: is the vertex cost the FCRAM fetch? */
+            const u32 vb = (u32)sizeof(VideoVertex) * 3 * 4000;
+            void *vv = vramAlloc((vb + 15) & ~15u);
+            if (vv) {
+                pica_copy(vv, b.v, (vb + 15) & ~15u);
+                pica_wait_idle(); /* the copy is not part of the time */
+                pica_vertex_buffer(vv);
+                for (int i = 0; i < 8; i++)
+                    pica_draw_arrays(GPU_TRIANGLES, 0, 3 * 4000);
+                report("gpu_vertices_vram", gpu_run(), 8.0 * 3 * 4000, "vertices");
+            }
+            frame_close();
+            if (vv)
+                vramFree(vv);
+        } else {
+            frame_close();
+        }
+        /* indexed: 4000 one-pixel-high triangles as 2000 quads sharing their edge vertices (2002
+         * vertices, 12000 indices); the post-vertex cache serves the repeats */
+        pica_frame_begin();
+        state_2d(&tv, proj, NULL, GPU_RGBA8);
+        VideoBatch g;
+        u16 *ix = NULL;
+        if (video_batch_begin(&g, 2 * 2001) && (ix = pica_frame_alloc(12000 * 2, 16))) {
+            for (int k = 0; k <= 2000; k++) {
+                const float x = (float)(k % 250), y = (float)(2 * (k / 250));
+                video_batch_vertex(&g, x, y, 0xFFFFFF, 0, 0);
+                video_batch_vertex(&g, x, y + 1, 0xFFFFFF, 0, 0);
+            }
+            for (int k = 0; k < 2000; k++) {
+                u16 *q = ix + 6 * k, v = (u16)(2 * k);
+                q[0] = v; q[1] = v + 1; q[2] = v + 2;
+                q[3] = v + 1; q[4] = v + 3; q[5] = v + 2;
+            }
+            pica_vertex_buffer(g.v);
+            for (int i = 0; i < 8; i++)
+                pica_draw_elements(GPU_TRIANGLES, ix, 12000);
+            report("gpu_vertices_indexed", gpu_run(), 8.0 * 12000, "indices");
         }
         frame_close();
     }

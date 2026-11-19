@@ -51,6 +51,7 @@ void video_draw_to_screen(const void *tex, u16 tw, u16 th, GPU_TEXCOLOR fmt, u16
 
 /* Like video_draw_to_screen, but stretched over the whole 400x240 screen (the caller already
  * laid out the image, e.g. GLideN64's window buffer). */
+void video_clear_draw(const PicaTarget *t, u32 rgba); /* a color target cleared by a quad (FCRAM) */
 void video_draw_fullscreen(const void *tex, u16 tw, u16 th, GPU_TEXCOLOR fmt, u16 w, u16 h,
                            bool top_is_t0, bool linear);
 

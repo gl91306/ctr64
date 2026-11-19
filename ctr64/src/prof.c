@@ -111,6 +111,59 @@ static void write_shot(void)
     g_shot_vi = 0;
 }
 
+/* Whole files handed over by other threads (frame dumps of the video thread: written there, the
+ * write stopped for good mid-file after a state load on HW, freezing the game, while this thread
+ * kept writing stats.log; 2026-11-18, Kirby 64 / earlier test hangs) */
+#define FILEQ 4
+static struct { char path[96]; void *data; unsigned size; } g_fq[FILEQ];
+static volatile unsigned g_fq_put, g_fq_got;
+
+static void write_files(void)
+{
+    while (g_fq_got != g_fq_put) {
+        __sync_synchronize();
+        const unsigned i = g_fq_got % FILEQ;
+        FILE *f = fopen(g_fq[i].path, "wb");
+        if (f) {
+            fwrite(g_fq[i].data, 1, g_fq[i].size, f);
+            fclose(f);
+        }
+        free(g_fq[i].data);
+        __sync_synchronize();
+        g_fq_got++;
+    }
+}
+
+bool prof_write_file(const char *path, void *data, unsigned size)
+{
+    if (!g_thread || g_quit)
+        return false;
+    for (int n = 0; g_fq_put - g_fq_got >= FILEQ; n++) {
+        if (n > 1000) /* 10 s */
+            return false;
+        LightEvent_Signal(&g_wake);
+        svcSleepThread(10000000LL);
+    }
+    const unsigned i = g_fq_put % FILEQ;
+    snprintf(g_fq[i].path, sizeof(g_fq[i].path), "%s", path);
+    g_fq[i].data = data;
+    g_fq[i].size = size;
+    __sync_synchronize();
+    g_fq_put++;
+    LightEvent_Signal(&g_wake);
+    return true;
+}
+
+/* waits (at most ms) until the files handed over are written: the writer has the lowest
+ * priority and starved in Azahar runs without the speed limit (frame dumps lost at exit) */
+void prof_files_flush(unsigned ms)
+{
+    for (unsigned n = 0; g_thread && g_fq_got != g_fq_put && n < ms / 5; n++) {
+        LightEvent_Signal(&g_wake);
+        svcSleepThread(5000000LL);
+    }
+}
+
 static void writer(void *arg)
 {
     (void)arg;
@@ -118,9 +171,11 @@ static void writer(void *arg)
         LightEvent_WaitTimeout(&g_wake, 500000000LL);
         write_out();
         write_shot();
+        write_files();
     }
     write_out();
     write_shot();
+    write_files();
 }
 
 bool prof_shot_ready(void)
@@ -195,8 +250,12 @@ static void start_writer(void)
     g_quit = false;
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    /* the lowest priority; core 1 (the compile thread's) */
-    g_thread = threadCreate(writer, NULL, 16 * 1024, 0x3F, 1, false);
+    /* the lowest priority; core 1 (the compile thread's) once the app has CPU time there: a
+     * thread asked for on core 1 before that is refused, and on hardware every refused request
+     * kept one thread of the app's limit of 32 until the console was switched off (+1 per game
+     * launch; after ~25 launches the video thread could not start) */
+    extern int ctr64_core1_ready(void);
+    g_thread = ctr64_core1_ready() ? threadCreate(writer, NULL, 16 * 1024, 0x3F, 1, false) : NULL;
     if (!g_thread)
         g_thread = threadCreate(writer, NULL, 16 * 1024, 0x3F, -2, false);
 }
@@ -236,9 +295,16 @@ bool prof_begin(const char *rom_path)
             *c = '_';
     time_t now = time(NULL);
     struct tm *tm = gmtime(&now); /* the 3DS clock is local time, kept as UTC by libctru */
+    /* each session in its own folder: creating a file in a FAT folder scans all its entries, and
+     * with hundreds of screenshots in one folder that blocked the SD card for seconds, stalling the
+     * ROM streaming of big games (Conker: 64 KB reads of up to 3 s while profiling) */
+    char session[200];
+    snprintf(session, sizeof(session), "%s %04d-%02d-%02d %02d.%02d.%02d", name, tm->tm_year + 1900, tm->tm_mon + 1,
+             tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
     char path[256];
-    snprintf(path, sizeof(path), DIR_PATH "/%s %04d-%02d-%02d %02d.%02d.%02d.prof", name, tm->tm_year + 1900,
-             tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+    snprintf(path, sizeof(path), DIR_PATH "/%s", session);
+    mkdir(path, 0777);
+    snprintf(path, sizeof(path), DIR_PATH "/%s/%s.prof", session, session);
     g_file = fopen(path, "w");
     if (!g_file)
         return false;

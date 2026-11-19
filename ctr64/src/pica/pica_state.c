@@ -34,10 +34,17 @@ static struct {
     u32 tex_units; /* enabled-unit bits */
     bool tex_valid[3];
 
+    u32 access[4]; /* framebuffer color read/write, depth read/write (0x112-0x115) */
     u32 depth_color, depth_scale, depth_offset;
     u32 cull, alpha_test, blend_func, blend_color;
     bool effect_valid;
+
+    /* projective draws (pica_projective): requested for the next draw; what the shader's bool
+     * uniform and texture unit 0's mode are set to */
+    bool proj_req, proj_bool, proj_tex;
 } S;
+
+int pica_proj_bool_bit = -1; /* the vertex shader's "proj" bool uniform (pica_projective) */
 
 /* ---- reset / framebuffer ------------------------------------------------------------------ */
 
@@ -117,6 +124,25 @@ void pica_bind_target(const PicaTarget *t)
     p[0] = p[1] = 0xF;          /* color read / write */
     p[2] = p[3] = depth_mask;   /* depth read / write */
     GPUCMD_AddIncrementalWrites(GPUREG_COLORBUFFER_READ, p, 4);
+    memcpy(S.access, p, sizeof(S.access));
+}
+
+/* Framebuffer access (0x112-0x115) for the following draws; bench.c only. Switching the color
+ * read off is 22% cheaper per fragment on hardware (bench gpu_draw_flat_vram_noread), but the GPU
+ * then writes whole 8x8 tiles: pixels a draw does not cover in a tile it touches become garbage
+ * (hardware self-test 2026-11-16: 286 color and 947 depth words wrong in a 64x64 scene). So
+ * games keep everything on. A change flushes the framebuffer cache first. */
+void pica_fb_access(const u32 a[4])
+{
+    if (!memcmp(a, S.access, sizeof(S.access)))
+        return;
+    if (S.drawn) { /* tiles cached under the old access mode go out first */
+        GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_FLUSH, 1);
+        GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_INVALIDATE, 1);
+        S.drawn = false;
+    }
+    memcpy(S.access, a, sizeof(S.access));
+    GPUCMD_AddIncrementalWrites(GPUREG_COLORBUFFER_READ, (u32 *)a, 4);
 }
 
 void pica_viewport(u16 x, u16 y, u16 w, u16 h)
@@ -174,6 +200,7 @@ void pica_bind_program(shaderProgram_s *prog)
     S.program = prog;
     shaderProgramConfigure(prog, true, true);
     upload_shader_constants(prog->vertexShader);
+    S.proj_bool = false; /* the program's own bool uniforms (proj off) were written */
     S.layout_dirty = true; /* input configuration must follow the program */
 }
 
@@ -241,8 +268,29 @@ void pica_vertex_buffer(const void *data)
     S.vbo_offset = off;
 }
 
+void pica_projective(bool on)
+{
+    S.proj_req = on && pica_proj_bool_bit >= 0;
+}
+
 void pica_state_prepare_draw(void)
 {
+    /* projective draw: the shader divides by w (screen-linear colours) and texture unit 0
+     * divides its coordinates per pixel (texcoord0w); one draw only */
+    if (S.proj_req != S.proj_bool) {
+        const shaderInstance_s *si = S.program ? S.program->vertexShader : NULL;
+        u32 b = si ? (si->boolUniforms & si->boolUniformMask) : 0;
+        if (S.proj_req)
+            b |= BIT(pica_proj_bool_bit);
+        GPUCMD_AddWrite(GPUREG_VSH_BOOLUNIFORM, 0x7FFF0000 | b);
+        S.proj_bool = S.proj_req;
+    }
+    if (S.tex_valid[0] && S.proj_req != S.proj_tex) {
+        S.tex[0][2] = (S.tex[0][2] & ~GPU_TEXTURE_MODE(7)) | (S.proj_req ? GPU_TEXTURE_MODE(GPU_TEX_PROJECTION) : 0);
+        GPUCMD_AddWrite(GPUREG_TEXUNIT0_PARAM, S.tex[0][2]);
+        S.proj_tex = S.proj_req;
+    }
+    S.proj_req = false;
     if (S.layout_dirty) {
         GPUCMD_AddIncrementalWrites(GPUREG_ATTRIBBUFFERS_FORMAT_LOW, S.attr_format, 2);
         GPUCMD_AddMaskedWrite(GPUREG_VSH_INPUTBUFFER_CONFIG, 0xB, 0xA0000000u | (S.attr_count - 1));
@@ -343,6 +391,8 @@ void pica_texture(int unit, const void *data, u16 width, u16 height, GPU_TEXCOLO
         S.tex_valid[unit] = true;
         GPUCMD_AddIncrementalWrites(base_reg[unit], r, 5);
         GPUCMD_AddWrite(type_reg[unit], fmt);
+        if (unit == 0)
+            S.proj_tex = false; /* written with the caller's (2D) mode */
     }
     units |= BIT(unit);
     if (changed || units != S.tex_units) {
@@ -423,8 +473,70 @@ void pica_blend_color(u32 rgba)
 
 /* ---- draws -------------------------------------------------------------------------------------- */
 
+/* DEV hang diagnosis: the last draws, dumped by pica_debug_dump when the GPU stops */
+typedef struct {
+    u32 seq, vi, prim, n, vbo, ibo, maxi, cmdw, proj, tex0;
+} DrawRec;
+static DrawRec g_dr[32];
+static u32 g_dr_seq;
+unsigned pica_bad_offsets; /* buffer offsets the GPU's 28-bit fields cannot hold */
+static void note_draw(u32 prim, u32 n, u32 ibo, u32 maxi)
+{
+    extern unsigned ctr64_vi_count;
+    DrawRec *r = &g_dr[g_dr_seq & 31];
+    r->seq = g_dr_seq++;
+    r->vi = ctr64_vi_count;
+    r->prim = prim;
+    r->n = n;
+    r->vbo = S.vbo_offset;
+    r->ibo = ibo;
+    r->maxi = maxi;
+    r->cmdw = gpuCmdBufOffset;
+    r->proj = S.proj_bool;
+    r->tex0 = S.tex[0][2];
+    if (S.vbo_offset >= 0x10000000u || ibo >= 0x10000000u)
+        pica_bad_offsets++;
+}
+
+void pica_state_debug(FILE *f)
+{
+    fprintf(f, "draws %lu bad offsets %u; last (seq vi prim n vbo ibo maxi cmdw proj tex0):\n",
+            (unsigned long)g_dr_seq, pica_bad_offsets);
+    for (u32 i = 0; i < 32; i++) {
+        const DrawRec *r = &g_dr[(g_dr_seq + i) & 31];
+        if (r->seq || r->n)
+            fprintf(f, "  %lu %lu %lu %lu %08lx %08lx %lu %lu %lu %08lx\n", (unsigned long)r->seq,
+                    (unsigned long)r->vi, (unsigned long)r->prim, (unsigned long)r->n, (unsigned long)r->vbo,
+                    (unsigned long)r->ibo, (unsigned long)r->maxi, (unsigned long)r->cmdw,
+                    (unsigned long)r->proj, (unsigned long)r->tex0);
+    }
+}
+
+/* Plain vertex lists are drawn as indexed draws through a fixed 0, 1, 2... index buffer, so the
+ * GPU never switches between array and indexed mode. Mixing both (indexed triangle lists with
+ * plain clipped lists / rectangles) hung the hardware GPU now and then (Mario Kart 64 at its
+ * first frames, 2026-11-18; never in Azahar). Dev switch directarrays.txt: real array draws. */
+bool pica_direct_arrays;
+static u16 *g_seq_idx;
+
 void pica_draw_arrays(GPU_Primitive_t prim, u32 first, u32 count)
 {
+    if (!count)
+        return; /* the hardware GPU hangs on a draw of 0 vertices (Azahar does not) */
+    if (!pica_direct_arrays && first + count <= 0x10000) {
+        if (!g_seq_idx) {
+            g_seq_idx = linearMemAlign(0x10000 * 2, 16);
+            if (g_seq_idx) {
+                for (u32 i = 0; i < 0x10000; i++)
+                    g_seq_idx[i] = (u16)i;
+                GSPGPU_FlushDataCache(g_seq_idx, 0x10000 * 2);
+            }
+        }
+        if (g_seq_idx) {
+            pica_draw_elements(prim, g_seq_idx + first, count);
+            return;
+        }
+    }
     pica_state_prepare_draw();
     GPUCMD_AddMaskedWrite(GPUREG_PRIMITIVE_CONFIG, 2, prim);
     GPUCMD_AddWrite(GPUREG_RESTART_PRIMITIVE, 1);
@@ -437,10 +549,13 @@ void pica_draw_arrays(GPU_Primitive_t prim, u32 first, u32 count)
     GPUCMD_AddMaskedWrite(GPUREG_START_DRAW_FUNC0, 1, 1);
     GPUCMD_AddMaskedWrite(GPUREG_GEOSTAGE_CONFIG2, 1, 0);
     GPUCMD_AddWrite(GPUREG_VTX_FUNC, 1); /* clear the post-vertex cache */
+    note_draw(prim, count, 0xFFFFFFFFu, first + count - 1);
 }
 
 void pica_draw_elements(GPU_Primitive_t prim, const u16 *indices, u32 count)
 {
+    if (!count)
+        return; /* as pica_draw_arrays */
     u32 off = osConvertVirtToPhys(indices) - PICA_BUFFER_BASE_PADDR;
     bool tris = prim == GPU_TRIANGLES;
 
@@ -462,6 +577,129 @@ void pica_draw_elements(GPU_Primitive_t prim, const u16 *indices, u32 count)
         GPUCMD_AddMaskedWrite(GPUREG_GEOSTAGE_CONFIG2, 2, 0);
     }
     GPUCMD_AddWrite(GPUREG_VTX_FUNC, 1);
+    /* written twice, as citro3d does (C3D_DrawElements): a single write after an indexed draw
+     * is suspected of leaving the GPU in indexed mode now and then, which hangs the next
+     * non-indexed draw (hardware: hangs at the first frame after a state load, 2026-11-18) */
     GPUCMD_AddMaskedWrite(GPUREG_PRIMITIVE_CONFIG, 0x8, 0);
     GPUCMD_AddMaskedWrite(GPUREG_PRIMITIVE_CONFIG, 0x8, 0);
+    u32 maxi = 0;
+    for (u32 i = 0; i < count; i++)
+        if (indices[i] > maxi)
+            maxi = indices[i];
+    note_draw(prim, count, off, maxi);
+}
+
+/* ---- save / restore ---------------------------------------------------------------------------- */
+
+/* A draw slipped in between a draw's state setup and the draw itself (the shadow copies of
+ * ContextImplPica::shadowDraw): pica_state_save() before it, pica_state_restore() after it puts
+ * back every register this layer shadows the way it was (the slipped-in draw goes out of the
+ * framebuffer cache first). Vertex shader uniforms are not shadowed: the slipped-in draw must not
+ * change them (same program, no uniform writes). */
+static __typeof__(S) Ssave;
+
+void pica_state_save(void)
+{
+    Ssave = S;
+}
+
+void pica_state_restore(void)
+{
+    /* target first: switching flushes what was drawn into the other one */
+    if (Ssave.target_valid) {
+        pica_bind_target(&Ssave.target);
+    } else {
+        pica_state_flush_framebuffer();
+        S.target_valid = false;
+    }
+    if (memcmp(S.access, Ssave.access, sizeof(S.access))) {
+        pica_state_flush_framebuffer();
+        memcpy(S.access, Ssave.access, sizeof(S.access));
+        GPUCMD_AddIncrementalWrites(GPUREG_COLORBUFFER_READ, S.access, 4);
+    }
+
+    if (Ssave.viewport_valid && (!S.viewport_valid || memcmp(S.viewport, Ssave.viewport, sizeof(S.viewport)))) {
+        GPUCMD_AddIncrementalWrites(GPUREG_VIEWPORT_WIDTH, Ssave.viewport, 4);
+        GPUCMD_AddWrite(GPUREG_VIEWPORT_XY, Ssave.viewport[4]);
+    }
+    memcpy(S.viewport, Ssave.viewport, sizeof(S.viewport));
+    S.viewport_valid = Ssave.viewport_valid;
+    if (Ssave.scissor_valid && (!S.scissor_valid || memcmp(S.scissor, Ssave.scissor, sizeof(S.scissor))))
+        GPUCMD_AddIncrementalWrites(GPUREG_SCISSORTEST_MODE, Ssave.scissor, 3);
+    memcpy(S.scissor, Ssave.scissor, sizeof(S.scissor));
+    S.scissor_valid = Ssave.scissor_valid;
+
+    if (Ssave.program && Ssave.program != S.program)
+        pica_bind_program(Ssave.program);
+
+    /* vertex input: written again at the next draw */
+    memcpy(S.attr_format, Ssave.attr_format, sizeof(S.attr_format));
+    S.attr_perm = Ssave.attr_perm;
+    S.attr_count = Ssave.attr_count;
+    S.stride = Ssave.stride;
+    S.vbo_offset = Ssave.vbo_offset;
+    S.layout_dirty = S.buffer_dirty = true;
+
+    for (int i = 0; i < 6; i++) {
+        if (Ssave.tev_valid[i] && (!S.tev_valid[i] || memcmp(S.tev[i], Ssave.tev[i], sizeof(S.tev[i])))) {
+            const int slot = i < 4 ? i : i + 2;
+            GPUCMD_AddIncrementalWrites(GPUREG_TEXENV0_SOURCE + slot * 8, Ssave.tev[i], 5);
+        }
+        memcpy(S.tev[i], Ssave.tev[i], sizeof(S.tev[i]));
+        S.tev_valid[i] = Ssave.tev_valid[i];
+    }
+    if (Ssave.tev_buffer_valid &&
+        (!S.tev_buffer_valid || memcmp(S.tev_buffer, Ssave.tev_buffer, sizeof(S.tev_buffer)))) {
+        GPUCMD_AddMaskedWrite(GPUREG_TEXENV_UPDATE_BUFFER, 0x7, Ssave.tev_buffer[0]);
+        GPUCMD_AddWrite(GPUREG_TEXENV_BUFFER_COLOR, Ssave.tev_buffer[1]);
+    }
+    memcpy(S.tev_buffer, Ssave.tev_buffer, sizeof(S.tev_buffer));
+    S.tev_buffer_valid = Ssave.tev_buffer_valid;
+
+    static const u16 base_reg[3] = {GPUREG_TEXUNIT0_BORDER_COLOR, GPUREG_TEXUNIT1_BORDER_COLOR,
+                                    GPUREG_TEXUNIT2_BORDER_COLOR};
+    static const u16 type_reg[3] = {GPUREG_TEXUNIT0_TYPE, GPUREG_TEXUNIT1_TYPE, GPUREG_TEXUNIT2_TYPE};
+    for (int u = 0; u < 3; u++) {
+        if (Ssave.tex_valid[u] && (!S.tex_valid[u] || memcmp(S.tex[u], Ssave.tex[u], sizeof(S.tex[u])) ||
+                                   S.tex_type[u] != Ssave.tex_type[u])) {
+            GPUCMD_AddIncrementalWrites(base_reg[u], Ssave.tex[u], 5);
+            GPUCMD_AddWrite(type_reg[u], Ssave.tex_type[u]);
+        }
+        memcpy(S.tex[u], Ssave.tex[u], sizeof(S.tex[u]));
+        S.tex_type[u] = Ssave.tex_type[u];
+        S.tex_valid[u] = Ssave.tex_valid[u];
+    }
+    S.tex_units = Ssave.tex_units;
+    emit_tex_config(true); /* units back, texture cache cleared (the copy wrote what is sampled next) */
+    S.proj_tex = Ssave.proj_tex; /* unit 0's mode bits came back with its registers */
+    S.proj_req = Ssave.proj_req; /* proj_bool stays: it is what the GPU has */
+
+    if (Ssave.effect_valid) {
+        if (S.depth_color != Ssave.depth_color) {
+            GPUCMD_AddWrite(GPUREG_DEPTH_COLOR_MASK, Ssave.depth_color);
+            GPUCMD_AddMaskedWrite(GPUREG_GAS_DELTAZ_DEPTH, 0x8,
+                                  (u32)GPU_MAKEGASDEPTHFUNC((GPU_TESTFUNC)((Ssave.depth_color >> 4) & 7)) << 24);
+        }
+        if (S.depth_scale != Ssave.depth_scale || S.depth_offset != Ssave.depth_offset) {
+            u32 v[2] = {Ssave.depth_scale, Ssave.depth_offset};
+            GPUCMD_AddWrite(GPUREG_DEPTHMAP_ENABLE, 1);
+            GPUCMD_AddIncrementalWrites(GPUREG_DEPTHMAP_SCALE, v, 2);
+        }
+        if (S.cull != Ssave.cull)
+            GPUCMD_AddWrite(GPUREG_FACECULLING_CONFIG, Ssave.cull & 3);
+        if (S.alpha_test != Ssave.alpha_test)
+            GPUCMD_AddWrite(GPUREG_FRAGOP_ALPHA_TEST, Ssave.alpha_test);
+        if (S.blend_func != Ssave.blend_func)
+            GPUCMD_AddWrite(GPUREG_BLEND_FUNC, Ssave.blend_func);
+        if (S.blend_color != Ssave.blend_color)
+            GPUCMD_AddWrite(GPUREG_BLEND_COLOR, Ssave.blend_color);
+    }
+    S.depth_color = Ssave.depth_color;
+    S.depth_scale = Ssave.depth_scale;
+    S.depth_offset = Ssave.depth_offset;
+    S.cull = Ssave.cull;
+    S.alpha_test = Ssave.alpha_test;
+    S.blend_func = Ssave.blend_func;
+    S.blend_color = Ssave.blend_color;
+    S.effect_valid = Ssave.effect_valid;
 }

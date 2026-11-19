@@ -181,6 +181,25 @@ static __attribute__((always_inline)) inline u32 lines_flush(u32 a, u32 e)
     return ICACHE_ACK;
 }
 
+/* The same for a list of single lines (ctr_jit_flush_lines). */
+static const u32 *g_list;
+static u32 g_list_n;
+static __attribute__((noinline)) u32 list_lines_callback(void)
+{
+    u32 zero = 0;
+    for (u32 i = 0; i < g_list_n; i++)
+        __asm__ volatile("mcr p15, 0, %0, c7, c10, 1" : : "r"(g_list[i]) : "memory"); /* clean D line */
+    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" : : "r"(zero) : "memory");
+    for (u32 i = 0; i < g_list_n; i++)
+        __asm__ volatile("mcr p15, 0, %0, c7, c5, 1" : : "r"(g_list[i]) : "memory"); /* invalidate I line */
+    __asm__ volatile(
+        "mcr p15, 0, %0, c7, c5, 6\n"  /* branch target cache */
+        "mcr p15, 0, %0, c7, c10, 4\n"
+        "mcr p15, 0, %0, c7, c5, 4\n"  /* prefetch buffer */
+        : : "r"(zero) : "memory");
+    return ICACHE_ACK;
+}
+
 static __attribute__((noinline)) u32 icache_lines_callback(void)
 {
     return lines_flush(g_line_a, g_line_e);
@@ -237,6 +256,7 @@ static int g_ct_core, g_ct_prio;        /* where it runs; core 2: below the vide
 static LightEvent g_ct_go, g_ct_done;
 static void (*g_ct_work)(void);
 static volatile bool g_ct_in;           /* the compile thread is compiling */
+static volatile bool g_ct_quit;         /* ctr_jit_thread_stop */
 int ctr64_jit_thread_want;              /* on-demand compiles on the thread too (dev switch jitthread.txt) */
 unsigned long long ctr_jit_ct_flush_ticks; /* cache maintenance on the compile thread (stats.log) */
 volatile int ctr_jit_thread_busy;       /* from kick until the compile is done (and its flushes) */
@@ -247,8 +267,12 @@ unsigned int ctr64_icache_absorbs;     /* stats.log "dynarec events" */
 static void ct_main(void *arg)
 {
     (void)arg;
+    extern void ctr64_vfp_runfast(int who); /* main.c: VFP RunFast, per thread */
+    ctr64_vfp_runfast(3);
     for (;;) {
         LightEvent_Wait(&g_ct_go);
+        if (g_ct_quit)
+            return;
         g_ct_in = true;
         g_ct_work();
         g_ct_in = false;
@@ -270,14 +294,23 @@ int ctr64_core1_ready(void)
     u32 cur = 0;
     const Result g = APT_GetAppCpuTimeLimit(&cur);
     Result s1 = 0;
-    known = R_SUCCEEDED(g) && cur >= 80;
-    if (!known) {
-        s1 = APT_SetAppCpuTimeLimit(80);
-        known = R_SUCCEEDED(s1);
+    known = R_SUCCEEDED(g) && cur >= 25;
+    /* Luma's PM refuses (D8E05BF4) any value above the exheader's MaxCpu (low 7 bits; ctr64.rsf
+     * had 0x9E = 30% and every request for 80 failed: the audio and compile threads then shared
+     * core 2 with the video thread). The 3dsx runs under another title's exheader: ask for the
+     * most it allows. */
+    static const u32 k_try[] = {80, 70, 60, 50, 40, 30, 25};
+    u32 got = cur;
+    for (unsigned i = 0; !known && i < sizeof(k_try) / sizeof(k_try[0]); i++) {
+        s1 = APT_SetAppCpuTimeLimit(k_try[i]);
+        if (R_SUCCEEDED(s1)) {
+            known = 1;
+            got = k_try[i];
+        }
     }
-    /* 2026-11-09 HW: still refused with the read first -> the codes, and core 2 for the rest */
-    DebugMessage(M64MSG_INFO, "core 1: time limit read %08lX (%lu percent), set to 80: %08lX -> %s",
-                 (unsigned long)g, (unsigned long)cur, (unsigned long)s1, known ? "usable" : "not usable");
+    DebugMessage(M64MSG_INFO, "core 1: time limit read %08lX (%lu percent), now %lu percent (last set %08lX) -> %s",
+                 (unsigned long)g, (unsigned long)cur, (unsigned long)got, (unsigned long)s1,
+                 known ? "usable" : "not usable");
     return known;
 }
 
@@ -358,6 +391,22 @@ void ctr_jit_thread_wait(void)
     __sync_synchronize();
 }
 
+/* the game ended: the compile thread ends and is joined (left running, it was killed at app exit
+ * on its core) */
+void ctr_jit_thread_stop(void)
+{
+    if (!g_ct)
+        return;
+    ctr_jit_thread_wait();
+    g_ct_quit = true;
+    __sync_synchronize();
+    LightEvent_Signal(&g_ct_go);
+    threadJoin(g_ct, U64_MAX);
+    threadFree(g_ct);
+    g_ct = NULL;
+    g_ct_quit = false;
+}
+
 /* core 0: invalidate what the compile thread wrote, before running it */
 void ctr_jit_thread_absorb(void)
 {
@@ -374,6 +423,30 @@ void ctr_jit_thread_absorb(void)
     }
     g_ct_lo = ~0u;
     g_ct_hi = 0;
+}
+
+/* Lines (32-byte aligned addresses) of single patched instructions, e.g. links the dynarec undoes
+ * when it invalidates a page (new_dynarec.c ll_kill_pointers, invalidate_page): one call for all
+ * of them instead of a whole 4 KB page each. false: no line flush here (emulators, compile thread):
+ * the caller flushes the pages instead. */
+bool ctr_jit_flush_lines(const u32 *lines, u32 n)
+{
+    if (!n)
+        return true;
+    if (g_line_flush && !(g_ct_in && ctr_jit_on_compile_thread()) && (!g_luma || svcGetProcessorID() == 0)) {
+        u64 t0 = svcGetSystemTick();
+        g_list = lines;
+        g_list_n = n;
+        register u32 r0 __asm__("r0") = (u32)list_lines_callback;
+        __asm__ volatile("svc 0x80" : "+r"(r0) : : "r1", "r2", "r3", "r12", "cc", "memory");
+        if (r0 != ICACHE_ACK)
+            jit_fail("local cache list callback", r0);
+        ctr_jit_flush_calls++;
+        ctr_jit_flush_bytes += n * 32;
+        ctr_jit_flush_ticks += svcGetSystemTick() - t0;
+        return true;
+    }
+    return false;
 }
 
 void ctr_jit_flush(void *start, void *end)
@@ -481,6 +554,41 @@ void ctr_jit_init(void *base, unsigned int size)
         if (sc)
             fclose(sc);
     }
+    {   /* dev switch noqrestore.txt: verified dirty blocks wait for clean_blocks (new_dynarec.c) */
+        extern int ctr64_quick_restore;
+        FILE *q = fopen("sdmc:/3ds/ctr64/noqrestore.txt", "r");
+        ctr64_quick_restore = q == NULL;
+        if (q)
+            fclose(q);
+    }
+    {   /* dev switch nospresume.txt: a display list waiting in a branch to itself raises SP interrupts again (rsp_core.c) */
+        extern int ctr64_sp_resume_on;
+        FILE *q = fopen("sdmc:/3ds/ctr64/nospresume.txt", "r");
+        ctr64_sp_resume_on = q == NULL;
+        if (q)
+            fclose(q);
+    }
+    {   /* dev switch forcedp.txt: threaded lists without a full sync raise the RDP interrupt anyway (gfx_async.c) */
+        extern bool ctr64_gfx_forcedp;
+        FILE *q = fopen("sdmc:/3ds/ctr64/forcedp.txt", "r");
+        ctr64_gfx_forcedp = q != NULL;
+        if (q)
+            fclose(q);
+    }
+    {   /* dev switch nostream.txt: display lists that branch to themselves run inline (gfx_async.c) */
+        extern bool ctr64_gfx_nostream;
+        FILE *q = fopen("sdmc:/3ds/ctr64/nostream.txt", "r");
+        ctr64_gfx_nostream = q != NULL;
+        if (q)
+            fclose(q);
+    }
+    {   /* dev switch nohotpage.txt: pages with code are always write-protected again (new_dynarec.c) */
+        extern int ctr64_hot_pages_on;
+        FILE *q = fopen("sdmc:/3ds/ctr64/nohotpage.txt", "r");
+        ctr64_hot_pages_on = q == NULL;
+        if (q)
+            fclose(q);
+    }
     if (((u32)base & 4095u) || (size & 4095u) || size < 4096)
         jit_fail("cache alignment/size", size);
 
@@ -529,12 +637,69 @@ void ctr_jit_init(void *base, unsigned int size)
             fclose(df);
         }
     }
+    {   /* dev switch noprevdl.txt: a new display list does not complete the previous one first (rsp_core.c) */
+        extern bool ctr64_gfx_noprevdl;
+        FILE *np = fopen("sdmc:/3ds/ctr64/noprevdl.txt", "r");
+        ctr64_gfx_noprevdl = np != NULL;
+        if (np)
+            fclose(np);
+    }
     {   /* dev switch nodefer.txt: no deferred RDP-done waits for slow games (gfx_async.c) */
         extern bool ctr64_gfx_nodefer;
         FILE *nd = fopen("sdmc:/3ds/ctr64/nodefer.txt", "r");
         if (nd) {
             ctr64_gfx_nodefer = true;
             fclose(nd);
+        }
+    }
+    {   /* dev switch rdpcap.txt: VIs after which the CPU waits for a display list in any case */
+        extern unsigned ctr64_gfx_cap_vi;
+        FILE *rc = fopen("sdmc:/3ds/ctr64/rdpcap.txt", "r");
+        if (rc) {
+            unsigned v = 0;
+            if (fscanf(rc, "%u", &v) == 1 && v >= 1 && v <= 16)
+                ctr64_gfx_cap_vi = v;
+            fclose(rc);
+        }
+    }
+    {   /* dev switch rdpearly.txt: a finished display list is done at once (gfx_async.c) */
+        extern bool ctr64_gfx_rdp_early;
+        FILE *re = fopen("sdmc:/3ds/ctr64/rdpearly.txt", "r");
+        if (re) {
+            ctr64_gfx_rdp_early = true;
+            fclose(re);
+        }
+    }
+    {   /* dev switch churnlink.txt: jumps into TLB pages that get evicted are linked too */
+        extern int ctr64_churn_nolink;
+        FILE *cl = fopen("sdmc:/3ds/ctr64/churnlink.txt", "r");
+        if (cl) {
+            ctr64_churn_nolink = 0;
+            fclose(cl);
+        }
+    }
+    {   /* dev switch nosecache.txt: soft TLB evictions walk the block list every time */
+        extern int ctr64_se_cache;
+        FILE *sc = fopen("sdmc:/3ds/ctr64/nosecache.txt", "r");
+        if (sc) {
+            ctr64_se_cache = 0;
+            fclose(sc);
+        }
+    }
+    {   /* dev switch nohtfirst.txt: unlinked jumps into evicted TLB pages walk the block list first */
+        extern int ctr64_ht_first;
+        FILE *hf = fopen("sdmc:/3ds/ctr64/nohtfirst.txt", "r");
+        if (hf) {
+            ctr64_ht_first = 0;
+            fclose(hf);
+        }
+    }
+    {   /* dev switch nosoftevict.txt: TLB evictions invalidate the code as before (new_dynarec.c) */
+        extern int ctr64_soft_evict;
+        FILE *se = fopen("sdmc:/3ds/ctr64/nosoftevict.txt", "r");
+        if (se) {
+            ctr64_soft_evict = 0;
+            fclose(se);
         }
     }
     {   /* dev switch nowaitskip.txt: wait loops run every cycle (new_dynarec.c ctr64_waitloop) */
@@ -578,6 +743,13 @@ void ctr_jit_init(void *base, unsigned int size)
     rc = svcControlProcessMemory(g_process, (u32)base, 0, size, MEMOP_PROT,
                                  MEMPERM_READ | MEMPERM_WRITE | MEMPERM_EXECUTE);
     if (R_FAILED(rc)) jit_fail("JIT executable permission", (u32)rc);
+    /* A handle to our own process must not outlive this: the process then holds a reference to
+     * itself and is never destroyed after it exits. On hardware every game launch left one
+     * behind (its threads stayed counted against the app's thread limit, 32, and its memory
+     * taken), until the video thread could not start, a ROM could not load (5 MB heap) and the
+     * system's loader crashed starting the app (D86007F3) - until a power cycle. */
+    svcCloseHandle(g_process);
+    g_process = 0;
     DebugMessage(M64MSG_INFO, "%s executable permission OK; self-test begins", JIT_BUILD);
 
     /* Test executable permissions AND instruction coherency on the actual

@@ -11,10 +11,11 @@ void gln64_thr_gl_invoke_command_loop(void) {}
  * draws dropped (no valid target / culled entirely), frame buffer binds, failed GPU allocations */
 unsigned int ctr64_gfx_stats[8];
 unsigned int ctr64_gfx_fcram[2];
+unsigned int ctr64_gfx_fb_reads[2]; /* reads of render targets: VRAM, FCRAM */
 unsigned int ctr64_gfx_vram_moves[2]; /* KB copied into / out of VRAM by keepInVram */ /* draws into FCRAM color / depth targets */
 unsigned int ctr64_game_starts; /* games started (core_host.c) */
 char ctr64_rt_mode[64]; /* frame buffer storage of the running game (pica_ContextImpl init), for stats.log */
-unsigned int ctr64_gfx_shadow[3]; /* shadow copies for sampling non-power-of-two storage (pica_ContextImpl shadowOf): count, KB */
+unsigned int ctr64_gfx_shadow[6]; /* shadow copies for sampling non-power-of-two storage (pica_ContextImpl shadowOf): count, KB */
 unsigned int ctr64_gfx_reused; /* render target storage taken over from a released texture (pica_ContextImpl allocStorage) */
 
 /* ticks: [0] PICA backend draw calls, [1] GLideN64 display list processing, [2] present
@@ -29,6 +30,8 @@ unsigned int ctr64_prof_calls[48];
 unsigned long long ctr64_prof_total[48];
 /* dev switch nocrcmemo.txt (read in pica_ContextImpl.cpp): GLideN64 texture hashes never reused */
 _Bool ctr64_crc_nomemo;
+/* dev switch fbcheckfull.txt: FrameBuffer::isValid always compares every word (no sampled pass) */
+_Bool ctr64_fbcheck_full;
 /* scope names, Ctr64Prof.h ids (stats.log "prof" line, profiler "s" rows) */
 const char *const ctr64_prof_names[48] = {
     "vtx", "procvtx", "tris", "texrect", "rect", "texupd", "texload", "tmem", "fbsave", "fbfromrdram",

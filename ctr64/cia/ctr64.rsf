@@ -1,4 +1,4 @@
-# makerom spec for the ctr64 CIA (scripts/build-3ds-cia.sh). New 3DS: 124 MB app memory, 804 MHz +
+# makerom spec for the ctr64 CIA (scripts/build-3ds-cia.sh). New 3DS: 178 MB app memory (main heap capped at 96 MB, main.c), 804 MHz +
 # L2 cache. Old 3DS: 96 MB. The dynarec needs svcControlProcessMemory (0x70) and the I-cache SVC (0x93).
 
 BasicInfo:
@@ -32,13 +32,15 @@ AccessControlInfo:
   MemoryType              : Application
   # Old 3DS: the largest app region (64 MB cannot hold code + JIT cache + ROM)
   SystemMode              : 96MB
-  SystemModeExt           : 124MB
+  # New 3DS: 178 MB, so 64 MB ROMs (Conker) load whole instead of streaming pages from SD
+  SystemModeExt           : 178MB
   CpuSpeed                : 804MHz
   EnableL2Cache           : true
   IdealProcessor          : 0
   AffinityMask            : 1
   Priority                : 16
-  MaxCpu                  : 0x9E
+  # bit 7 = "multi" mode, low 7 bits = most of core 1 the app may ask for (Luma PM refuses more)
+  MaxCpu                  : 0xD0
   HandleTableSize         : 0x200
   DisableDebug            : false
   EnableForceDebug        : false

@@ -41,6 +41,8 @@ extern unsigned ctr64_gfx_wait_ticks; /* gfx_async.c: CPU-side waiting, for the 
 static void worker(void *arg)
 {
     (void)arg;
+    extern void ctr64_vfp_runfast(int who); /* main.c: VFP RunFast, per thread */
+    ctr64_vfp_runfast(2);
     for (;;) {
         LightLock_Lock(&g_lock);
         while (g_got == g_put && !g_quit)

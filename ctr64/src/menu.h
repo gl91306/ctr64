@@ -29,3 +29,5 @@ bool menu_running_touched(unsigned long down);
 /* first console row (inside the debug window) for the developer counters (settings: debug info) */
 int menu_debug_row(void);
 void menu_apply_settings(void);
+/* HOME Menu / exit (true) and back (false): the bottom backlight on, and off again when set so */
+void menu_screen_suspend(bool suspend);
