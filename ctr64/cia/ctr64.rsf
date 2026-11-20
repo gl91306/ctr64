@@ -30,8 +30,10 @@ AccessControlInfo:
     - DirectSdmc
   IoAccessControl:
   MemoryType              : Application
-  # Old 3DS: the largest app region (64 MB cannot hold code + JIT cache + ROM)
-  SystemMode              : 96MB
+  # Old 3DS: 80 MB, the extended mode retail games use. 96 MB leaves the HOME Menu too little
+  # memory: it crashes (data abort in "menu") before ctr64 starts. 64 MB cannot hold
+  # code + JIT cache + ROM pages.
+  SystemMode              : 80MB
   # New 3DS: 178 MB, so 64 MB ROMs (Conker) load whole instead of streaming pages from SD
   SystemModeExt           : 178MB
   CpuSpeed                : 804MHz

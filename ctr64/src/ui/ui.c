@@ -569,6 +569,35 @@ int ui_text(int x, int y, int size, UiCol c, int align, const char *s)
     return draw_text(x, y, size, c, s, -1);
 }
 
+int ui_text_mask(int size, const char *utf8, int max_w, u8 *out, int w, int h)
+{
+    enum { MAX_H = 48 };
+    static u16 save[UI_W * MAX_H];
+    if (!g_fb || w <= 0 || w > UI_W || h <= 0 || h > MAX_H)
+        return 0;
+    /* the top h rows of the first w columns: px(x, h-1) .. px(x, 0) are contiguous */
+    for (int x = 0; x < w; x++)
+        memcpy(&save[x * h], px(x, h - 1), h * sizeof(u16));
+    const int cx0 = g_cx0, cy0 = g_cy0, cx1 = g_cx1, cy1 = g_cy1;
+    ui_clip(0, 0, w, h);
+    ui_fill(0, 0, w, h, 0);
+    const int y = (h - ui_line_height(size)) / 2;
+    const int tw = ui_text_width(size, utf8);
+    if (tw <= max_w)
+        ui_text((w - tw) / 2, y, size, UI_WHITE, UI_LEFT, utf8);
+    else
+        ui_text_fit((w - max_w) / 2, y, size, UI_WHITE, UI_LEFT, max_w, utf8);
+    for (int yy = 0; yy < h; yy++)
+        for (int x = 0; x < w; x++) {
+            const u16 c = *px(x, yy);
+            out[yy * w + x] = (u8)(((c >> 5) & 0x3F) * 255 / 63); /* green: 6 bits */
+        }
+    for (int x = 0; x < w; x++)
+        memcpy(px(x, h - 1), &save[x * h], h * sizeof(u16));
+    g_cx0 = cx0, g_cy0 = cy0, g_cx1 = cx1, g_cy1 = cy1;
+    return tw < max_w ? tw : max_w;
+}
+
 int ui_textf(int x, int y, int size, UiCol c, int align, const char *fmt, ...)
 {
     char buf[160];
@@ -793,6 +822,26 @@ void ui_scan(u32 *down, u32 *held, u32 *up)
             char path[96];
             snprintf(path, sizeof(path), "sdmc:/3ds/ctr64/ui_%s.tga", a);
             ui_dump(path);
+            continue;
+        }
+        if (!strcmp(cmd, "topdump") && sscanf(line, "%*s %31s", a) == 1) { /* the top screen */
+            extern const void *pica_top_latest(unsigned *bytes);
+            unsigned bytes = 0;
+            const u8 *fb = pica_top_latest(&bytes); /* BGR8, 240x400 as the LCD scans it */
+            char path[96];
+            snprintf(path, sizeof(path), "sdmc:/3ds/ctr64/ui_%s.tga", a);
+            FILE *f = fb && bytes >= 240 * 400 * 3 ? fopen(path, "wb") : NULL;
+            if (f) {
+                const u8 hdr[18] = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 400 & 255, 400 >> 8, 240, 0, 24, 0};
+                fwrite(hdr, 1, sizeof(hdr), f);
+                static u8 row[400 * 3];
+                for (int y = 239; y >= 0; y--) { /* bottom-up */
+                    for (int x = 0; x < 400; x++)
+                        memcpy(&row[x * 3], &fb[(x * 240 + (239 - y)) * 3], 3);
+                    fwrite(row, 1, sizeof(row), f);
+                }
+                fclose(f);
+            }
             continue;
         }
     }

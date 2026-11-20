@@ -28,6 +28,7 @@ add_executable(ctr64
   src/ctru_abi.c
   src/gpu_test.c
   src/rom_browser.c
+  src/boxart.c
   src/rom_title.c
   src/rom_stream.c
   src/ui/ui.c
@@ -36,6 +37,9 @@ add_executable(ctr64
   src/pica/pica_state.c)
 
 target_include_directories(ctr64 PRIVATE src ${CMAKE_SOURCE_DIR}/common)
+# devkitPro portlibs (3ds-curl, 3ds-mbedtls, 3ds-libpng, 3ds-zlib): box art downloads, src/boxart.c
+target_include_directories(ctr64 PRIVATE ${DEVKITPRO}/portlibs/3ds/include)
+target_link_directories(ctr64 PRIVATE ${DEVKITPRO}/portlibs/3ds/lib)
 # gfx_async.c uses the core's plugin headers (custom/ holds mupen64plus-next_common.h)
 set_source_files_properties(src/gfx_async.c src/audio_async.c PROPERTIES INCLUDE_DIRECTORIES
   ${CMAKE_SOURCE_DIR}/third_party/mupen64plus-libretro-nx/custom)
@@ -45,7 +49,8 @@ set_source_files_properties(src/rom_stream.c PROPERTIES INCLUDE_DIRECTORIES
 # libctru's own struct layouts (1-byte enums); see src/ctru_abi.c
 set_source_files_properties(src/ctru_abi.c PROPERTIES COMPILE_OPTIONS -fshort-enums)
 target_compile_options(ctr64 PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
-target_link_libraries(ctr64 PRIVATE ctr64_shaders_bin ctr64_gliden64 ctr64_core ctr64_gliden64 stdc++)
+target_link_libraries(ctr64 PRIVATE ctr64_shaders_bin ctr64_gliden64 ctr64_core ctr64_gliden64 stdc++
+  curl mbedtls mbedx509 mbedcrypto png z) # box art downloads (src/boxart.c): devkitPro 3ds-curl, 3ds-mbedtls
 if(CTR64_PGO STREQUAL "gen") # instrumented compiler (core.cmake)
   target_link_libraries(ctr64 PRIVATE gcov)
   target_compile_definitions(ctr64 PRIVATE CTR64_PGO_GEN=1)

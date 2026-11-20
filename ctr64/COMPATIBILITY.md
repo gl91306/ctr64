@@ -67,9 +67,12 @@ speed).
 
 ## Old 3DS
 
-- CIA on Old 3DS 11.17 / Luma 13.5: fails to start, no core.log or crash.txt (report, 0.9.1;
-  waiting for a Luma dump).
-- ROMs over 16 MB are streamed from SD in 64 KB pages (Azahar-tested).
+- CIA on Old 3DS 11.17 / Luma 13.5: fails to start, no core.log or crash.txt (report, 0.9.1).
+  The Luma dump showed the HOME Menu itself crashing: the CIA asked for the 96 MB memory mode,
+  which leaves the HOME Menu too little memory. 0.9.2 uses the 80 MB mode retail games use, with
+  less memory use to fit (Azahar Old 3DS: SM64, MK64, SSB, GoldenEye, OoT, PM, MM run 1800 VIs;
+  GoldenEye Dam gameplay). Not yet confirmed on an Old 3DS.
+- ROMs are streamed from SD in 64 KB pages unless one fits with 12 MB of heap to spare (Azahar-tested).
 
 ## Requests from users
 

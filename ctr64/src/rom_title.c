@@ -212,6 +212,11 @@ void rom_title_from_header(const unsigned char hdr[64], const char *file, char *
 
 void rom_title_read(const char *path, char *title, size_t tn, char *tags, size_t gn)
 {
+    rom_title_read_id(path, title, tn, tags, gn, NULL);
+}
+
+void rom_title_read_id(const char *path, char *title, size_t tn, char *tags, size_t gn, char id[5])
+{
     unsigned char h[64] = {0};
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
@@ -222,4 +227,20 @@ void rom_title_read(const char *path, char *title, size_t tn, char *tags, size_t
         fclose(f);
     }
     rom_title_from_header(h, base, title, tn, tags, gn);
+    if (id) {
+        unsigned char k[64];
+        if (h[0] == 0x37 && h[1] == 0x80)
+            for (int i = 0; i < 64; i++)
+                k[i] = h[i ^ 1];
+        else if (h[0] == 0x40 && h[1] == 0x12)
+            for (int i = 0; i < 64; i++)
+                k[i] = h[(i & ~3) | (3 - (i & 3))];
+        else
+            memcpy(k, h, 64);
+        for (int i = 0; i < 4; i++)
+            id[i] = isalnum(k[0x3B + i]) ? (char)toupper(k[0x3B + i]) : 0;
+        id[4] = 0;
+        if (!id[0] || !id[1] || !id[2] || !id[3])
+            id[0] = 0;
+    }
 }

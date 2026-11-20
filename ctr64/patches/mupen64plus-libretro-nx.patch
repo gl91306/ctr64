@@ -125,7 +125,7 @@ index 8cf3913..838f41b 100644
  	u32 numPixels = (_endAddress - _startAddress) >> 1;
  	if (numPixels / m_pCurFrameBuffer->m_width > max_height) {
 diff --git a/GLideN64/src/BufferCopy/RDRAMtoColorBuffer.cpp b/GLideN64/src/BufferCopy/RDRAMtoColorBuffer.cpp
-index bb4fe0e..e7198ec 100644
+index bb4fe0e..77ff54b 100644
 --- a/GLideN64/src/BufferCopy/RDRAMtoColorBuffer.cpp
 +++ b/GLideN64/src/BufferCopy/RDRAMtoColorBuffer.cpp
 @@ -1,3 +1,4 @@
@@ -147,7 +147,17 @@ index bb4fe0e..e7198ec 100644
  	m_pTexture->textureBytes = m_pTexture->width * m_pTexture->height * fbTexFormats.colorFormatBytes;
  
  	m_pTexture->hdRatioS = 1.0f;
-@@ -94,8 +101,9 @@ void RDRAMtoColorBuffer::addAddress(u32 _address, u32 _size)
+@@ -65,7 +72,9 @@ void RDRAMtoColorBuffer::init()
+ 	setParams.magFilter = textureParameters::FILTER_LINEAR;
+ 	gfxContext.setTextureParameters(setParams);
+ 
++#ifndef __3DS__
+ 	m_pbuf = (u8*)malloc(m_pTexture->textureBytes);
++#endif /* ctr64: on first use (_copyFromRDRAM), 1.25 MB many games never need */
+ }
+ 
+ void RDRAMtoColorBuffer::destroy()
+@@ -94,8 +103,9 @@ void RDRAMtoColorBuffer::addAddress(u32 _address, u32 _size)
  }
  
  // Write the whole buffer
@@ -159,8 +169,14 @@ index bb4fe0e..e7198ec 100644
  {
  	if ((_address & 1) != 0)
  		return false;
-@@ -181,7 +189,7 @@ void RDRAMtoColorBuffer::_copyFromRDRAM(u32 _height, bool _fullAlpha)
+@@ -179,9 +189,13 @@ u32 RGBA32ToABGR32(u32 col, bool _fullAlpha)
+ void RDRAMtoColorBuffer::_copyFromRDRAM(u32 _height, bool _fullAlpha)
+ {
  	Cleaner cleaner(this);
++#ifdef __3DS__
++	if (m_pbuf == nullptr && (m_pbuf = (u8*)malloc(m_pTexture->textureBytes)) == nullptr)
++		return;
++#endif
  	const u32 address = m_pCurBuffer->m_startAddress;
  	const u32 width = m_pCurBuffer->m_width;
 -	const u32 height = _height;
@@ -168,7 +184,7 @@ index bb4fe0e..e7198ec 100644
  
  	const u32 x0 = 0;
  	const u32 y0 = 0;
-@@ -204,11 +212,32 @@ void RDRAMtoColorBuffer::_copyFromRDRAM(u32 _height, bool _fullAlpha)
+@@ -204,11 +218,32 @@ void RDRAMtoColorBuffer::_copyFromRDRAM(u32 _height, bool _fullAlpha)
  	}
  
  	bool bCopy;
@@ -203,7 +219,7 @@ index bb4fe0e..e7198ec 100644
  	} else {
  		if (m_pCurBuffer->m_size == G_IM_SIZ_16b)
  			bCopy = _copyPixelsFromRdram<u16>(address, m_vecAddress, pDst, RGBA16ToABGR32, 1, width, height, _fullAlpha);
-@@ -320,6 +349,7 @@ void RDRAMtoColorBuffer::copyFromRDRAM(u32 _address, bool _bCFB)
+@@ -320,6 +355,7 @@ void RDRAMtoColorBuffer::copyFromRDRAM(u32 _address, bool _bCFB)
  
  void RDRAMtoColorBuffer::copyFromRDRAM(FrameBuffer * _pBuffer)
  {
@@ -1341,6 +1357,24 @@ index 4fdd01f..0db2c6d 100644
  extern u32 RDRAMSize;
  extern bool ConfigOpen;
  
+diff --git a/GLideN64/src/RDP.h b/GLideN64/src/RDP.h
+index 992548c..00cca35 100644
+--- a/GLideN64/src/RDP.h
++++ b/GLideN64/src/RDP.h
+@@ -1,7 +1,13 @@
+ #ifndef RDP_H
+ #define RDP_H
+ 
++#ifdef __3DS__
++/* ctr64: a ring of 1 MB, not 4 MB (static memory the Old 3DS's 80 MB mode cannot spare); DP lists
++ * are a few KB to tens of KB between two RDP_ProcessRDPList calls */
++#define MAXCMD 0x40000
++#else
+ #define MAXCMD 0x100000
++#endif
+ const unsigned int maxCMDMask = MAXCMD - 1;
+ 
+ typedef struct
 diff --git a/GLideN64/src/RSP.cpp b/GLideN64/src/RSP.cpp
 index a6b6078..a488b93 100644
 --- a/GLideN64/src/RSP.cpp
@@ -3667,7 +3701,7 @@ index 15a490f..a085ffa 100644
     /* Create or recreate converter if sample rate changed */
     if (!audio_converter || converter_input_rate != (unsigned)GameFreq)
 diff --git a/libretro/libretro.c b/libretro/libretro.c
-index 4a9f129..b44fe94 100644
+index 4a9f129..9d772bc 100644
 --- a/libretro/libretro.c
 +++ b/libretro/libretro.c
 @@ -413,7 +413,9 @@ static bool emu_step_load_data()
@@ -3697,9 +3731,9 @@ index 4a9f129..b44fe94 100644
  
          retro_thread = co_active();
 +#if defined(__3DS__)
-+        /* ctr64: 1 MB (not 4): the heap is tight on an Old 3DS. Measured peak in OoT, MK64 and SSB
-+         * with GLideN64 running inline on it (video thread off): 17 KB */
-+        game_thread = co_create(1024 * 1024, (void (*)(void))EmuThreadFunction);
++        /* ctr64: 256 KB (not 4 MB): the heap is tight on an Old 3DS (80 MB mode). Measured peak in
++         * OoT, MK64 and SSB with GLideN64 running inline on it (video thread off): 17 KB */
++        game_thread = co_create(256 * 1024, (void (*)(void))EmuThreadFunction);
 +#else
          game_thread = co_create(65536 * sizeof(void*) * 16, (void (*)(void))EmuThreadFunction);
 +#endif

@@ -104,6 +104,10 @@ int ui_line_height(int size);
 int ui_text_y(int size, int cy);
 /* text cut with "..." to fit max_w */
 int ui_text_fit(int x, int y, int size, UiCol c, int align, int max_w, const char *utf8);
+/* text as coverage (0..255, row-major w x h, centred, cut with "..." past max_w) for drawing it
+ * elsewhere (the top-screen box art carousel); drawn in a corner of the canvas and put back, so
+ * the bottom screen is unchanged. h <= 48. Returns the drawn width. */
+int ui_text_mask(int size, const char *utf8, int max_w, u8 *out, int w, int h);
 
 /* palettized run-length image (tools/ui/png2c.py) */
 typedef struct {

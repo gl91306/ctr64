@@ -213,7 +213,9 @@ bool rom_stream_wanted(long size, const char *data_dir)
         return true;
     bool new3ds = false;
     APT_CheckNew3DS(&new3ds);
-    return !new3ds && size > RS_FULL_LOAD_MAX;
+    /* Old 3DS (80 MB mode): whole only if the heap keeps its headroom for the rest of the emulator
+     * (GLideN64 grows by ~7 MB once a game draws; Super Mario 64's 8 MB loaded whole ran out) */
+    return !new3ds && (size > RS_FULL_LOAD_MAX || (uint32_t)size + RS_HEADROOM > heap_free());
 }
 
 static void md5_path(char *out, size_t n, const char *data_dir, const uint8_t *z64_header)

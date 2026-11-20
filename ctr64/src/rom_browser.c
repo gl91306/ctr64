@@ -7,6 +7,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "boxart.h"
 #include "menu.h"
 #include "rom_title.h"
 #include "settings.h"
@@ -23,6 +24,7 @@ typedef struct {
     char file[128];
     char title[80];
     char tags[32];
+    char id[5]; /* cartridge ID (box art) */
 } Rom;
 static Rom g_roms[MAX_ROMS];
 static int g_count;
@@ -127,11 +129,19 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
                 char path[400];
                 snprintf(r->file, sizeof(r->file), "%.127s", e->d_name);
                 snprintf(path, sizeof(path), "%s/%s", dir, r->file);
-                rom_title_read(path, r->title, sizeof(r->title), r->tags, sizeof(r->tags));
+                rom_title_read_id(path, r->title, sizeof(r->title), r->tags, sizeof(r->tags), r->id);
             }
         closedir(d);
     }
     qsort(g_roms, g_count, sizeof(g_roms[0]), cmp_roms);
+    /* the top screen: box art of the selected game */
+    boxart_begin();
+    for (int i = 0; i < g_count; i++) {
+        char path[400];
+        snprintf(path, sizeof(path), "%s/%s", dir, g_roms[i].file);
+        boxart_add(path, g_roms[i].title, g_roms[i].id, strstr(g_roms[i].tags, "hack") != NULL);
+    }
+    boxart_start();
 
     consoleClear();
     ui_init();
@@ -146,8 +156,11 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
         ui_scan(&down, &held, &up);
         const u32 rep = hidKeysDownRepeat() | (down & (KEY_DUP | KEY_DDOWN));
         ui_touch_update(&touch, down, held, up);
-        if (down & KEY_START)
+        boxart_frame();
+        if (down & KEY_START) {
+            boxart_end();
             return ROM_BROWSER_QUIT;
+        }
         bool tap_settings = false, tap_theme = false;
         if (touch.tap && ui_hit(touch.x, touch.y, 0, UI_H - UI_FOOTER_H, UI_W, UI_FOOTER_H)) {
             tap_settings = touch.x >= g_foot_x[1] && touch.x < g_foot_x[2];
@@ -160,6 +173,7 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
             ui_set_dark(g_settings.dark_mode);
             ui_background(0, UI_H);
             draw_frame();
+            boxart_redraw();
             hidSetRepeatParameters(18, 5);
             touch = (UiTouch){0};
             redraw = true;
@@ -170,10 +184,12 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
             settings_save(SETTINGS_PATH);
             ui_background(0, UI_H);
             draw_frame();
+            boxart_redraw();
             redraw = true;
         }
         if (g_count && (down & KEY_A)) {
             snprintf(out, outsz, "%s/%s", dir, g_roms[sel].file);
+            boxart_end();
             return ROM_BROWSER_PICKED;
         }
         if (g_count && (rep & (KEY_DDOWN | KEY_DUP | KEY_CPAD_DOWN | KEY_CPAD_UP))) {
@@ -182,6 +198,7 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
                 scroll = sel * ROW_H;
             if (sel * ROW_H + CARD_H > scroll + LIST_H)
                 scroll = sel * ROW_H + CARD_H - LIST_H;
+            boxart_select(sel);
             redraw = true;
         }
         if (touch.dragging && touch.dy && max_scroll) {
@@ -192,19 +209,24 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
         if (touch.tap && g_count) {
             if (ui_hit(touch.x, touch.y, 0, UI_H - UI_FOOTER_H, g_foot_x[1], UI_FOOTER_H)) {
                 snprintf(out, outsz, "%s/%s", dir, g_roms[sel].file);
+                boxart_end();
                 return ROM_BROWSER_PICKED;
             }
-            if (ui_hit(touch.x, touch.y, UI_W / 2, UI_H - UI_FOOTER_H, UI_W / 2, UI_FOOTER_H))
+            if (ui_hit(touch.x, touch.y, UI_W / 2, UI_H - UI_FOOTER_H, UI_W / 2, UI_FOOTER_H)) {
+                boxart_end();
                 return ROM_BROWSER_QUIT;
+            }
             if (ui_hit(touch.x, touch.y, 0, LIST_Y, UI_W, LIST_H)) {
                 const int i = (touch.y - LIST_Y + scroll) / ROW_H;
                 const int in_row = (touch.y - LIST_Y + scroll) % ROW_H;
                 if (i < g_count && in_row < CARD_H) {
                     if (i == sel) { /* a second tap on the selected game starts it */
                         snprintf(out, outsz, "%s/%s", dir, g_roms[sel].file);
+                        boxart_end();
                         return ROM_BROWSER_PICKED;
                     }
                     sel = i;
+                    boxart_select(sel);
                     redraw = true;
                 }
             }
@@ -215,6 +237,7 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
         draw_list(sel, scroll);
         ui_present();
     }
+    boxart_end();
     return ROM_BROWSER_QUIT;
 }
 

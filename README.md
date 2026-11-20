@@ -12,9 +12,9 @@ Basically this project is mupen64plus-next + gliden64 ported to the 3ds with a c
   cores. Several games run at or close to full speed (Super Mario 64, Ocarina of Time, Paper
   Mario, Super Smash Bros., Mario Kart 64 and others), with optional 2× anti-aliasing. 64 MB games
   (Conker's Bad Fur Day) are read from the SD card while they run, as on the Old 3DS below.
-- **Old 3DS / 2DS**: works, but slower. Games up to 16 MB are loaded into memory; bigger ones
-  (Ocarina of Time, Majora's Mask, Paper Mario, Conker...) do not fit, so ctr64 reads them from
-  the SD card while they run. Their first start reads the whole file once (a progress bar shows
+- **Old 3DS / 2DS**: works, but slower. ctr64 runs in the Old 3DS's 80 MB extended memory mode,
+  which leaves room for only the smallest games in memory; most games (Super Mario 64, Mario
+  Kart 64, Ocarina of Time, Paper Mario...) are read from the SD card while they run. Their first start reads the whole file once (a progress bar shows
   it), and there can be short pauses when the game loads new areas. Use the **.cia** on an Old
   3DS (see below).
 
@@ -63,6 +63,14 @@ both ways (the name must match the ROM's file name).
 The **game list** shows the game titles. Tap a game to select it and tap it again (or press **A**) to start it; **Y** switches
 dark mode on or off; **START** quits.
 
+The top screen shows the box art of the selected game. With Wi-Fi on, ctr64 downloads the art
+of your games from [libretro-thumbnails](https://github.com/libretro-thumbnails/Nintendo_-_Nintendo_64)
+while the game list is open (about 350 KB per game, once) and keeps a 128 KB copy sized for
+the screen in `sdmc:/3ds/ctr64/boxart`; games are matched by the cartridge ID in the ROM, so file names do not
+matter. Without Wi-Fi, or for games without art (ROM hacks, test ROMs), a card with the title
+is shown. To fetch a game's art again, delete its file from that folder (`.none` marks a game
+that has no art).
+
 While a game runs, the bottom screen shows the speed. **SELECT** or a tap on the bottom screen
 pauses and opens the menu:
 
@@ -99,7 +107,9 @@ the new settings (CIA; with the .3dsx, start ctr64 again).
 On Windows:
 
 1. Install [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the **3DS development**
-   group (devkitARM, libctru, picasso, 3dsxtool, smdhtool), in `C:\devkitPro`.
+   group (devkitARM, libctru, picasso, 3dsxtool, smdhtool), in `C:\devkitPro`, plus the
+   `3ds-curl`, `3ds-mbedtls`, `3ds-libpng` and `3ds-zlib` packages (box art downloads):
+   `pacman -S 3ds-curl 3ds-mbedtls 3ds-libpng 3ds-zlib` in devkitPro's MSYS2 shell.
 2. Install git.
 3. For the `.cia`, put `makerom` (from [Project_CTR](https://github.com/3DSGuy/Project_CTR/releases))
    on your `PATH` or in `C:\devkitPro\tools\bin`. Without it you get only the `.3dsx`.
@@ -177,6 +187,10 @@ Thank you to:
 - **[Azahar](https://github.com/azahar-emu/azahar)**: the 3DS emulator that most of the
   development and testing ran on.
 - **[Project_CTR](https://github.com/3DSGuy/Project_CTR)** (makerom) for building the CIA.
+- **[libretro-thumbnails](https://github.com/libretro-thumbnails/libretro-thumbnails)** and
+  **[libretro-database](https://github.com/libretro/libretro-database)**: the box art in the game
+  list and the cartridge IDs that find it (`tools/ui/boxart_names.py`). curl, mbedTLS, libpng and
+  zlib (devkitPro portlibs) download and decode it.
 
 ## Licenses
 

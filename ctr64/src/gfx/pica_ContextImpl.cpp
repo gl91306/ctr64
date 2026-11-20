@@ -903,17 +903,24 @@ private:
 
 class PicaPixelReadBuffer : public PixelReadBuffer {
 public:
-    explicit PicaPixelReadBuffer(size_t size) : m_data(size, 0) {}
+    /* the zeroed storage is made on first use (1.25 MB for the depth copy, which many games
+     * never do: heap the Old 3DS's 80 MB mode cannot spare) */
+    explicit PicaPixelReadBuffer(size_t size) : m_size(size) {}
     void readPixels(s32, s32, u32, u32, Parameter, Parameter) override {}
     void *getDataRange(u32 offset, u32 range) override
     {
-        return offset + range <= m_data.size() ? m_data.data() + offset : nullptr;
+        if (offset + range > m_size)
+            return nullptr;
+        if (m_data.empty())
+            m_data.resize(m_size, 0);
+        return m_data.data() + offset;
     }
     void closeReadBuffer() override {}
     void bind() override {}
     void unbind() override {}
 
 private:
+    size_t m_size;
     std::vector<u8> m_data;
 };
 
