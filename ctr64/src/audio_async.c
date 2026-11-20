@@ -144,10 +144,15 @@ bool ctr64_audio_task_start(const unsigned char *dmem, const unsigned char *imem
 }
 
 /* `elapsed`: emulated count cycles since the task started */
+/* After 1/16 VI (about 1 ms, an N64 audio task's own length) the CPU waits for the thread. It was
+ * 1/4 VI: on HW (core 1 is shared with the system) a task then often ended late in emulated
+ * time, and Rayman 2 built display lists that call themselves without end at its save slot
+ * screen (graphics stopped, music played on; HW playtest 2026-11-20). Azahar: the same with
+ * audio inline but reported done ~1/4 VI late; clean at 1/8 VI and with this cap. */
 bool ctr64_audio_ready(unsigned elapsed)
 {
     const unsigned vi = g_dev.vi.delay ? g_dev.vi.delay : 780000;
-    return g_got == g_put || elapsed >= vi / 4;
+    return g_got == g_put || elapsed >= vi / 16;
 }
 
 void ctr64_audio_finish(void)

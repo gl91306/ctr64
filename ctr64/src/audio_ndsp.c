@@ -115,8 +115,10 @@ static void dump_audio(const int16_t *frames, size_t count)
     }
 }
 
+unsigned ctr64_audio_in_frames; /* stats.log "audio in" */
 void ctr64_audio_push(const int16_t *frames, size_t count, unsigned rate)
 {
+    ctr64_audio_in_frames += count;
     dump_audio(frames, count);
     if (!g_ok)
         return;

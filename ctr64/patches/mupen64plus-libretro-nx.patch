@@ -1376,7 +1376,7 @@ index 992548c..00cca35 100644
  
  typedef struct
 diff --git a/GLideN64/src/RSP.cpp b/GLideN64/src/RSP.cpp
-index a6b6078..a488b93 100644
+index a6b6078..9045bc9 100644
 --- a/GLideN64/src/RSP.cpp
 +++ b/GLideN64/src/RSP.cpp
 @@ -23,13 +23,53 @@ using namespace std;
@@ -1503,7 +1503,7 @@ index a6b6078..a488b93 100644
  		*REG.SP_STATUS &= ~(SP_STATUS_TASKDONE | SP_STATUS_HALT | SP_STATUS_BROKE);
  		return;
  	}
-@@ -287,6 +372,16 @@ void RSP_Init()
+@@ -287,6 +372,21 @@ void RSP_Init()
  		TFH.shutdown();
  
  	strncpy(RSP.romname, romname, 21);
@@ -1516,6 +1516,11 @@ index a6b6078..a488b93 100644
 +		ctr64_gfx_infloop_seen = true;
 +	if (strstr(RSP.romname, "Rayman 2") != nullptr)
 +		ctr64_gfx_infloop_seen = ctr64_gfx_inline_game = true; /* inline, not streamed (gfx_async.c) */
++	/* Donald Duck (Goin' Quackers / Quack Attack) loses a full sync the same way after "New game";
++	 * gfx_async.c's rescue unfroze it, but the game then sent half its audio tasks (audio slow and
++	 * stuttering, HW playtest 2026-11-20). Inline from the start it never loses one. */
++	if (strncmp(RSP.romname, "Donald Duck", 11) == 0)
++		ctr64_gfx_infloop_seen = ctr64_gfx_inline_game = true;
 +#endif
  	setDepthClearColor();
  	config.generalEmulation.hacks = 0;
@@ -1879,7 +1884,7 @@ index e62ff60..aa89a0b 100644
  
  private:
 diff --git a/GLideN64/src/Textures.cpp b/GLideN64/src/Textures.cpp
-index abfdaa3..d26aeb9 100644
+index abfdaa3..0a36dc8 100644
 --- a/GLideN64/src/Textures.cpp
 +++ b/GLideN64/src/Textures.cpp
 @@ -1,3 +1,4 @@
@@ -2146,7 +2151,22 @@ index abfdaa3..d26aeb9 100644
  
  	return crc;
  }
-@@ -2063,6 +2209,7 @@ void TextureCache::toggleDumpTex()
+@@ -1960,6 +2106,14 @@ void TextureCache::activateMSDummy(u32 _t)
+ 
+ void TextureCache::_updateBackground()
+ {
++#ifdef __3DS__
++	/* ctr64: a background whose format or size is out of range indexes past ImageFormat's tlp
++	 * table in _loadBackground (Iggy's Reckin' Balls: data abort on the Iguana logo, HW
++	 * 2026-11-20); one reaching past RDRAM is read past it. Keep the last background instead. */
++	if (gSP.bgImage.format > 4 || gSP.bgImage.size > 3 ||
++		gSP.bgImage.address + ((u64)gSP.bgImage.width * gSP.bgImage.height << gSP.bgImage.size >> 1) > RDRAMSize)
++		return;
++#endif
+ 	u32 numBytes = gSP.bgImage.width * gSP.bgImage.height << gSP.bgImage.size >> 1;
+ 	u64 crc;
+ 
+@@ -2063,6 +2217,7 @@ void TextureCache::toggleDumpTex()
  
  void TextureCache::update(u32 _t)
  {
@@ -2154,7 +2174,7 @@ index abfdaa3..d26aeb9 100644
  	const gDPTile * pTile = gSP.textureTile[_t];
  	switch (pTile->textureMode) {
  	case TEXTUREMODE_BGIMAGE:
-@@ -2110,7 +2257,11 @@ void TextureCache::update(u32 _t)
+@@ -2110,7 +2265,11 @@ void TextureCache::update(u32 _t)
  	params.width = sizes.width;
  	params.height = sizes.height;
  
@@ -2167,7 +2187,7 @@ index abfdaa3..d26aeb9 100644
  
  	if (current[_t] != nullptr && current[_t]->crc == crc) {
  		activateTexture(_t, current[_t]);
-@@ -2135,7 +2286,10 @@ void TextureCache::update(u32 _t)
+@@ -2135,7 +2294,10 @@ void TextureCache::update(u32 _t)
  
  		if (currentTex.bHDTexture)
  			m_hdTexCacheSize -= currentTex.textureBytes;

@@ -895,6 +895,17 @@ static void run_game(void)
                         fprintf(g_stats, "  audio underruns: %u, queue target %u ms\n", ctr64_audio_underruns,
                                 ctr64_audio_target_ms);
                     ctr64_audio_underruns = 0;
+                    { /* audio the game made per VI (expected: rate / 59.83) */
+                        extern unsigned ctr64_audio_in_frames, ctr64_vi_count;
+                        static unsigned last_vi;
+                        const unsigned vis = ctr64_vi_count - last_vi;
+                        if (vis)
+                            fprintf(g_stats, "  audio in: %u frames over %u VIs = %.1f per VI at %u Hz (%.1f expected)\n",
+                                    ctr64_audio_in_frames, vis, (double)ctr64_audio_in_frames / vis, audio_ndsp_rate(),
+                                    audio_ndsp_rate() / 59.826);
+                        ctr64_audio_in_frames = 0;
+                        last_vi = ctr64_vi_count;
+                    }
                     frames_seen = ctr64_vi_frames;
                 }
                 { /* DEV ONLY - remove: commands that ended triangle batches (count, same words as before) */
