@@ -8984,7 +8984,7 @@ index 3063aa1..6568e87 100644
  }
  
 diff --git a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
-index 99767bc..f5ea419 100644
+index 99767bc..67f96ea 100644
 --- a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 +++ b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 @@ -21,7 +21,9 @@
@@ -9046,7 +9046,7 @@ index 99767bc..f5ea419 100644
              for(i=0; i<length; i++) {
                  spmem[(memaddr^S8) & 0xfff] = dram[(dramaddr^S8) & 0x7fffff];
                  memaddr++;
-@@ -143,8 +173,20 @@ static void fifo_pop(struct rsp_core* sp)
+@@ -143,8 +173,25 @@ static void fifo_pop(struct rsp_core* sp)
      }
  }
  
@@ -9059,7 +9059,12 @@ index 99767bc..f5ea419 100644
  {
 +#if defined(__3DS__)
 +    /* a streamed display list still open: finish it first, as an inline one would be */
-+    if (ctr64_sp_resume == 2 && sp->rsp_task_locked) {
++    /* Not for a yield request alone (set SIG0, osSpTaskYield; Gauntlet Legends every frame to
++     * run its audio task): the HLE never yields, the game waits for the SP interrupt of the
++     * finished task either way, and its other threads run meanwhile instead of the whole
++     * emulation waiting for the worker. Dev switch syncyield.txt: wait as before. */
++    extern bool ctr64_sync_yield;
++    if (ctr64_sp_resume == 2 && sp->rsp_task_locked && (w != 0x400 || ctr64_sync_yield)) {
 +        remove_event(&sp->mi->r4300->cp0.q, SP_INT);
 +        ctr64_stream_settle(sp, true);
 +    }
@@ -9067,7 +9072,7 @@ index 99767bc..f5ea419 100644
      /* clear / set halt */
      if ((w & 0x3) == 0x1) sp->regs[SP_STATUS_REG] &= ~SP_STATUS_HALT;
      if ((w & 0x3) == 0x2) sp->regs[SP_STATUS_REG] |= SP_STATUS_HALT;
-@@ -323,9 +365,158 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
+@@ -323,9 +370,158 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
          masked_write(&sp->regs2[reg], value, mask);
  }
  
@@ -9226,7 +9231,7 @@ index 99767bc..f5ea419 100644
  
      uint32_t sp_delay_time;
  
-@@ -345,6 +536,30 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -345,6 +541,30 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
          new_frame();
  
@@ -9257,7 +9262,7 @@ index 99767bc..f5ea419 100644
          if (sp->mi->regs[MI_INTR_REG] & MI_INTR_DP)
          {
              sp->mi->regs[MI_INTR_REG] &= ~MI_INTR_DP;
-@@ -361,6 +576,20 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -361,6 +581,20 @@ void do_SP_Task(struct rsp_core* sp)
      }
      else if (sp->mem[0xfc0/4] == 2)
      {
@@ -9278,7 +9283,7 @@ index 99767bc..f5ea419 100644
          //audio.processAList();
          sp->regs2[SP_PC_REG] &= 0xfff;
  #if defined(PROFILE)
-@@ -373,6 +602,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -373,6 +607,9 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
  
          sp_delay_time = 4000;
@@ -9288,7 +9293,7 @@ index 99767bc..f5ea419 100644
      }
      else
      {
-@@ -382,6 +614,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -382,6 +619,9 @@ void do_SP_Task(struct rsp_core* sp)
  
          sp_delay_time = 0;
      }
@@ -9298,7 +9303,7 @@ index 99767bc..f5ea419 100644
  
      sp->rsp_task_locked = 0;
      sp->mi->r4300->cp0.interrupt_unsafe_state &= ~INTR_UNSAFE_RSP;
-@@ -391,6 +626,32 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -391,6 +631,32 @@ void do_SP_Task(struct rsp_core* sp)
          sp->mi->r4300->cp0.interrupt_unsafe_state |= INTR_UNSAFE_RSP;
          sp->mi->regs[MI_INTR_REG] |= MI_INTR_SP;
      }
@@ -9331,7 +9336,7 @@ index 99767bc..f5ea419 100644
      if (sp->mi->regs[MI_INTR_REG] & MI_INTR_SP)
      {
          cp0_update_count(sp->mi->r4300);
-@@ -406,6 +667,39 @@ void rsp_interrupt_event(void* opaque)
+@@ -406,6 +672,39 @@ void rsp_interrupt_event(void* opaque)
  {
      struct rsp_core* sp = (struct rsp_core*)opaque;
  

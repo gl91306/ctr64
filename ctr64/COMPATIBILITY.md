@@ -13,8 +13,10 @@ speed).
 
 | Game | Status | Seen on | Notes | Source |
 |---|---|---|---|---|
+| 1080 Snowboarding | Playable | 0.9.2-dev | ~50% with stutter (forum, 0.9.1). It waits for its threads in a loop around osYieldThread; 0.9.2-dev skips that loop while it only returns to the same thread: HW 0.9.2-dev 60 VI/s (was 51), game 30 fps | forum, HW |
 | Animal Forest (Animal Crossing, fan translation) | Issues | 0.9.2-dev | Good speed, drops too often; horizontal/vertical line glitches while walking; drops on room change; froze in Tom Nook's store after ~1 h. Az: boots to the new-game dialogue, graphics right. HW 0.9.2-dev: boot to the K.K. intro ~100% (the 1 h freeze in Nook's store not retested) | forum, Az, HW |
 | Banjo-Kazooie | Perfect | 0.9.1 | Runs really well; near perfect, minimal occasional stutter (played to Mumbo's Mountain) | forum |
+| Banjo-Tooie | Playable | 0.9.2-dev | Gray square around Banjo, slow (forum, 0.9.1). HW 0.9.2-dev: Spiral Mountain 59.2 VI/s (min 51); the square not seen in our runs or in play | forum, HW |
 | Beetle Adventure Racing! | Playable | 0.9.2-dev | Good; minor graphics glitches; small drops (e.g. crashing into a wall). HW 0.9.2-dev: intro/demo/main menu 100% (race not reached) | forum, HW |
 | Blast Corps | Good | 0.9.2-dev | 0.9.1 froze in the bulldozer intro (two RDP interrupts merged when two display lists were in flight; fixed in rdp_core.c). Ground glitches fixed: light/shadow pools came out as black squares (8-bit frame buffer read as RGBA; now red-to-all like GLideN64) and, with anti-aliasing on HW only, whole ground patches were missing (huge off-screen triangles dropped by the 3DS rasterizer; now clipped to a guard band). HW 0.9.2-dev: intro and gameplay 96-98%, one heavy scene ~75%; boot to the first level ~100%, no crash (a 0.9.1 crash report in the first level came with the two-interrupt problem above). The whole-system freeze from the forum report not seen | forum, HW |
 | Bomberman 64: The Second Attack! | Perfect | 0.9.0 | Near perfect | forum |
@@ -24,16 +26,20 @@ speed).
 | Command & Conquer | Playable | 0.9.2-dev | ~99.5% in our run | HW |
 | Conker's Bad Fur Day | Issues | 0.9.2-dev | Boot to gameplay on HW: mostly 87-100%; rain intro ~68% and one cutscene stretch ~73% (both CPU and video bound); 64 MB ROM now loads whole (178 MB mode), no SD streaming hitches | HW |
 | Diddy Kong Racing | Perfect | 0.9.0 | Near perfect | forum |
-| Donald Duck: Goin' Quackers | Broken | 0.9.0 | Picture freezes before gameplay, sound continues | forum |
+| Donald Duck: Goin' Quackers | Playable | 0.9.2-dev | Picture froze after "New game", sound went on (forum, 0.9.0; HW 0.9.2-dev the same): the game rewrote a display list before the video thread had read it, its RDP interrupt was lost and it waited for it. 0.9.2-dev notices that wait, raises the interrupt and runs the game's display lists on the CPU thread from then on. Az: into the first cutscenes. HW 0.9.2-dev before the fix: menus 90-100% | forum, Az, HW |
 | Donkey Kong 64 | Playable | 0.9.2-dev | Major graphics glitches, major stutter (0.9.0-0.9.1). The intro (DK Rap) drew a red wall and no dancers since 0.9.0: the game switches the FPU register mode (Status.FR) and the recompiler took back code compiled for the other mode; fixed in 0.9.2-dev. Shade subdivision made 1 M triangles/s in the intro; capped. HW 0.9.2-dev: intro renders right at 70-100% (was 23%, one 39% stretch early on); gameplay on DK Isles (new game, walking and swimming) ~91%, renders right; video thread CPU-bound (display lists ~17 ms/VI, no single hotspot). Froze once in game on HW (cause unknown, not reproduced since) | forum, Az, HW |
+| Doom 64 | Perfect | 0.9.2-dev | Near perfect (forum, 0.9.1). HW 0.9.2-dev: boot and menus 100% | forum, HW |
 | Dr. Mario 64 | Perfect | 0.9.1 | Near perfect | forum |
 | Duck Dodgers Starring Daffy Duck | Playable | 0.9.2-dev | Stages stutter, 50-80% (forum). HW 0.9.2-dev: boot to the opening scene 100%; hub walking 100% (from a save state; stages not checked) | forum, Az, HW |
-| Extreme-G | Playable | 0.9.0 | Runs great, some audio stutter | forum |
-| F-Zero X | Playable | 0.9.1 | Runs great, a little audio stutter; black vehicles of 0.9.0 fixed in 0.9.1 | forum |
-| Gauntlet Legends | Issues | 0.9.2-dev | ~20% speed (forum). Black screen with threaded video (all versions): its display lists branch to themselves; fixed in 0.9.2-dev (its display lists run on the CPU thread). 0.9.2-dev: the self-looping list is no longer restarted 35000 times a second, no 832x960 buffers. HW 0.9.2-dev: menus 96-99%, attract ~40%, gameplay 28-39% (still CPU-bound: GLideN64 display-list work ~20 ms per frame) | forum, Az, HW |
+| Extreme-G | Playable | 0.9.2-dev | Runs great, some audio stutter (forum, 0.9.0). HW 0.9.2-dev: menus and first race 90-100% | forum, HW |
+| F-Zero X | Playable | 0.9.2-dev | Runs great, a little audio stutter; black vehicles of 0.9.0 fixed in 0.9.1; Port Town start hitch (forum). HW 0.9.2-dev: menus and a Mute City race 89-100%, ~75% for a few seconds around the race start | forum, HW |
+| FIFA 99 | Playable | 0.9.2-dev | Decent speed (forum, 0.9.1). HW 0.9.2-dev: menus and a match 87-100%, ~68% at kick-off | forum, HW |
+| Gauntlet Legends | Playable | 0.9.2-dev | ~20% speed (forum). Black screen with threaded video (all versions): its display lists branch to themselves; fixed in 0.9.2-dev (its display lists run on the CPU thread). 0.9.2-dev: the self-looping list is no longer restarted 35000 times a second, no 832x960 buffers. HW 0.9.2-dev: menus 96-99%, attract ~40%; gameplay was 28-46%: every frame the game asks its graphics task to yield (for audio) and the whole emulation waited for the video thread. A yield request no longer waits (the HLE never yields; the game waits for the task itself while its other threads run): gameplay 76-84%, the game drawing every other VI, audio underruns 357 -> 38 in the same run | forum, Az, HW |
+| Glover | Perfect | 0.9.2-dev | Near perfect (forum, 0.9.1). HW 0.9.2-dev: boot, menus and name entry 90-100% | forum, HW |
 | GoldenEye 007 | Playable | 0.9.2-dev | 96.6-99.7% | HW |
 | Harvest Moon 64 | Playable | 0.9.2-dev | Almost perfect, minor stutter. HW 0.9.2-dev: boot/title/name entry ~100% | forum, HW |
-| Hydro Thunder | Issues | 0.9.0 | 50-100%; graphics fine | forum |
+| Hydro Thunder | Playable | 0.9.2-dev | 50-100% (0.9.0); froze after ~15 min (forum, 0.9.1). Az 0.9.2-dev: 16 min (a full race, then the initials screen), no freeze. HW 0.9.2-dev: menus 100%, first race 80-92% (video thread bound) | forum, Az, HW |
+| Iggy's Reckin' Balls | Playable | 0.9.2-dev | Very glitched graphics, froze after a few seconds in game (forum, 0.9.1). HW 0.9.2-dev: 60 VI/s, game 30 fps, 1800 VIs in game clean; glitches and freeze not seen | forum, HW |
 | Jet Force Gemini | Playable | 0.9.2-dev | ~99.5% in our run; stutter and audio stutter reported | HW, forum |
 | Kirby 64: The Crystal Shards | Playable | 0.9.2-dev | Glitches of 0.9.0 gone; minor drops (collecting shards). HW 0.9.2-dev: to the first level tutorial ~100% | forum, HW |
 | Legend of Zelda: Majora's Mask | Playable | 0.9.2-dev | 96.8-99.7% | HW |
@@ -44,14 +50,19 @@ speed).
 | Mario Tennis | Playable | 0.9.2-dev | ~75%; graphics fixed in 0.9.1; sometimes a match doesn't start (0.9.0). Az: menus render right. HW 0.9.2-dev: intro/menus were 45-55% (its 384x240 picture got 480-line buffers, 768x960 at 2x, rendered outside VRAM); fixed: now ~100% through intro and menus with anti-aliasing (matches not reached) | forum, Az, HW |
 | Mickey's Speedway USA | Playable | 0.9.2-dev | Full speed most of the time in game; big drops in menus. HW 0.9.2-dev: to the house hub 96-100% | forum, HW |
 | Micro Machines 64 Turbo | Perfect | 0.9.1 | Near perfect | forum |
+| Mischief Makers | Playable | 0.9.2-dev | A bit of stutter in game (forum, 0.9.1). HW 0.9.2-dev: 60 VI/s | forum, HW |
 | Ms. Pac-Man: Maze Madness | Playable | 0.9.2-dev | Minor slowdowns. HW 0.9.2-dev: to the title ~100% | forum, HW |
 | Mystical Ninja Starring Goemon | Playable | 0.9.2-dev | 0.9.0 glitches mostly gone; some audio stutter. Az: gameplay renders right. HW 0.9.2-dev: into gameplay 83-100%, one ~40% stretch in the intro | forum, Az, HW |
 | Paper Mario | Playable | 0.9.2-dev | ~100%; audio stutter on room change (adaptive audio queue added in 0.9.2-dev, compile stalls remain) | HW, forum |
+| Paper Mario: TTYD64 (ROM hack) | Issues | 0.9.2-dev | Crash when checking the bush with the hammer (report, 0.9.1; Luma dump: the 3DS kernel itself, on the video thread's core during a timed wait). HW 0.9.2-dev: boot to Goomba Village 90-100% (bush not reached yet) | report, HW |
 | Pilotwings 64 | Issues | 0.9.2-dev | 98-99.6%; Class A rocket pack mission 2: rain makes the whole screen flash (not reproduced yet: Class A needs a save with Beginner class done) | HW, forum |
 | Pokemon Puzzle League | Playable | 0.9.2-dev | Near perfect in game, stutter in menus. HW 0.9.2-dev: menus/Puzzle Village ~100% | forum, HW |
 | Rat Attack! | Good | 0.9.2-dev | 0.9.1 ~20% speed. HW 0.9.2-dev: menus and first level ~100% (boot 77%) | forum, HW |
 | Rayman 2: The Great Escape | Issues | 0.9.2-dev | Froze after ~5 min (music continues; forum): with threaded video the game rewrote a display list before the video thread had read it. Fixed in 0.9.2-dev (its display lists run on the CPU thread; Azahar from a save state froze at ~VI 5600 before, clean to 8000 after). HW 0.9.2-dev: no freeze in a 6500-VI run; gameplay 60-90%, some scenes ~100% | forum, Az, HW |
 | Ridge Racer 64 | Perfect | 0.9.0 | Near perfect | forum |
+| Rocket: Robot on Wheels | Playable | 0.9.2-dev | Drops here and there (forum, 0.9.1); black screen after loading a state (fixed: default scissor). HW 0.9.2-dev: 59.7 VI/s (min 54) | forum, HW |
+| S.C.A.R.S. | Playable | 0.9.2-dev | Needed frameskip 2 (forum, 0.9.1). Hung the console on HW (a new 1.25 MB depth buffer every frame until memory ran out; fixed). HW 0.9.2-dev: 59.8 VI/s | forum, HW |
+| Smash Remix (ROM hack) | Playable | 0.9.2-dev | Battles full speed. All-Star with Terry crashes at GAME SET: the same on the PC core (not ctr64). Switching characters very fast with R can freeze (the game rewrites graphics data the video thread is still drawing; avoidable) | forum, HW, Az |
 | Snowboard Kids 2 | Perfect | 0.9.0 | Near perfect | forum |
 | Space Invaders | Playable | 0.9.2-dev | Minor stutter. HW 0.9.2-dev: 100% | forum, HW |
 | Star Fox 64 | Playable | 0.9.2-dev | ~99.5% | HW |

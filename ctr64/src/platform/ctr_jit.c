@@ -575,6 +575,13 @@ void ctr_jit_init(void *base, unsigned int size)
         if (q)
             fclose(q);
     }
+    {   /* dev switch syncyield.txt: a yield request waits for a streamed display list (rsp_core.c) */
+        extern bool ctr64_sync_yield;
+        FILE *q = fopen("sdmc:/3ds/ctr64/syncyield.txt", "r");
+        ctr64_sync_yield = q != NULL;
+        if (q)
+            fclose(q);
+    }
     {   /* dev switch nostream.txt: display lists that branch to themselves run inline (gfx_async.c) */
         extern bool ctr64_gfx_nostream;
         FILE *q = fopen("sdmc:/3ds/ctr64/nostream.txt", "r");

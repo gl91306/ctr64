@@ -71,7 +71,19 @@ static unsigned g_put, g_got;               /* commands queued / completed */
 static unsigned g_dlists_put, g_dlists_got; /* display lists queued / completed */
 static unsigned g_dlists_taken;             /* display list results consumed by the core */
 static unsigned g_nodp_score = 64;          /* recent display lists without a full sync (x32); a game starts "mixing" until 64 lists with one */
+bool ctr64_sync_yield;                      /* dev switch syncyield.txt (rsp_core.c update_sp_status) */
 bool ctr64_gfx_forcedp;                     /* dev switch forcedp.txt (see ctr64_gfx_dlist_finish) */
+/* A lost full sync the game then waits for (Donald Duck: Goin' Quackers after "New game"; the
+ * picture froze, music played on): no display list for LOST_WAIT_VIS VIs after it. Then the
+ * interrupt is raised late and the game's lists run inline from then on (no race left). Blast
+ * Corps' intro sends two lists without a full sync on purpose and goes on with more lists, so
+ * it is left alone (raising at once hung it). */
+#define LOST_WAIT_VIS 30
+static bool g_lost;
+static unsigned g_lost_vi, g_lost_calls, g_dl_calls;
+unsigned ctr64_gfx_lost_rescued; /* stats.log / core.log */
+extern bool ctr64_gfx_inline_game, ctr64_gfx_infloop_seen;
+extern unsigned ctr64_vi_count;
 unsigned ctr64_gfx_dp_forced;               /* stats.log: lost full syncs raised anyway */
 static LightLock g_lock;
 /* Waits re-check their condition this often: a wakeup between cores was seen to get lost
@@ -362,6 +374,11 @@ bool ctr64_gfx_dlist_finish(void)
         if (g_nodp_score < 64) {
             dp = ctr64_gfx_forcedp;
             ctr64_gfx_dp_forced++;
+            /* watched from the VI (w_update_screen): if the game sends no further display list,
+             * it is waiting for that lost interrupt */
+            g_lost = !dp && !ctr64_gfx_inline_game;
+            g_lost_vi = ctr64_vi_count;
+            g_lost_calls = g_dl_calls;
         }
         if (g_nodp_score < 4096)
             g_nodp_score += 32;
@@ -500,6 +517,7 @@ int ctr64_gfx_stream_poll(unsigned elapsed, bool *dp)
 
 static void w_process_dlist(void)
 {
+    g_dl_calls++;
     ctr64_gfx_stream = false;
     if (ctr64_gfx_infloop_seen && !ctr64_gfx_nostream && !ctr64_gfx_inline_game && threaded()) {
         extern unsigned ctr64_gfx_pending; /* rsp_core.c */
@@ -538,6 +556,18 @@ static void w_update_screen(void)
             win_frames = ctr64_vi_frames;
         }
     }
+    if (g_lost) {
+        if (g_dl_calls != g_lost_calls)
+            g_lost = false; /* the game went on */
+        else if (ctr64_vi_count - g_lost_vi >= LOST_WAIT_VIS) {
+            g_lost = false;
+            ctr64_gfx_lost_rescued++;
+            ctr64_gfx_infloop_seen = ctr64_gfx_inline_game = true;
+            signal_rcp_interrupt(&g_dev.mi, MI_INTR_DP);
+            extern void ctr64_log_line(const char *line);
+            ctr64_log_line("video thread: lost full sync, the game waited for it; raised it, display lists inline from now");
+        }
+    }
     if (threaded())
         enqueue(C_SCREEN);
     else
@@ -572,7 +602,7 @@ static void w_show_cfb(void)
 static void w_process_rdp_list(void) { run_inline(C_QUIT, g_orig.processRDPList); }
 static void w_change_window(void) { ctr64_gfx_drain(); g_orig.changeWindow(); }
 static void w_rom_closed(void) { ctr64_gfx_drain(); g_orig.romClosed(); }
-static int w_rom_open(void) { ctr64_gfx_drain(); ctr64_gfx_infloop_seen = false; ctr64_gfx_inline_game = false; g_nodp_score = 64; return g_orig.romOpen(); }
+static int w_rom_open(void) { ctr64_gfx_drain(); ctr64_gfx_infloop_seen = false; ctr64_gfx_inline_game = false; g_nodp_score = 64; g_lost = false; return g_orig.romOpen(); }
 static void w_move_screen(int x, int y) { ctr64_gfx_drain(); g_orig.moveScreen(x, y); }
 static void w_read_screen(void *d, int *w, int *h, int f) { ctr64_gfx_drain(); g_orig.readScreen(d, w, h, f); }
 static void w_resize(int w, int h) { ctr64_gfx_drain(); g_orig.resizeVideoOutput(w, h); }
