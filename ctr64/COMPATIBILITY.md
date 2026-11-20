@@ -54,7 +54,7 @@ speed).
 | Ms. Pac-Man: Maze Madness | Playable | 0.9.2-dev | Minor slowdowns. HW 0.9.2-dev: to the title ~100% | forum, HW |
 | Mystical Ninja Starring Goemon | Playable | 0.9.2-dev | 0.9.0 glitches mostly gone; some audio stutter. Az: gameplay renders right. HW 0.9.2-dev: into gameplay 83-100%, one ~40% stretch in the intro | forum, Az, HW |
 | Paper Mario | Playable | 0.9.2-dev | ~100%; audio stutter on room change (adaptive audio queue added in 0.9.2-dev, compile stalls remain) | HW, forum |
-| Paper Mario: TTYD64 (ROM hack) | Issues | 0.9.2-dev | Crash when checking the bush with the hammer (report, 0.9.1; Luma dump: the 3DS kernel itself, on the video thread's core during a timed wait). HW 0.9.2-dev: boot to Goomba Village 90-100% (bush not reached yet). Characters were drawn white (a two-cycle combiner lost its texture product); fixed | report, HW |
+| Paper Mario: TTYD64 (ROM hack) | Issues | 0.9.2-dev | Crash when checking the bush with the hammer (report, 0.9.1; Luma dump: the 3DS kernel itself, on the video thread's core during a timed wait). HW 0.9.2-dev: boot to Goomba Village 90-100% (bush not reached yet). Characters were drawn white (a two-cycle combiner lost its texture product); fixed, HW-checked in the opening scene | report, HW |
 | Pilotwings 64 | Issues | 0.9.2-dev | 98-99.6%; Class A rocket pack mission 2: rain makes the whole screen flash (not reproduced yet: Class A needs a save with Beginner class done) | HW, forum |
 | Pokemon Puzzle League | Playable | 0.9.2-dev | Near perfect in game, stutter in menus. HW 0.9.2-dev: menus/Puzzle Village ~100% | forum, HW |
 | Rat Attack! | Good | 0.9.2-dev | 0.9.1 ~20% speed. HW 0.9.2-dev: menus and first level ~100% (boot 77%) | forum, HW |
@@ -65,7 +65,7 @@ speed).
 | Smash Remix (ROM hack) | Playable | 0.9.2-dev | Battles full speed. All-Star with Terry crashes at GAME SET: the same on the PC core (not ctr64). Switching characters very fast with R can freeze (the game rewrites graphics data the video thread is still drawing; avoidable) | forum, HW, Az |
 | Snowboard Kids 2 | Perfect | 0.9.0 | Near perfect | forum |
 | Space Invaders | Playable | 0.9.2-dev | Minor stutter. HW 0.9.2-dev: 100% | forum, HW |
-| Star Fox 64 | Playable | 0.9.2-dev | ~99.5% | HW |
+| Star Fox 64 | Playable | 0.9.2-dev | ~99.5%. Garbage strips at the picture edges with anti-aliasing (2x buffers, copies to RDRAM): AA is off for this game for now (strips gone on HW); a real fix is planned | HW |
 | Star Soldier: Vanishing Earth | Perfect | 0.9.0 | Near perfect | forum |
 | Star Wars Episode I: Racer | Playable | 0.9.2-dev | Almost perfect in game, stutter in menus. HW 0.9.2-dev: title 95-100%, but name entry was 15-20% (its 480-line menus at 2x needed 8 MB, rendered outside VRAM); fixed: such a game drops anti-aliasing to 1x; now 100% through title/menus/name entry | forum, HW |
 | Super Mario 64 | Perfect | 0.9.2-dev | ~99.5-99.9% | HW, forum |

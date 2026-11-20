@@ -3593,7 +3593,7 @@ index 8e3d81e..5631e74 100644
  
  #ifdef ANDROID
 diff --git a/custom/GLideN64/mupenplus/Config_mupenplus.cpp b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
-index fb51f34..2f8487b 100644
+index fb51f34..5f4ecf6 100644
 --- a/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 +++ b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 @@ -11,6 +11,8 @@
@@ -3647,7 +3647,7 @@ index fb51f34..2f8487b 100644
  
  	config.generalEmulation.hacks = hacks;
  
-@@ -230,5 +252,104 @@ extern "C" void Config_LoadConfig()
+@@ -230,5 +252,108 @@ extern "C" void Config_LoadConfig()
  		LoadCustomSettings(false);
  	}
  
@@ -3673,7 +3673,9 @@ index fb51f34..2f8487b 100644
 +	 *   delay) could finish inside that gap, when other threads ran first: the mark then stayed
 +	 *   set with nothing running, the next audio task asked a yield of an idle RSP and the game
 +	 *   waited forever (HW freezes after 1-15 minutes of racing, 2026-11-20). A real RSP takes
-+	 *   milliseconds per frame: report display lists done 50000 counts (~1 ms) on. */
++	 *   milliseconds per frame: report display lists done 50000 counts (~1 ms) on.
++	 * - Star Fox 64: no anti-aliasing: with 2x frame buffers its copies to RDRAM brought back
++	 *   4-pixel garbage strips at the picture's edges (HW only; none without AA, 2026-11-20). */
 +	bool ctr64_no_aa = false;
 +	{
 +		extern unsigned ctr64_copy_every;
@@ -3697,6 +3699,8 @@ index fb51f34..2f8487b 100644
 +			}
 +			if (strstr(RSP.romname, "YOSHI STORY") != nullptr)
 +				config.graphics2D.bgMode = Config::BGMode::bgStripped;
++			if (strncmp(RSP.romname, "STARFOX64", 9) == 0)
++				ctr64_no_aa = true;
 +			if (strncmp(RSP.romname, "HYDRO THUNDER", 13) == 0)
 +				ctr64_gfx_sp_delay = 50000;
 +		}
