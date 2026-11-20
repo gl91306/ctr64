@@ -3593,7 +3593,7 @@ index 8e3d81e..5631e74 100644
  
  #ifdef ANDROID
 diff --git a/custom/GLideN64/mupenplus/Config_mupenplus.cpp b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
-index fb51f34..9471896 100644
+index fb51f34..2f8487b 100644
 --- a/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 +++ b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 @@ -11,6 +11,8 @@
@@ -3605,7 +3605,7 @@ index fb51f34..9471896 100644
  #include "../Log.h"
  extern "C" {
  #include "main/util.h"
-@@ -19,6 +21,16 @@ extern "C" {
+@@ -19,6 +21,17 @@ extern "C" {
  
  Config config;
  
@@ -3614,6 +3614,7 @@ index fb51f34..9471896 100644
 + * 2 async; frame buffer emulation on/off */
 +extern "C" int ctr64_setting_fb_copy, ctr64_setting_fb_emulation, ctr64_setting_aa, ctr64_setting_aspect;
 +extern "C" int ctr64_aa_ready(void);
++extern "C" unsigned ctr64_gfx_sp_delay; /* rsp_core.c */
 +int g_ctr64AaApplied = 0, g_ctr64AspectApplied = 0;
 +extern u32 g_ctr64GameCopyToRDRAM;
 +extern int g_ctr64FbEmulationApplied;
@@ -3622,7 +3623,7 @@ index fb51f34..9471896 100644
  std::string replaceChars(std::string myString)
  {
  	for (size_t pos = myString.find(' '); pos != std::string::npos; pos = myString.find(' ', pos))
-@@ -171,7 +183,13 @@ extern "C" void Config_LoadConfig()
+@@ -171,7 +184,13 @@ extern "C" void Config_LoadConfig()
  	config.frameBufferEmulation.copyFromRDRAM = EnableCopyColorFromRDRAM;
  
  	// TODO: Make this a Core options or maybe only default to bsOnVerticalInterrupt on Android with Thr Renderer
@@ -3636,7 +3637,7 @@ index fb51f34..9471896 100644
  
  #ifdef HAVE_OPENGLES2
  	config.generalEmulation.enableFragmentDepthWrite = 0;
-@@ -220,6 +238,9 @@ extern "C" void Config_LoadConfig()
+@@ -220,6 +239,9 @@ extern "C" void Config_LoadConfig()
  	config.textureFilter.txHiresTextureFileStorage = EnableEnhancedHighResStorage;
  	config.textureFilter.txHiresVramLimit = MaxHiResTxVramLimit;
  	config.frameBufferEmulation.nativeResFactor = EnableNativeResFactor;
@@ -3646,7 +3647,7 @@ index fb51f34..9471896 100644
  
  	config.generalEmulation.hacks = hacks;
  
-@@ -230,5 +251,95 @@ extern "C" void Config_LoadConfig()
+@@ -230,5 +252,104 @@ extern "C" void Config_LoadConfig()
  		LoadCustomSettings(false);
  	}
  
@@ -3666,11 +3667,18 @@ index fb51f34..9471896 100644
 +	 *   FCRAM and the GPU hung, freezing the console (HW 2026-11-20; fine without AA).
 +	 * - Banjo-Kazooie: the intro's jigsaw pieces are cut from a frame the CPU reads in RDRAM
 +	 *   (black without copies; the double-buffered copy comes too late, and one copy in 4 frames
-+	 *   misses the frame it reads): sync copies (HW gameplay still fine). */
++	 *   misses the frame it reads): sync copies (HW gameplay still fine).
++	 * - Hydro Thunder: its main thread hands a frame to its scheduler and only then marks the
++	 *   RSP busy. A display list reported done 1000 counts after its start (the HLE's usual
++	 *   delay) could finish inside that gap, when other threads ran first: the mark then stayed
++	 *   set with nothing running, the next audio task asked a yield of an idle RSP and the game
++	 *   waited forever (HW freezes after 1-15 minutes of racing, 2026-11-20). A real RSP takes
++	 *   milliseconds per frame: report display lists done 50000 counts (~1 ms) on. */
 +	bool ctr64_no_aa = false;
 +	{
 +		extern unsigned ctr64_copy_every;
 +		ctr64_copy_every = 1;
++		ctr64_gfx_sp_delay = 1000;
 +		FILE *f = fopen("sdmc:/3ds/ctr64/nogamefix.txt", "r");
 +		if (f)
 +			fclose(f);
@@ -3689,6 +3697,8 @@ index fb51f34..9471896 100644
 +			}
 +			if (strstr(RSP.romname, "YOSHI STORY") != nullptr)
 +				config.graphics2D.bgMode = Config::BGMode::bgStripped;
++			if (strncmp(RSP.romname, "HYDRO THUNDER", 13) == 0)
++				ctr64_gfx_sp_delay = 50000;
 +		}
 +	}
 +	/* ctr64 video settings override the game's own (custom ini) choices */
@@ -9085,7 +9095,7 @@ index 3063aa1..f4f99a4 100644
  }
  
 diff --git a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
-index 99767bc..33ef204 100644
+index 99767bc..d918f18 100644
 --- a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 +++ b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 @@ -21,7 +21,9 @@
@@ -9147,13 +9157,16 @@ index 99767bc..33ef204 100644
              for(i=0; i<length; i++) {
                  spmem[(memaddr^S8) & 0xfff] = dram[(dramaddr^S8) & 0x7fffff];
                  memaddr++;
-@@ -143,8 +173,25 @@ static void fifo_pop(struct rsp_core* sp)
+@@ -143,8 +173,28 @@ static void fifo_pop(struct rsp_core* sp)
      }
  }
  
 +#if defined(__3DS__)
 +static int ctr64_sp_resume;
 +static void ctr64_stream_settle(struct rsp_core* sp, bool force);
++/* counts from a display list's start (or its streamed end) to its SP interrupt; per game
++ * (Config_mupenplus.cpp: Hydro Thunder) */
++unsigned ctr64_gfx_sp_delay = 1000;
 +#endif
 +
  static void update_sp_status(struct rsp_core* sp, uint32_t w)
@@ -9173,7 +9186,7 @@ index 99767bc..33ef204 100644
      /* clear / set halt */
      if ((w & 0x3) == 0x1) sp->regs[SP_STATUS_REG] &= ~SP_STATUS_HALT;
      if ((w & 0x3) == 0x2) sp->regs[SP_STATUS_REG] |= SP_STATUS_HALT;
-@@ -323,9 +370,181 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
+@@ -323,9 +373,181 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
          masked_write(&sp->regs2[reg], value, mask);
  }
  
@@ -9333,7 +9346,7 @@ index 99767bc..33ef204 100644
 +            /* the bits at once, as the HLE sets them for an inline list (with HALT clear the
 +             * game's next SP_STATUS write would start a task while this one is still ending) */
 +            sp->regs[SP_STATUS_REG] |= SP_STATUS_TASKDONE | SP_STATUS_BROKE | SP_STATUS_HALT;
-+            add_interrupt_event(&sp->mi->r4300->cp0, SP_INT, 1000);
++            add_interrupt_event(&sp->mi->r4300->cp0, SP_INT, ctr64_gfx_sp_delay);
 +            return;
 +        }
 +        /* waits in a branch to itself: from here as an inline one */
@@ -9355,7 +9368,7 @@ index 99767bc..33ef204 100644
  
      uint32_t sp_delay_time;
  
-@@ -345,6 +564,30 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -345,6 +567,30 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
          new_frame();
  
@@ -9386,7 +9399,17 @@ index 99767bc..33ef204 100644
          if (sp->mi->regs[MI_INTR_REG] & MI_INTR_DP)
          {
              sp->mi->regs[MI_INTR_REG] &= ~MI_INTR_DP;
-@@ -361,6 +604,20 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -355,12 +601,30 @@ void do_SP_Task(struct rsp_core* sp)
+                 add_interrupt_event(&sp->mi->r4300->cp0, DP_INT, 4000);
+             }
+         }
++#if defined(__3DS__)
++        sp_delay_time = ctr64_gfx_sp_delay;
++#else
+         sp_delay_time = 1000;
++#endif
+ 
+         protect_framebuffers(&sp->dp->fb);
      }
      else if (sp->mem[0xfc0/4] == 2)
      {
@@ -9407,7 +9430,7 @@ index 99767bc..33ef204 100644
          //audio.processAList();
          sp->regs2[SP_PC_REG] &= 0xfff;
  #if defined(PROFILE)
-@@ -373,6 +630,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -373,6 +637,9 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
  
          sp_delay_time = 4000;
@@ -9417,7 +9440,7 @@ index 99767bc..33ef204 100644
      }
      else
      {
-@@ -382,6 +642,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -382,6 +649,9 @@ void do_SP_Task(struct rsp_core* sp)
  
          sp_delay_time = 0;
      }
@@ -9427,7 +9450,7 @@ index 99767bc..33ef204 100644
  
      sp->rsp_task_locked = 0;
      sp->mi->r4300->cp0.interrupt_unsafe_state &= ~INTR_UNSAFE_RSP;
-@@ -391,6 +654,32 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -391,6 +661,32 @@ void do_SP_Task(struct rsp_core* sp)
          sp->mi->r4300->cp0.interrupt_unsafe_state |= INTR_UNSAFE_RSP;
          sp->mi->regs[MI_INTR_REG] |= MI_INTR_SP;
      }
@@ -9460,7 +9483,7 @@ index 99767bc..33ef204 100644
      if (sp->mi->regs[MI_INTR_REG] & MI_INTR_SP)
      {
          cp0_update_count(sp->mi->r4300);
-@@ -406,6 +695,39 @@ void rsp_interrupt_event(void* opaque)
+@@ -406,6 +702,39 @@ void rsp_interrupt_event(void* opaque)
  {
      struct rsp_core* sp = (struct rsp_core*)opaque;
  

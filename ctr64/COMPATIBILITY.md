@@ -38,7 +38,7 @@ speed).
 | Glover | Perfect | 0.9.2-dev | Near perfect (forum, 0.9.1). HW 0.9.2-dev: boot, menus and name entry 90-100% | forum, HW |
 | GoldenEye 007 | Playable | 0.9.2-dev | 96.6-99.7% | HW |
 | Harvest Moon 64 | Playable | 0.9.2-dev | Almost perfect, minor stutter. HW 0.9.2-dev: boot/title/name entry ~100% | forum, HW |
-| Hydro Thunder | Playable | 0.9.2-dev | 50-100% (0.9.0); froze after ~15 min (forum, 0.9.1). Az 0.9.2-dev: 16 min (a full race, then the initials screen), no freeze. HW 0.9.2-dev: menus 100%, first race 80-92% (video thread bound) | forum, Az, HW |
+| Hydro Thunder | Playable | 0.9.2-dev | 50-100% (0.9.0); froze after ~15 min (forum, 0.9.1). Az 0.9.2-dev: 16 min (a full race, then the initials screen), no freeze. HW 0.9.2-dev: menus 100%, first race 80-92% (video thread bound). Race freeze fixed: display lists now reported done ~1 ms after their start (the game marks the RSP busy only after handing over a frame; a 1000-count finish left the mark stuck and the next audio task waited forever); HW full race, no freeze | forum, Az, HW |
 | Iggy's Reckin' Balls | Playable | 0.9.2-dev | Very glitched graphics, froze after a few seconds in game (forum, 0.9.1). HW 0.9.2-dev: crashed the 3DS once on the Iguana logo (a background image with an invalid format indexed past a table; now skipped); then plays fine, glitches and freeze not seen | forum, HW |
 | Jet Force Gemini | Playable | 0.9.2-dev | ~99.5% in our run; stutter and audio stutter reported | HW, forum |
 | Kirby 64: The Crystal Shards | Playable | 0.9.2-dev | Glitches of 0.9.0 gone; minor drops (collecting shards). HW 0.9.2-dev: to the first level tutorial ~100% | forum, HW |
