@@ -2,6 +2,7 @@
 #include "debug_crumb.h"
 
 #include <malloc.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -259,6 +260,26 @@ void pica_cache_invalidate(const void *p, u32 size)
     GSPGPU_InvalidateDataCache(p, size);
 }
 
+int pica_gpucheck;
+void pica_check(const char *fmt, ...)
+{
+    static int lines;
+    if (lines >= 300)
+        return;
+    FILE *f = fopen("sdmc:/3ds/ctr64/gpucheck.log", "a");
+    if (!f)
+        return;
+    extern unsigned ctr64_vi_count;
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(f, "vi %u: ", ctr64_vi_count);
+    vfprintf(f, fmt, ap);
+    fputc('\n', f);
+    va_end(ap);
+    fclose(f);
+    lines++;
+}
+
 /* DEV hang diagnosis: the last command lists handed to the GPU */
 static struct {
     u32 addr, words;
@@ -380,6 +401,12 @@ static void apt_hook(APT_HookType type, void *param)
 
 bool pica_init(void)
 {
+    {
+        FILE *f = fopen("sdmc:/3ds/ctr64/gpucheck.txt", "r");
+        pica_gpucheck = f != NULL;
+        if (f)
+            fclose(f);
+    }
     memset(&P, 0, sizeof(P));
     for (int i = 0; i < SLOT_COUNT; i++) {
         P.slots[i].cmd = linearMemAlign(CMDBUF_BYTES, 16);
@@ -623,6 +650,7 @@ void pica_flush(void)
 
 void pica_untile_rgba8(const void *src, u16 width, u16 rows, void *dst)
 {
+    PICA_CHECK(!width || !rows || (width & 7) || (rows & 7) || width > 1024 || rows > 1024, "%s %ux%u", __func__, width, rows);
     pica_flush();
     queue_reserve(1);
     GX_DisplayTransfer((u32 *)src, GX_BUFFER_DIM(width, rows), (u32 *)dst, GX_BUFFER_DIM(width, rows),
@@ -637,6 +665,7 @@ void pica_untile_rgba8(const void *src, u16 width, u16 rows, void *dst)
  * pica_wait_fence(pica_fence() taken right after this call), then pica_cache_invalidate. */
 void pica_untile_rgba8_async(const void *src, u16 width, u16 rows, void *dst)
 {
+    PICA_CHECK(!width || !rows || (width & 7) || (rows & 7) || width > 1024 || rows > 1024, "%s %ux%u", __func__, width, rows);
     pica_flush();
     queue_reserve(1);
     GX_DisplayTransfer((u32 *)src, GX_BUFFER_DIM(width, rows), (u32 *)dst, GX_BUFFER_DIM(width, rows),
@@ -650,6 +679,7 @@ void pica_untile_rgba8_async(const void *src, u16 width, u16 rows, void *dst)
  * supersampling resolve, the average bilinear sampling at exactly half size gives */
 void pica_downscale2_rgba8(const void *src, u16 width, u16 rows, void *dst)
 {
+    PICA_CHECK(!width || !rows || (width & 7) || (rows & 7) || width > 1024 || rows > 1024, "%s %ux%u", __func__, width, rows);
     pica_flush();
     queue_reserve(1);
     GX_DisplayTransfer((u32 *)src, GX_BUFFER_DIM(width, rows), (u32 *)dst, GX_BUFFER_DIM(width / 2, rows / 2),
@@ -661,6 +691,7 @@ void pica_downscale2_rgba8(const void *src, u16 width, u16 rows, void *dst)
 /* linear RGBA8 (width x rows, multiples of 8) to tiled, queued after everything submitted so far */
 void pica_tile_rgba8(const void *src, u16 width, u16 rows, void *dst)
 {
+    PICA_CHECK(!width || !rows || (width & 7) || (rows & 7) || width > 1024 || rows > 1024, "%s %ux%u", __func__, width, rows);
     pica_flush();
     queue_reserve(1);
     GX_DisplayTransfer((u32 *)src, GX_BUFFER_DIM(width, rows), (u32 *)dst, GX_BUFFER_DIM(width, rows),
@@ -816,6 +847,7 @@ static void fill_any_impl(void *p, u32 bytes, u32 value, u32 bpp)
 {
     if (!bytes)
         return;
+    PICA_CHECK(((u32)p & 7) || (bytes & 15), "fill %p bytes %lu (%s)", p, (unsigned long)bytes, g_fill_who);
     g_fill_vram = is_vram(p);
     if (is_vram(p) || g_fcram_fill || !g_fill_scratch) {
         queue_reserve(1);
@@ -913,6 +945,7 @@ void pica_clear(const PicaTarget *t, u32 rgba, bool clear_depth, u32 depth24)
  * (Azahar allows it). */
 void pica_copy(void *dst, const void *src, u32 bytes)
 {
+    PICA_CHECK(!bytes || (bytes & 15) || ((u32)dst & 7) || ((u32)src & 7), "copy %p <- %p bytes %lu", dst, src, (unsigned long)bytes);
     pica_cache_flush(src, bytes);
     submit_commands();
     queue_reserve(1);
@@ -921,6 +954,7 @@ void pica_copy(void *dst, const void *src, u32 bytes)
 
 void pica_copy_from_vram(void *dst, const void *src, u32 bytes)
 {
+    PICA_CHECK(!bytes || (bytes & 15) || ((u32)dst & 7) || ((u32)src & 7), "copy %p <- %p bytes %lu", dst, src, (unsigned long)bytes);
     submit_commands();
     queue_reserve(1);
     GX_TextureCopy((u32 *)src, 0, (u32 *)dst, 0, bytes, GX_TRANSFER_RAW_COPY(1));
@@ -930,6 +964,7 @@ void pica_copy_from_vram(void *dst, const void *src, u32 bytes)
  * bytes skipped in dst after each run; queued after everything submitted so far */
 void pica_copy_gap(void *dst, const void *src, u32 bytes, u32 run16, u32 gap16)
 {
+    PICA_CHECK(!bytes || (bytes & 15) || !run16 || (bytes / 16) % run16, "copy_gap bytes %lu run16 %lu gap16 %lu", (unsigned long)bytes, (unsigned long)run16, (unsigned long)gap16);
     submit_commands();
     queue_reserve(1);
     GX_TextureCopy((u32 *)src, GX_BUFFER_DIM(run16, 0), (u32 *)dst, GX_BUFFER_DIM(run16, gap16), bytes,
@@ -938,6 +973,7 @@ void pica_copy_gap(void *dst, const void *src, u32 bytes, u32 run16, u32 gap16)
 
 void pica_copy_rect(void *dst, const void *src, u32 bytes, u32 run16, u32 in_gap16, u32 out_gap16)
 {
+    PICA_CHECK(!bytes || (bytes & 15) || !run16 || (bytes / 16) % run16, "copy_rect bytes %lu run16 %lu gaps %lu %lu", (unsigned long)bytes, (unsigned long)run16, (unsigned long)in_gap16, (unsigned long)out_gap16);
     submit_commands();
     queue_reserve(1);
     GX_TextureCopy((u32 *)src, GX_BUFFER_DIM(run16, in_gap16), (u32 *)dst, GX_BUFFER_DIM(run16, out_gap16), bytes,

@@ -13,3 +13,9 @@ void pica_state_reset(void);
 void pica_state_flush_framebuffer(void);
 /* Emits any pending uniform/attribute state; called right before a draw trigger. */
 void pica_state_prepare_draw(void);
+
+/* DEV (switch gpucheck.txt): logs to gpucheck.log GPU work that the hardware may hang on while
+ * Azahar accepts it (sizes, alignment, empty ranges); at most 300 lines */
+extern int pica_gpucheck;
+void pica_check(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#define PICA_CHECK(cond, ...) do { if (pica_gpucheck && (cond)) pica_check(__VA_ARGS__); } while (0)

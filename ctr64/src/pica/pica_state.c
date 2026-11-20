@@ -101,6 +101,8 @@ void pica_state_flush_framebuffer(void)
 
 void pica_bind_target(const PicaTarget *t)
 {
+    PICA_CHECK(!t->color || !t->width || !t->height || t->width > 1024 || t->height > 1024 || (t->width & 7) || (t->height & 7),
+               "target %p %ux%u", t->color, t->width, t->height);
     static const u8 color_size_code[] = {2, 1, 0, 0, 0}; /* RGBA8, RGB8, 5551, 565, RGBA4 */
     u32 p[4];
 
@@ -147,6 +149,7 @@ void pica_fb_access(const u32 a[4])
 
 void pica_viewport(u16 x, u16 y, u16 w, u16 h)
 {
+    PICA_CHECK(!w || !h || w > 2048 || h > 2048 || x > 1024 || y > 1024, "viewport %u,%u %ux%u", x, y, w, h);
     u32 v[5];
     v[0] = f32tof24(w / 2.0f);
     v[1] = f32tof31(2.0f / w) << 1;
@@ -163,6 +166,8 @@ void pica_viewport(u16 x, u16 y, u16 w, u16 h)
 
 void pica_scissor(GPU_SCISSORMODE mode, u16 left, u16 top, u16 right, u16 bottom)
 {
+    PICA_CHECK(mode != GPU_SCISSOR_DISABLE && (right <= left || bottom <= top || right > 1024 || bottom > 1024),
+               "scissor mode %d %u,%u-%u,%u", (int)mode, left, top, right, bottom);
     u32 s[3] = {mode, 0, 0};
     if (mode != GPU_SCISSOR_DISABLE) {
         s[1] = ((u32)top << 16) | left;
@@ -377,6 +382,9 @@ void pica_texture(int unit, const void *data, u16 width, u16 height, GPU_TEXCOLO
         return;
     }
 
+    /* sizes that are not powers of two but multiples of 8 are fine (video.c self-test) */
+    PICA_CHECK(width < 8 || height < 8 || width > 1024 || height > 1024 || (width & 7) || (height & 7) || ((u32)data & 7),
+               "texture unit %d %p %ux%u fmt %d", unit, data, width, height, (int)fmt);
     u32 r[5];
     r[0] = 0;                                   /* border color */
     r[1] = height | ((u32)width << 16);         /* dimensions */
@@ -556,6 +564,7 @@ void pica_draw_elements(GPU_Primitive_t prim, const u16 *indices, u32 count)
 {
     if (!count)
         return; /* as pica_draw_arrays */
+    PICA_CHECK((prim == GPU_TRIANGLES && count % 3) || ((u32)indices & 1) || count > 0x10000, "draw_elements prim %d count %lu", (int)prim, (unsigned long)count);
     u32 off = osConvertVirtToPhys(indices) - PICA_BUFFER_BASE_PADDR;
     bool tris = prim == GPU_TRIANGLES;
 
