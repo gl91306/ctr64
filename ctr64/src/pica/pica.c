@@ -489,8 +489,10 @@ const void *pica_top_latest(unsigned *bytes)
 {
     if (!P.top_fb[2])
         return NULL;
-    /* a transfer still waiting to be presented is the newest; else the one presented last */
-    void *p = P.top_fb[P.swap_pending ? P.top_next : (P.top_next + 2) % 3];
+    /* the one presented last: what the LCD shows. A transfer still waiting to be presented may
+     * not have landed yet (Star Fox: the remote SHOT showed a torn image with a doubled ship
+     * that the LCD never did) */
+    void *p = P.top_fb[(P.top_next + 2) % 3];
     GSPGPU_InvalidateDataCache(p, TOP_FB_BYTES);
     *bytes = TOP_FB_BYTES;
     return p;

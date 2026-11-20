@@ -1376,7 +1376,7 @@ index 992548c..00cca35 100644
  
  typedef struct
 diff --git a/GLideN64/src/RSP.cpp b/GLideN64/src/RSP.cpp
-index a6b6078..9045bc9 100644
+index a6b6078..df67714 100644
 --- a/GLideN64/src/RSP.cpp
 +++ b/GLideN64/src/RSP.cpp
 @@ -23,13 +23,53 @@ using namespace std;
@@ -1503,7 +1503,7 @@ index a6b6078..9045bc9 100644
  		*REG.SP_STATUS &= ~(SP_STATUS_TASKDONE | SP_STATUS_HALT | SP_STATUS_BROKE);
  		return;
  	}
-@@ -287,6 +372,21 @@ void RSP_Init()
+@@ -287,6 +372,26 @@ void RSP_Init()
  		TFH.shutdown();
  
  	strncpy(RSP.romname, romname, 21);
@@ -1520,6 +1520,11 @@ index a6b6078..9045bc9 100644
 +	 * gfx_async.c's rescue unfroze it, but the game then sent half its audio tasks (audio slow and
 +	 * stuttering, HW playtest 2026-11-20). Inline from the start it never loses one. */
 +	if (strncmp(RSP.romname, "Donald Duck", 11) == 0)
++		ctr64_gfx_infloop_seen = ctr64_gfx_inline_game = true;
++	/* Mario Golf with its display lists on the video thread: after loading a state it halted within
++	 * a second (Azahar; inline it plays on), and on HW it froze the whole console while the ball
++	 * flew, after a transition drew an empty rectangle (playtest 2026-11-20) */
++	if (strncmp(RSP.romname, "MarioGolf64", 11) == 0)
 +		ctr64_gfx_infloop_seen = ctr64_gfx_inline_game = true;
 +#endif
  	setDepthClearColor();
@@ -4047,10 +4052,18 @@ index 4426728..be19d3e 100644
      }
  }
 diff --git a/mupen64plus-core/src/device/r4300/interrupt.c b/mupen64plus-core/src/device/r4300/interrupt.c
-index 9c81a18..dd6886f 100644
+index 9c81a18..3cc3211 100644
 --- a/mupen64plus-core/src/device/r4300/interrupt.c
 +++ b/mupen64plus-core/src/device/r4300/interrupt.c
-@@ -140,9 +140,11 @@ void add_interrupt_event_count(struct cp0* cp0, int type, unsigned int count)
+@@ -31,6 +31,7 @@
+ #include <assert.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ #include "api/callbacks.h"
+@@ -140,14 +141,29 @@ void add_interrupt_event_count(struct cp0* cp0, int type, unsigned int count)
      unsigned int* cp0_next_interrupt = r4300_cp0_next_interrupt(cp0);
      int* cp0_cycle_count = r4300_cp0_cycle_count(cp0);
  
@@ -4062,6 +4075,24 @@ index 9c81a18..dd6886f 100644
  
      event = alloc_node(&cp0->q.pool);
      if (event == NULL)
+     {
+         DebugMessage(M64MSG_ERROR, "Failed to allocate node for new interrupt event");
++#if defined(__3DS__)
++        { /* ctr64: core.log, what fills the queue (a lost event hangs the game) */
++
++            static unsigned logged;
++            if (logged++ < 3) {
++                extern void ctr64_log_line(const char *line);
++                char b[300]; int n = snprintf(b, sizeof b, "event queue full, adding %x; queued (type@cycles ahead):", type);
++                for (struct node *q = cp0->q.first; q && n < 280; q = q->next)
++                    n += snprintf(b + n, sizeof b - n, " %x@%x", q->data.type, q->data.count - cp0_regs[CP0_COUNT_REG]);
++                ctr64_log_line(b);
++            }
++        }
++#endif
+         return;
+     }
+ 
 diff --git a/mupen64plus-core/src/device/r4300/mips_instructions.def b/mupen64plus-core/src/device/r4300/mips_instructions.def
 index c3a4acf..8ff5e97 100644
 --- a/mupen64plus-core/src/device/r4300/mips_instructions.def
@@ -8934,7 +8965,7 @@ index 05ecdd7..e5714cc 100644
      r4300_check_interrupt(mi->r4300, CP0_CAUSE_IP2, mi->regs[MI_INTR_REG] & mi->regs[MI_INTR_MASK_REG]);
  }
 diff --git a/mupen64plus-core/src/device/rcp/rdp/rdp_core.c b/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
-index 3063aa1..6568e87 100644
+index 3063aa1..f4f99a4 100644
 --- a/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
 +++ b/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
 @@ -27,6 +27,11 @@
@@ -8949,13 +8980,14 @@ index 3063aa1..6568e87 100644
  
  static void update_dpc_status(struct rdp_core* dp, uint32_t w)
  {
-@@ -145,10 +150,53 @@ void write_dps_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mas
+@@ -145,10 +150,65 @@ void write_dps_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mas
      }
  }
  
 +#if defined(__3DS__)
 +/* ctr64: threaded display lists (see rsp_core.c) */
 +extern unsigned ctr64_gfx_pending, ctr64_gfx_dp_checks;
++unsigned ctr64_gfx_dp_raises; /* DP_INT events of a loaded state still queued */
 +extern uint32_t ctr64_gfx_start_count;
 +extern bool ctr64_gfx_dlist_finish(void);
 +extern unsigned ctr64_gfx_dlist_step(void);
@@ -8967,6 +8999,17 @@ index 3063aa1..6568e87 100644
      struct rdp_core* dp = (struct rdp_core*)opaque;
  
 +#if defined(__3DS__)
++    /* DP_INT events a loaded state brought (ctr64_rsp_state_loaded) are real interrupts; they come
++     * before any check queued since (those are a step or more ahead), and taken for checks they
++     * were lost: Mario Golf from a state, threaded, halted within a second */
++    if (ctr64_gfx_dp_raises) {
++        ctr64_gfx_dp_raises--;
++        if (dp->dpc_regs[DPC_STATUS_REG] & DPC_STATUS_FREEZE)
++            dp->do_on_unfreeze |= DELAY_DP_INT;
++        else
++            raise_rcp_interrupt(dp->mi, MI_INTR_DP);
++        return;
++    }
 +    if (ctr64_gfx_dp_checks) {
 +        ctr64_gfx_dp_checks--;
 +        if (!ctr64_gfx_pending)
@@ -9004,7 +9047,7 @@ index 3063aa1..6568e87 100644
  }
  
 diff --git a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
-index 99767bc..67f96ea 100644
+index 99767bc..33ef204 100644
 --- a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 +++ b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 @@ -21,7 +21,9 @@
@@ -9092,7 +9135,7 @@ index 99767bc..67f96ea 100644
      /* clear / set halt */
      if ((w & 0x3) == 0x1) sp->regs[SP_STATUS_REG] &= ~SP_STATUS_HALT;
      if ((w & 0x3) == 0x2) sp->regs[SP_STATUS_REG] |= SP_STATUS_HALT;
-@@ -323,9 +370,158 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
+@@ -323,9 +370,181 @@ void write_rsp_regs2(void* opaque, uint32_t address, uint32_t value, uint32_t ma
          masked_write(&sp->regs2[reg], value, mask);
  }
  
@@ -9134,6 +9177,16 @@ index 99767bc..67f96ea 100644
 +        ctr64_audio_finish();
 +        ctr64_audio_pending = false;
 +    }
++    /* The DP_INT events that only check on a threaded list (rdp_interrupt_event) go: the lists are
++     * completed here, and a state must not carry them. Left in, with ctr64_gfx_dp_checks counting
++     * them, a loaded state (whose queue has none) had its first real DP interrupts taken for such
++     * checks and dropped; the game's tasks piled up until the event queue was full and an RSP DMA
++     * never completed (Mario Golf from a state: the game halted in osSpTaskLoad). */
++    while (ctr64_gfx_dp_checks && get_event(&g_dev.r4300.cp0.q, DP_INT)) {
++        remove_event(&g_dev.r4300.cp0.q, DP_INT);
++        ctr64_gfx_dp_checks--;
++    }
++    ctr64_gfx_dp_checks = 0;
 +    while (ctr64_gfx_pending) {
 +        ctr64_gfx_pending--;
 +        if (ctr64_gfx_dlist_finish()) {
@@ -9178,6 +9231,19 @@ index 99767bc..67f96ea 100644
 +void ctr64_rsp_state_loaded(void)
 +{
 +    ctr64_sp_resume = 0;
++    /* the loaded queue holds no check events or tasks of this session (ctr64_rsp_gfx_quiesce) */
++    ctr64_gfx_dp_checks = 0;
++    ctr64_gfx_pending = 0;
++    ctr64_audio_pending = false;
++    /* its DP_INT events raise the interrupt as they are (rdp_interrupt_event) */
++    {
++        extern struct device g_dev;
++        extern unsigned ctr64_gfx_dp_raises;
++        ctr64_gfx_dp_raises = 0;
++        for (struct node *q = g_dev.r4300.cp0.q.first; q; q = q->next)
++            if (q->data.type == DP_INT)
++                ctr64_gfx_dp_raises++;
++    }
 +}
 +
 +unsigned int ctr64_sp_tasks[3]; /* ctr64 profiling: gfx, audio, other */
@@ -9251,7 +9317,7 @@ index 99767bc..67f96ea 100644
  
      uint32_t sp_delay_time;
  
-@@ -345,6 +541,30 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -345,6 +564,30 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
          new_frame();
  
@@ -9282,7 +9348,7 @@ index 99767bc..67f96ea 100644
          if (sp->mi->regs[MI_INTR_REG] & MI_INTR_DP)
          {
              sp->mi->regs[MI_INTR_REG] &= ~MI_INTR_DP;
-@@ -361,6 +581,20 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -361,6 +604,20 @@ void do_SP_Task(struct rsp_core* sp)
      }
      else if (sp->mem[0xfc0/4] == 2)
      {
@@ -9303,7 +9369,7 @@ index 99767bc..67f96ea 100644
          //audio.processAList();
          sp->regs2[SP_PC_REG] &= 0xfff;
  #if defined(PROFILE)
-@@ -373,6 +607,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -373,6 +630,9 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
  
          sp_delay_time = 4000;
@@ -9313,7 +9379,7 @@ index 99767bc..67f96ea 100644
      }
      else
      {
-@@ -382,6 +619,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -382,6 +642,9 @@ void do_SP_Task(struct rsp_core* sp)
  
          sp_delay_time = 0;
      }
@@ -9323,7 +9389,7 @@ index 99767bc..67f96ea 100644
  
      sp->rsp_task_locked = 0;
      sp->mi->r4300->cp0.interrupt_unsafe_state &= ~INTR_UNSAFE_RSP;
-@@ -391,6 +631,32 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -391,6 +654,32 @@ void do_SP_Task(struct rsp_core* sp)
          sp->mi->r4300->cp0.interrupt_unsafe_state |= INTR_UNSAFE_RSP;
          sp->mi->regs[MI_INTR_REG] |= MI_INTR_SP;
      }
@@ -9356,7 +9422,7 @@ index 99767bc..67f96ea 100644
      if (sp->mi->regs[MI_INTR_REG] & MI_INTR_SP)
      {
          cp0_update_count(sp->mi->r4300);
-@@ -406,6 +672,39 @@ void rsp_interrupt_event(void* opaque)
+@@ -406,6 +695,39 @@ void rsp_interrupt_event(void* opaque)
  {
      struct rsp_core* sp = (struct rsp_core*)opaque;
  

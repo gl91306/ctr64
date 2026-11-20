@@ -170,6 +170,13 @@ void emit_cycle(u32 A, u32 B, u32 C, u32 D, Chain &ch)
             ch.push(F_MODULATE, 2, b, c);
             ch.push(F_SUBTRACT, 2, d, simple(K_PREV));
         }
+    } else if (D == C) {
+        /* (A - B)*C + C = 2 * C * (A - B + 1)/2, exact (both clamp at 0 and 1 alike), and no
+         * combiner buffer: the general case below writes it, and C/D = COMBINED in cycle 2 then
+         * read that temporary instead (TTYD64's characters: (SHADE - ENV)*COMBINED + COMBINED
+         * drew TEXEL0 alone, white) */
+        ch.push(F_INTERPOLATE, 3, a, one_minus(b), simple(K_HALF));
+        ch.push(F_MODULATE, 2, simple(K_PREV), c).scale = 1;
     } else if (!varying(B) && !varying(D)) {
         /* (A - B)*C + D = lerp(B, A, C) + (D - B): the lerp stays in [0, 1] (exact), and the
          * signed constant D - B is added as its positive part, then subtracted as its negative
