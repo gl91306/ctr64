@@ -12,6 +12,7 @@ void gln64_thr_gl_invoke_command_loop(void) {}
 unsigned int ctr64_gfx_stats[8];
 unsigned int ctr64_gfx_fcram[2];
 unsigned int ctr64_gfx_fb_reads[2]; /* reads of render targets: VRAM, FCRAM */
+unsigned int ctr64_gfx_far_draws; /* draws clipped at the far w limit, pica_ContextImpl.cpp GB_WFAR (stats.log) */
 unsigned int ctr64_gfx_vram_moves[2]; /* KB copied into / out of VRAM by keepInVram */ /* draws into FCRAM color / depth targets */
 unsigned int ctr64_game_starts; /* games started (core_host.c) */
 char ctr64_rt_mode[64]; /* frame buffer storage of the running game (pica_ContextImpl init), for stats.log */

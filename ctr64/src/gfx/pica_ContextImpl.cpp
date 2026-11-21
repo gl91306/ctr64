@@ -121,6 +121,7 @@ extern int ctr64_stash; /* gSP.cpp: triangle batching (dev switch nostash.txt) *
 extern int ctr64_flat_stash; /* gSP.cpp: flat-shaded triangles stashed (dev switch noflatstash.txt) */
 extern int ctr64_std_fast; /* gSP.cpp: standard vertex fast path (dev switch nostdvtx.txt) */
 extern "C" unsigned int ctr64_gfx_vram_moves[2]; /* KB moved into / out of VRAM (keepInVram) */
+extern "C" unsigned int ctr64_gfx_far_draws; /* draws clipped at the far w limit (GB_WFAR) */
 extern "C" unsigned int ctr64_gfx_fb_reads[2];   /* reads of render targets (copies to RDRAM): [0] VRAM, [1] FCRAM */
 extern "C" unsigned int ctr64_gfx_reused;
 extern "C" unsigned int ctr64_game_starts; /* core_host.c */
@@ -3098,6 +3099,13 @@ void log_draw(const char *what, const CombinerProgram *prog, int kind, const GVt
  * the others go as they are. Returns a flat triangle list in frame memory, or null when no
  * triangle needed it. */
 static const float GB_MIN = -256.0f, GB_MAX = 1016.0f, GB_W = 1e-5f;
+/* Far limit for w. The N64's RSP computes clip coordinates in s15.16, so its w never exceeds
+ * 32768; GLideN64's float transform can make far more. Iggy's Reckin' Balls, in the frame its
+ * main menu appears, has triangles from w ~ 2 to w ~ 1e7..3e11 (points thrown to a screen
+ * corner), and such a command list hung the HW GPU in about one boot in six (2026-11-21; the
+ * same frame without them ran). Triangles are clipped at this w like at the guard band. */
+static const float GB_WFAR = 32768.0f;
+enum { GB_PLANES = 6 };
 struct ClipV {
     float p[4], c[4], st[4];
 };
@@ -3118,32 +3126,32 @@ static inline GVtx from_clip(const ClipV &c)
     return g;
 }
 /* plane k: d = A*x + B*y + C*w >= 0 inside */
-static void guard_planes(const s32 vp[4], float pl[5][3])
+static void guard_planes(const s32 vp[4], float pl[GB_PLANES][3])
 {
     /* window x = vp0 + (x/w + 1) / 2 * vp2 <= GB_MAX  <=>  x <= ax * w */
     const float axh = 2.0f * (GB_MAX - vp[0]) / (vp[2] ? vp[2] : 1) - 1.0f;
     const float axl = 2.0f * (GB_MIN - vp[0]) / (vp[2] ? vp[2] : 1) - 1.0f;
     const float ayh = 2.0f * (GB_MAX - vp[1]) / (vp[3] ? vp[3] : 1) - 1.0f;
     const float ayl = 2.0f * (GB_MIN - vp[1]) / (vp[3] ? vp[3] : 1) - 1.0f;
-    const float t[5][3] = {{-1, 0, axh}, {1, 0, -axl}, {0, -1, ayh}, {0, 1, -ayl}, {0, 0, 1}};
+    const float t[GB_PLANES][3] = {{-1, 0, axh}, {1, 0, -axl}, {0, -1, ayh}, {0, 1, -ayl}, {0, 0, 1}, {0, 0, -1}};
     memcpy(pl, t, sizeof t);
 }
-static inline float guard_dist(const float pl[5][3], int k, const float *p)
+static inline float guard_dist(const float pl[GB_PLANES][3], int k, const float *p)
 {
-    return pl[k][0] * p[0] + pl[k][1] * p[1] + pl[k][2] * p[3] - (k == 4 ? GB_W : 0.0f);
+    return pl[k][0] * p[0] + pl[k][1] * p[1] + pl[k][2] * p[3] - (k == 4 ? GB_W : 0.0f) + (k == 5 ? GB_WFAR : 0.0f);
 }
-/* a vertex outside the band (or w <= 0) */
-static inline bool guard_out(const float pl[5][3], const GVtx &g)
+/* a vertex outside the band (or w <= 0, or w > GB_WFAR) */
+static inline bool guard_out(const float pl[GB_PLANES][3], const GVtx &g)
 {
     const float p[4] = {g.x, g.y, g.z, g.w};
-    for (int k = 0; k < 5; k++)
+    for (int k = 0; k < GB_PLANES; k++)
         if (guard_dist(pl, k, p) < 0.0f)
             return true;
     return false;
 }
 GVtx *guard_clip(GVtx *v, u32 &count, const void *elements, u32 nidx, bool bytes, const s32 vp[4])
 {
-    float pl[5][3];
+    float pl[GB_PLANES][3];
     guard_planes(vp, pl);
     auto dist = [&](int k, const float *p) { return guard_dist(pl, k, p); };
     const u32 ntri = (nidx ? nidx : count) / 3;
@@ -3158,8 +3166,8 @@ GVtx *guard_clip(GVtx *v, u32 &count, const void *elements, u32 nidx, bool bytes
         any = guard_out(pl, v[i]);
     if (!any)
         return nullptr;
-    /* worst case: a triangle clipped by 5 planes is a polygon of 8 vertices = 6 triangles */
-    GVtx *out = static_cast<GVtx *>(pica_frame_alloc(ntri * 18 * sizeof(GVtx), 16));
+    /* worst case: a triangle clipped by 6 planes is a polygon of 9 vertices = 7 triangles */
+    GVtx *out = static_cast<GVtx *>(pica_frame_alloc(ntri * 21 * sizeof(GVtx), 16));
     if (!out)
         return nullptr;
     u32 n = 0;
@@ -3171,7 +3179,7 @@ GVtx *guard_clip(GVtx *v, u32 &count, const void *elements, u32 nidx, bool bytes
         poly[0][1] = to_clip(b);
         poly[0][2] = to_clip(c);
         bool clipped = false;
-        for (int k = 0; k < 5 && m >= 3; k++) {
+        for (int k = 0; k < GB_PLANES && m >= 3; k++) {
             float d[9];
             bool out_any = false;
             for (int i = 0; i < m; i++) {
@@ -3747,7 +3755,7 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
      * guard_clip need not look at the many more vertices drawn. */
     bool guardAny = false;
     if (mode == DM_TRIANGLES && !g_noguard) {
-        float pl[5][3];
+        float pl[GB_PLANES][3];
         guard_planes(m_vp, pl);
         if (compact) {
             for (u32 i = 0; i < compactCount && !guardAny; i++)
@@ -3756,6 +3764,14 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
             for (u32 i = 0; i < p.verticesCount && !guardAny; i++)
                 if (!expand || m_idxUsed[i] == m_idxGen)
                     guardAny = guard_out(pl, v[i]);
+        }
+        if (guardAny) { /* stats.log: draws cut at the far w limit (GB_WFAR) */
+            const u32 nv = compact ? compactCount : p.verticesCount;
+            for (u32 i = 0; i < nv; i++)
+                if ((!expand || m_idxUsed[i] == m_idxGen) && v[i].w > GB_WFAR) {
+                    ctr64_gfx_far_draws++;
+                    break;
+                }
         }
     }
     u32 count = compact ? compactCount : p.verticesCount;

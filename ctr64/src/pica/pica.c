@@ -317,15 +317,28 @@ static void submit_commands(void)
     P.cmd_bytes += words * 4;
 }
 
-static void dump_file(const char *dir, const char *name, const void *p, u32 bytes)
+/* Writes bytes at p to dir/name through a small heap buffer (the hang dump of linear memory
+ * written straight from there left the old files on the SD card, Iggy 2026-11-21); returns the
+ * bytes written. */
+static u32 dump_file(const char *dir, const char *name, const void *p, u32 bytes)
 {
     char path[160];
     snprintf(path, sizeof(path), "%s/%s", dir, name);
+    remove(path);
     FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(p, 1, bytes, f);
-        fclose(f);
+    if (!f)
+        return 0;
+    static u8 chunk[16 * 1024];
+    u32 done = 0;
+    while (done < bytes) {
+        u32 n = bytes - done < sizeof(chunk) ? bytes - done : sizeof(chunk);
+        memcpy(chunk, (const u8 *)p + done, n);
+        if (fwrite(chunk, 1, n, f) != n)
+            break;
+        done += n;
     }
+    fclose(f);
+    return done;
 }
 
 void pica_debug_dump(FILE *f, const char *dir, bool regs_only)
@@ -359,25 +372,29 @@ void pica_debug_dump(FILE *f, const char *dir, bool regs_only)
     for (int i = 0; i < SLOT_COUNT; i++) {
         char n[32];
         snprintf(n, sizeof(n), "cmd%d.bin", i);
-        dump_file(dir, n, P.slots[i].cmd, CMDBUF_BYTES);
+        u32 a = dump_file(dir, n, P.slots[i].cmd, CMDBUF_BYTES);
         snprintf(n, sizeof(n), "pool%d.bin", i);
-        dump_file(dir, n, P.slots[i].pool, POOL_BYTES);
+        u32 b = dump_file(dir, n, P.slots[i].pool, POOL_BYTES);
+        fprintf(f, "dump slot %d: cmd %lu pool %lu bytes written\n", i, (unsigned long)a, (unsigned long)b);
+        fflush(f);
     }
     fprintf(f, "dump files done\n");
     fflush(f);
     return;
 regs:; /* GPU registers: a call of its own, last (Azahar asserts on some; GSP could block) */
-    static const u32 ranges[][2] = {{0x1EF00000, 0x100}, {0x1EF00C00, 0x40}, {0x1EF01000, 0x1000}};
+    static const u32 ranges[][2] = {{0x1EF00000, 0x100}, {0x1EF00C00, 0x40}};
+    /* not the PICA registers at 0x1EF01000: with the GPU hung, the whole console froze during
+     * that read (Iggy 2026-11-21) */
     u32 *regs = calloc(0x1000 / 4, 4);
     if (!regs)
         return;
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < 2; r++) {
         for (u32 o = 0; o < ranges[r][1]; o += 0x80)
             GSPGPU_ReadHWRegs(ranges[r][0] - 0x1EB00000 + o, regs + o / 4, 0x80);
         char n[32];
         snprintf(n, sizeof(n), "regs_%08lx.bin", ranges[r][0]);
         dump_file(dir, n, regs, ranges[r][1]);
-        if (r < 2) {
+        {
             fprintf(f, "regs %08lx:", ranges[r][0]);
             for (u32 o = 0; o < ranges[r][1]; o += 4)
                 fprintf(f, " %08lx", regs[o / 4]);

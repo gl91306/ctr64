@@ -407,6 +407,13 @@ static void watchdog(void *arg)
                             ctr64_crumb ? ctr64_crumb : "?", ctr64_gcrumb ? ctr64_gcrumb : "?", ctr64_gret[0],
                             ctr64_gret[1]);
                     if (stuck == 10) { /* DEV hang diagnosis: once per real hang (loads stall ~3 s) */
+                        fprintf(g_stats, "memory: reserve %s; segments (phys):", ctr64_mem_reserve_state());
+                        for (int k = 0; k < XSEG_MAX; k++)
+                            if (g_xseg[k].bytes)
+                                fprintf(g_stats, " %08lx+%lx", osConvertVirtToPhys((void *)g_xseg[k].base),
+                                        (unsigned long)g_xseg[k].bytes);
+                        fputc('\n', g_stats);
+                        fflush(g_stats);
                         mkdir(DATA_DIR "/hang", 0777);
                         pica_debug_dump(g_stats, DATA_DIR "/hang", false);
                     }
@@ -846,10 +853,11 @@ static void run_game(void)
                     /* the game's frames per second: VIs with a new origin (as DaedalusX64 counts) */
                     extern unsigned ctr64_vi_frames;
                     static unsigned frames_seen;
-                    extern unsigned int ctr64_gfx_fcram[2];
-                    fprintf(g_stats, "  game frames %.1f/s, draws into FCRAM targets: color %u depth %u\n",
-                            (ctr64_vi_frames - frames_seen) * 1000.0f / wall, ctr64_gfx_fcram[0], ctr64_gfx_fcram[1]);
-                    ctr64_gfx_fcram[0] = ctr64_gfx_fcram[1] = 0;
+                    extern unsigned int ctr64_gfx_fcram[2], ctr64_gfx_far_draws;
+                    fprintf(g_stats, "  game frames %.1f/s, draws into FCRAM targets: color %u depth %u; draws clipped at far w %u\n",
+                            (ctr64_vi_frames - frames_seen) * 1000.0f / wall, ctr64_gfx_fcram[0], ctr64_gfx_fcram[1],
+                            ctr64_gfx_far_draws);
+                    ctr64_gfx_fcram[0] = ctr64_gfx_fcram[1] = ctr64_gfx_far_draws = 0;
                     {
                         extern unsigned int ctr64_sp_tasks[3];
                         static unsigned int last_tasks[3];
