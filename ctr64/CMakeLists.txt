@@ -15,7 +15,6 @@ add_executable(ctr64
   src/main.c
   src/prof.c
   src/bench.c
-  src/remote.c
   src/memcpy_prof.c
   src/crash.c
   src/frameskip.c
@@ -63,6 +62,14 @@ option(CTR64_MEMCPY_PROF "count memcpy bytes per caller" OFF)
 if(CTR64_MEMCPY_PROF)
   target_compile_definitions(ctr64 PRIVATE CTR64_MEMCPY_PROF=1)
   target_link_options(ctr64 PRIVATE -Wl,--wrap=memcpy)
+endif()
+
+# development: remote test mode (src/remote.c: with remote.txt on the SD card the PC sends files,
+# installs builds and starts test runs over Wi-Fi on port 5050). Never in a release build.
+option(CTR64_REMOTE "remote test mode (development builds only)" OFF)
+if(CTR64_REMOTE)
+  target_sources(ctr64 PRIVATE src/remote.c)
+  target_compile_definitions(ctr64 PRIVATE CTR64_REMOTE=1)
 endif()
 
 # Release version: here, in the CIA's title version (makerom -ver, scripts/build-3ds.ps1) and
