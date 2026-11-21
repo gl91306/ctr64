@@ -1071,6 +1071,7 @@ public:
     /* drawing */
     void drawTriangles(const Context::DrawTriangleParameters &p) override;
     void drawRects(const Context::DrawRectParameters &p) override;
+    void clipRect(GVtx *v, u32 n);
     void drawLine(f32, SPVertex *) override {}
     f32 getMaxLineWidth() override { return 1.0f; }
 
@@ -4138,6 +4139,7 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
         o.s0 = (s.s0 + 0.0001f) * ss0; o.t0 = (s.t0 + 0.0001f) * st0;
         o.s1 = (s.s1 + 0.0001f) * ss1; o.t1 = (s.t1 + 0.0001f) * st1;
     }
+    clipRect(v, p.verticesCount);
 
     if (draw_log())
         log_draw("rect", m_program, (int)m_kind, v, p.verticesCount, m_vp, stateString());
@@ -4149,6 +4151,73 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
     pica_draw_arrays(mode == DM_TRIANGLES ? GPU_TRIANGLES : mode == DM_TRIANGLE_FAN ? GPU_TRIANGLE_FAN : GPU_TRIANGLE_STRIP,
                      0, p.verticesCount);
     gtDraw(special ? 2 : 1);
+}
+
+/* A rectangle reaching far past its target, cut down to the target (plus a margin). Mario
+ * Tennis's scene-change fade is one white rectangle to about 1016x1784 window pixels with
+ * anti-aliasing (2x): the PICA rasterizer on hardware drew only its top ~265 rows, the rest of
+ * the screen kept unfaded (Azahar draws it all; at 1x, 508x892, hardware too). Only for an
+ * axis-aligned rectangle of 4 corners with one w: its attributes are interpolated bilinearly
+ * between the corners, exact for such a rectangle. */
+void ContextImplPica::clipRect(GVtx *v, u32 n)
+{
+    if (n != 4)
+        return;
+    const Tex *d = tex(drawFbo().color);
+    if (!d || m_vp[2] <= 0 || m_vp[3] <= 0)
+        return;
+    const float w = v[0].w;
+    if (w <= 0.0f)
+        return;
+    float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+    for (u32 i = 0; i < 4; i++) {
+        if (v[i].w != w)
+            return;
+        x0 = std::min(x0, v[i].x); x1 = std::max(x1, v[i].x);
+        y0 = std::min(y0, v[i].y); y1 = std::max(y1, v[i].y);
+    }
+    if (!(x1 > x0) || !(y1 > y0))
+        return;
+    /* the target plus 16 pixels around it, in clip space (x = ndc * w) */
+    const float m = 16.0f;
+    const float cx0 = ((-m - m_vp[0]) / m_vp[2] * 2.0f - 1.0f) * w;
+    const float cx1 = (((float)d->tw + m - m_vp[0]) / m_vp[2] * 2.0f - 1.0f) * w;
+    const float cy0 = ((-m - m_vp[1]) / m_vp[3] * 2.0f - 1.0f) * w;
+    const float cy1 = (((float)d->th + m - m_vp[1]) / m_vp[3] * 2.0f - 1.0f) * w;
+    if (x0 >= cx0 && x1 <= cx1 && y0 >= cy0 && y1 <= cy1)
+        return;
+    /* the corners: each at x0 or x1 and y0 or y1 */
+    int at[2][2] = {{-1, -1}, {-1, -1}};
+    for (u32 i = 0; i < 4; i++) {
+        const int ix = v[i].x == x0 ? 0 : v[i].x == x1 ? 1 : -1;
+        const int iy = v[i].y == y0 ? 0 : v[i].y == y1 ? 1 : -1;
+        if (ix < 0 || iy < 0 || at[ix][iy] >= 0)
+            return;
+        at[ix][iy] = (int)i;
+    }
+    const float nx0 = std::max(x0, cx0), nx1 = std::min(x1, cx1);
+    const float ny0 = std::max(y0, cy0), ny1 = std::min(y1, cy1);
+    if (!(nx1 > nx0) || !(ny1 > ny0))
+        return;
+    GVtx c[2][2];
+    for (int ix = 0; ix < 2; ix++)
+        for (int iy = 0; iy < 2; iy++)
+            c[ix][iy] = v[at[ix][iy]];
+    auto lerp = [](float a, float b, float f) { return a + (b - a) * f; };
+    for (int ix = 0; ix < 2; ix++)
+        for (int iy = 0; iy < 2; iy++) {
+            const float fx = ((ix ? nx1 : nx0) - x0) / (x1 - x0);
+            const float fy = ((iy ? ny1 : ny0) - y0) / (y1 - y0);
+            GVtx &o = v[at[ix][iy]];
+            auto bil = [&](float GVtx::*f) {
+                return lerp(lerp(c[0][0].*f, c[1][0].*f, fx), lerp(c[0][1].*f, c[1][1].*f, fx), fy);
+            };
+            o.x = ix ? nx1 : nx0;
+            o.y = iy ? ny1 : ny0;
+            o.z = bil(&GVtx::z);
+            o.s0 = bil(&GVtx::s0); o.t0 = bil(&GVtx::t0);
+            o.s1 = bil(&GVtx::s1); o.t1 = bil(&GVtx::t1);
+        }
 }
 
 /* DEV ONLY (gputime.txt, pica.c): each draw submitted alone, tagged by kind, target memory
