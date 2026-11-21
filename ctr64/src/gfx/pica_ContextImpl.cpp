@@ -227,6 +227,7 @@ u16 pot(u32 v)
 bool g_slowtex; /* dev switch slowtex.txt: texture uploads by the old per-texel paths (A/B) */
 bool g_noguard; /* dev switch noguard.txt: no guard band clipping (A/B) */
 bool g_noshadelin; /* dev switch noshadelin.txt: no screen-linear shade subdivision (A/B) */
+bool g_nooverlayoff; /* dev switch nooverlayoff.txt: transparent-Z overlays get no depth offset (drawTriangles) */
 bool g_novramflush; /* dev switch novramflush.txt: no cache flush after CPU texel writes into VRAM */
 bool g_noproj;     /* dev switch noproj.txt: screen-linear shade by subdivision, not projective draws */
 bool g_noidxdraw;  /* dev switch noidxdraw.txt: indexed triangle lists drawn as plain lists (A/B) */
@@ -987,6 +988,10 @@ inline float fast_floor(float v)
  * CPU from the draw's triangles (poly_offset_for_draw); this is the floor for flat or
  * screen-aligned geometry (r taken as 2^-16, the PICA interpolating depth with less than 24 bits). */
 const float k_poly_offset = -3.0f / 65536.0f;
+/* see-through overlays (drawTriangles): a fixed offset, no slope term. Conker's shadow on its
+ * ground: 3/65536 left most of it out, 32 shows it all but a few pixels; the slope-scaled decal
+ * offset also lifted Wave Race's water over the beach sand it lies under (Azahar 2026-11-20) */
+const float k_overlay_offset = -32.0f / 65536.0f;
 constexpr float k_poly_factor = -3.0f;
 
 constexpr u32 WINDOW_W = 400, WINDOW_H = 240;
@@ -1369,6 +1374,10 @@ void ContextImplPica::init()
     if (FILE *sv = fopen("sdmc:/3ds/ctr64/nostdvtx.txt", "r")) { /* gSP.cpp: generic vertex path */
         fclose(sv);
         ctr64_std_fast = 0;
+    }
+    if (FILE *no = fopen("sdmc:/3ds/ctr64/nooverlayoff.txt", "r")) {
+        fclose(no);
+        g_nooverlayoff = true;
     }
     if (FILE *nv = fopen("sdmc:/3ds/ctr64/novramlru.txt", "r")) {
         fclose(nv);
@@ -3770,11 +3779,21 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
      * instead (pica_projective: the GPU interpolates colour linearly on screen, exactly, and
      * texture 0 stays perspective-correct), with no subdivision. */
     bool proj = false;
+    /* A see-through overlay drawn over geometry already in the Z buffer, with its z compared and
+     * not written (N64 Z mode "transparent"): Conker's and Mario Tennis's character shadows are
+     * the ground's own triangles again, textured with the shadow image. The N64 gets the same z
+     * both times; here the ground went through other paths (shade subdivision, projective) and
+     * its depth came out a hair nearer, so the shadow failed the test: gone (Azahar) or in
+     * fragments (HW). It gets a small fixed depth offset (k_overlay_offset) and the decals'
+     * path. Dev switch nooverlayoff.txt: off. */
+    const bool overlay = m_enDepth && !m_depthWrite && !g_nooverlayoff && gDP.otherMode.depthCompare != 0 &&
+                         gDP.otherMode.depthUpdate == 0 && gDP.otherMode.depthMode == 2;
+    const bool zoffset = m_enDepth && (m_enPolyOffset || overlay);
     /* not for decals (polygon offset): the shader's z / w in 24-bit floats loses the few depth
      * units the offset gives them, so shadows on the ground z-fought into fragments (Mario
      * Tennis on the court, Conker; Azahar and HW 2026-11-18) */
     if (mode == DM_TRIANGLES && m_kind == Kind::Combiner && m_program && !g_noshadelin && !g_noproj && wPos &&
-        !(m_enPolyOffset && m_enDepth) &&
+        !zoffset &&
         pica_proj_bool_bit >= 0 && m_program->usesShade() &&
         !static_cast<const PicaCombinerProgram *>(m_program)->tev().uses_tex[1])
         proj = true;
@@ -3829,6 +3848,8 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
             memcpy(idx, elements, elementsCount * 2);
         }
     }
+    if (zoffset && !m_enPolyOffset)
+        pica_depth_map(-1.0f, k_overlay_offset);
     if (m_enPolyOffset && m_enDepth)
         pica_depth_map(-1.0f, poly_offset_for_draw(v, idx, idx ? elementsCount : count, prim_type));
     pica_projective(proj);
