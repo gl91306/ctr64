@@ -13,6 +13,7 @@ dkp_add_embedded_binary_library(ctr64_shaders_bin ctr64_shaders)
 
 add_executable(ctr64
   src/main.c
+  src/devfiles.c
   src/prof.c
   src/bench.c
   src/memcpy_prof.c
@@ -56,7 +57,8 @@ if(CTR64_PGO STREQUAL "gen") # instrumented compiler (core.cmake)
 endif()
 # The core uses int-sized enums (see core.cmake); libctru's structs shared with ctr64 code
 # do not depend on enum storage size, so the mixed-enum-size link is intentional.
-target_link_options(ctr64 PRIVATE -Wl,--no-enum-size-warning -Wl,--wrap=abort -Wl,--wrap=__system_allocateHeaps -Wl,--wrap=_sbrk_r)
+target_link_options(ctr64 PRIVATE -Wl,--no-enum-size-warning -Wl,--wrap=abort -Wl,--wrap=__system_allocateHeaps -Wl,--wrap=_sbrk_r
+  -Wl,--wrap=fopen) # devfiles.c: missing files in the data folder answered without the SD card
 # development: bytes copied by memcpy per caller (src/memcpy_prof.c, sdmc:/3ds/ctr64/memcpy.log)
 option(CTR64_MEMCPY_PROF "count memcpy bytes per caller" OFF)
 if(CTR64_MEMCPY_PROF)

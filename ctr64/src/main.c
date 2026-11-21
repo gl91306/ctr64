@@ -390,6 +390,35 @@ volatile u32 ctr64_heartbeat; /* also advanced by the menu (menu.c) */
 static volatile bool g_watchdog_quit;
 static FILE *g_stats; /* <data dir>/stats.log: one line per second, for unattended test runs */
 
+/* <data dir>/timing.log: how long starting ctr64, loading a game and leaving it take, step by step
+ * (ms since this process started, and the wall clock, so the gap of a restart shows too). Kept in
+ * memory and written at a few points (writing every mark would add SD card time of its own). */
+static char g_timing[2048];
+static size_t g_timing_len;
+void ctr64_time_mark(const char *what)
+{
+    static u64 t0;
+    const u64 now = svcGetSystemTick();
+    if (!t0)
+        t0 = now;
+    if (g_timing_len < sizeof(g_timing) - 96)
+        g_timing_len += snprintf(g_timing + g_timing_len, sizeof(g_timing) - g_timing_len, "%7.0f ms  %llu  %s\n",
+                                 (double)(now - t0) * 1000.0 / SYSCLOCK_ARM11, (unsigned long long)osGetTime(), what);
+}
+void ctr64_time_flush(void)
+{
+    if (!g_timing_len)
+        return;
+    struct stat st;
+    const bool big = stat(DATA_DIR "/timing.log", &st) == 0 && st.st_size > 32 * 1024;
+    FILE *f = fopen(DATA_DIR "/timing.log", big ? "w" : "a");
+    if (f) {
+        fwrite(g_timing, 1, g_timing_len, f);
+        fclose(f);
+    }
+    g_timing_len = 0;
+}
+
 /* Higher-priority thread on the app core: if the main loop stops advancing, report the last
  * breadcrumb (debug_crumb.h) on the bottom screen. */
 static void watchdog(void *arg)
@@ -631,6 +660,16 @@ static void run_game(void)
             ctr64_fast_compile = ctr64_fast_compile_dev >= 0 ? ctr64_fast_compile_dev : g_settings.fast_compile ? 15 : 0;
         }
         core_host_run_frame();
+        {
+            static unsigned first; /* 0: no frame yet, 1: first frame marked, 2: done */
+            if (first == 0) {
+                ctr64_time_mark("first frame");
+                first = 1;
+            } else if (first == 1 && frames >= 120) {
+                ctr64_time_mark("2 s of game"); /* written at exit: writing here stalled Iggy 3.4 s (HW) */
+                first = 2;
+            }
+        }
         if (g_framelog) {
             const u64 t1 = svcGetSystemTick();
             /* kept in memory and written once a second with stats.log: writing every frame hung
@@ -1163,6 +1202,7 @@ int main(void)
     char rom[300];
     bool new3ds = false;
 
+    ctr64_time_mark("start");
     vfp_enable_runfast();
     gfxInitDefault();
     ui_set_console(consoleInit(GFX_BOTTOM, NULL));
@@ -1178,6 +1218,7 @@ int main(void)
         gfxExit();
         return 1;
     }
+    ctr64_time_mark("video ready");
     RomBrowserResult choice = ROM_BROWSER_QUIT;
     /* Development aid: <data dir>/autoboot.txt holding a ROM path skips the browser. */
     FILE *ab = gpu_test ? NULL : fopen(DATA_DIR "/autoboot.txt", "r");
@@ -1221,8 +1262,10 @@ int main(void)
     if (choice == ROM_BROWSER_GPU_TEST) {
         gpu_test_run();
     } else if (choice == ROM_BROWSER_PICKED) {
+        ctr64_time_mark("game picked");
         rom_browser_loading(rom);
         core_host_init(DATA_DIR);
+        ctr64_time_mark("core ready");
         /* the memory reserve (ctr64_mem_prepare) is decided by the anti-aliasing setting before the
          * ROM is loaded; menu_init loads the settings again later */
         settings_load(DATA_DIR "/settings.txt");
@@ -1236,7 +1279,9 @@ int main(void)
                 g_stats = prof_stats_stream();
             else
                 g_stats = prof_stats_begin(DATA_DIR "/stats.log"); /* written by a background thread */
+            ctr64_time_mark("stats log open");
             menu_init(DATA_DIR "/settings.txt");
+            ctr64_time_mark("menu ready");
             static aptHookCookie apt_cookie;
             aptHook(&apt_cookie, apt_hook, NULL);
             Thread wd = threadCreate(watchdog, NULL, 4096, prio - 4, -2, false);
@@ -1256,7 +1301,9 @@ int main(void)
                          (long long)cur[0], (long long)lim[0], (long long)(cur[1] / 1024), (long long)(lim[1] / 1024));
                 ctr64_log_line(line);
             }
+            ctr64_time_mark("game starts");
             run_game();
+            ctr64_time_mark("game left");
             g_watchdog_quit = true;
             if (wd) {
                 threadJoin(wd, U64_MAX);
@@ -1283,6 +1330,7 @@ int main(void)
                 g_quit = MENU_GAME_LIST;
         }
         core_host_shutdown();
+        ctr64_time_mark("core shut down");
     }
 
     /* back to the game list: the app restarts itself, everything starts clean (GLideN64 and the
@@ -1302,5 +1350,7 @@ int main(void)
     pica_wait_idle();
     video_exit();
     gfxExit();
+    ctr64_time_mark("exit");
+    ctr64_time_flush();
     return 0;
 }

@@ -2299,7 +2299,7 @@ index 137c33d..9294bbb 100644
  		dest[(destIdx + 3) & destMask] = src[srcIdx++];
  		dest[(destIdx + 2) & destMask] = src[srcIdx++];
 diff --git a/GLideN64/src/gDP.cpp b/GLideN64/src/gDP.cpp
-index adf9d4a..1c57d78 100644
+index adf9d4a..90928d8 100644
 --- a/GLideN64/src/gDP.cpp
 +++ b/GLideN64/src/gDP.cpp
 @@ -1,3 +1,4 @@
@@ -2435,11 +2435,30 @@ index adf9d4a..1c57d78 100644
  
  	u16 *tmem16 = reinterpret_cast<u16*>(TMEM);
  	u32 addr = gDP.loadTile->imageAddress >> 2;
-@@ -615,6 +675,17 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
+@@ -602,6 +662,16 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
+ 		width = 1;
+ 	else if (width & 7)
+ 		width = (width & (~7U)) + 8;
++#ifdef __3DS__
++	/* The caller checked gDP.textureImage's range; this reads from the load tile's own address,
++	 * which Iggy's Reckin' Balls (Iguana logo) points near the end of RDRAM with a long block:
++	 * the 3DS has nothing mapped after RDRAM (data abort, HW 2026-11-21). Reads stop at its end. */
++	const u32 words = (RDRAMSize + 1) >> 2; /* RDRAMSize is the size - 1 */
++	if (addr >= words)
++		return;
++	if (width > words - addr)
++		width = (words - addr) & ~1U;
++#endif
+ 
+ 	if (dxt != 0) {
+ 		u32 j = 0;
+@@ -615,6 +685,19 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
  			t = ((j >> 11) & 1) ? 3 : 1;
  			if (t != oldt)
  				i += line;
 +#ifdef __3DS__
++			if (i + 1 >= width) /* the line skip went past the (clamped) block */
++				break;
 +			/* ctr64: tb + i is even (tb and line are multiples of 4, i steps by 2), so the two
 +			 * texels fill one aligned word of each TMEM half (see gDPLoadTile32b) */
 +			u32 *tmem32 = reinterpret_cast<u32*>(TMEM);
@@ -2453,7 +2472,7 @@ index adf9d4a..1c57d78 100644
  			ptr = ((tb + i) ^ t) & 0x3ff;
  			c = src[addr + i];
  			tmem16[ptr] = c >> 16;
-@@ -623,11 +694,23 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
+@@ -623,11 +706,23 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
  			c = src[addr + i + 1];
  			tmem16[ptr] = c >> 16;
  			tmem16[ptr | 0x400] = c & 0xffff;
@@ -2478,7 +2497,7 @@ index adf9d4a..1c57d78 100644
  			ptr = ((tb + i) ^ 1) & 0x3ff;
  			c = src[addr + i];
  			tmem16[ptr] = c >> 16;
-@@ -638,6 +721,7 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
+@@ -638,6 +733,7 @@ void gDPLoadBlock32(u32 uls,u32 lrs, u32 dxt)
  
  void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  {
@@ -2486,7 +2505,7 @@ index adf9d4a..1c57d78 100644
  	gDPSetTileSize( tile, uls, ult, lrs, dxt );
  	gDP.loadTileIdx = tile;
  	gDP.loadTile = &gDP.tiles[tile];
-@@ -680,7 +764,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
+@@ -680,7 +776,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  	}
  
  	gDP.loadTile->frameBufferAddress = 0;
@@ -2495,7 +2514,7 @@ index adf9d4a..1c57d78 100644
  
  	const u32 texLowerBound = gDP.loadTile->tmem;
  	const u32 texUpperBound = gDP.loadTile->tmem + (bytes >> 3);
-@@ -693,10 +777,51 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
+@@ -693,10 +789,51 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  
  	if (gDP.loadTile->size == G_IM_SIZ_32b)
  		gDPLoadBlock32(gDP.loadTile->uls, gDP.loadTile->lrs, dxt);
@@ -2548,7 +2567,7 @@ index adf9d4a..1c57d78 100644
  		UnswapCopyWrap(RDRAM, address, reinterpret_cast<u8*>(TMEM), tmemAddr << 3, 0xFFF, bytes);
  		if (dxt != 0) {
  			u32 dxtCounter = 0;
-@@ -724,6 +849,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
+@@ -724,6 +861,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  			end_dxt_test:
  				DWordInterleaveWrap(reinterpret_cast<u32*>(TMEM), tmemAddr << 1, 0x3FF, line);
  		}
@@ -2556,7 +2575,7 @@ index adf9d4a..1c57d78 100644
  	}
  
  	DebugMsg( DEBUG_NORMAL, "gDPLoadBlock( %i, %i, %i, %i, %i );\n", tile, uls, ult, lrs, dxt );
-@@ -731,6 +857,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
+@@ -731,6 +869,7 @@ void gDPLoadBlock(u32 tile, u32 uls, u32 ult, u32 lrs, u32 dxt)
  
  void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  {
@@ -2564,7 +2583,7 @@ index adf9d4a..1c57d78 100644
  	gDPSetTileSize( tile, uls, ult, lrs, lrt );
  	if (gDP.tiles[tile].tmem < 256) {
  		DebugMsg(DEBUG_NORMAL | DEBUG_ERROR, "gDPLoadTLUT wrong tile tmem addr: tile[%d].tmem=%04x;\n", tile, gDP.tiles[tile].tmem);
-@@ -742,6 +869,111 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
+@@ -742,6 +881,111 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  	u16 * dest = reinterpret_cast<u16*>(TMEM);
  	u32 destIdx = gDP.tiles[tile].tmem << 2;
  
@@ -2676,7 +2695,7 @@ index adf9d4a..1c57d78 100644
  	int i = 0;
  	while (i < count) {
  		for (u16 j = 0; (j < 16) && (i < count); ++j, ++i) {
-@@ -755,6 +987,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
+@@ -755,6 +999,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  	}
  
  	gDP.paletteCRC256 = CRC_Calculate(UINT64_MAX, gDP.paletteCRC16, sizeof(u64) * 16);
@@ -2684,7 +2703,7 @@ index adf9d4a..1c57d78 100644
  
  	if (TFH.isInited()) {
  		const u16 start = static_cast<u16>(gDP.tiles[tile].tmem) - 256; // starting location in the palettes
-@@ -762,7 +995,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
+@@ -762,7 +1007,7 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  		memcpy(reinterpret_cast<u8*>(gDP.TexFilterPalette + start), spal, u32(count)<<1);
  	}
  
@@ -2693,7 +2712,7 @@ index adf9d4a..1c57d78 100644
  
  	DebugMsg( DEBUG_NORMAL, "gDPLoadTLUT( %i, %i, %i, %i, %i );\n",
  		tile, gDP.tiles[tile].uls, gDP.tiles[tile].ult, gDP.tiles[tile].lrs, gDP.tiles[tile].lrt );
-@@ -770,6 +1003,9 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
+@@ -770,6 +1015,9 @@ void gDPLoadTLUT( u32 tile, u32 uls, u32 ult, u32 lrs, u32 lrt )
  
  void gDPSetScissor(u32 mode, s16 xh, s16 yh, s16 xl, s16 yl)
  {
@@ -2703,7 +2722,7 @@ index adf9d4a..1c57d78 100644
  	gDP.scissor.mode = mode;
  	gDP.scissor.xh = xh;
  	gDP.scissor.yh = yh;
-@@ -885,6 +1121,7 @@ void gDPSetKeyGB(u32 cG, u32 sG, u32 wG, u32 cB, u32 sB, u32 wB )
+@@ -885,6 +1133,7 @@ void gDPSetKeyGB(u32 cG, u32 sG, u32 wG, u32 cB, u32 sB, u32 wB )
  
  void gDPTextureRectangle(f32 ulx, f32 uly, f32 lrx, f32 lry, s32 tile, s16 s, s16 t, f32 dsdx, f32 dtdy , bool flip)
  {
@@ -2711,7 +2730,7 @@ index adf9d4a..1c57d78 100644
  	if (gDP.otherMode.cycleType == G_CYC_COPY) {
  		dsdx /= 4.0f;
  		lrx += 1.0f;
-@@ -982,10 +1219,19 @@ void gDPFullSync()
+@@ -982,10 +1231,19 @@ void gDPFullSync()
  	FrameBuffer * pCurrentBuffer = frameBufferList().getCurrent();
  	if (pCurrentBuffer != nullptr)
  		pCurrentBuffer->copyDepthTexture();

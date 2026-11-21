@@ -18,6 +18,8 @@ extern char ctr64_rs_md5[33]; /* rom_stream.c */
 #include "libretro.h"
 #include "settings.h"
 
+void ctr64_time_mark(const char *what); /* main.c: timing.log */
+
 /* glsm shim (src/core_compat): the core's context_reset, captured at load time */
 extern retro_hw_context_reset_t ctr64_core_context_reset;
 
@@ -658,6 +660,7 @@ bool core_host_load(const char *rom_path)
         fflush(H.log);
     }
     /* Old 3DS: a ROM over 16 MB stays on the SD card and is read in pages (rom_stream.c) */
+    ctr64_time_mark("load: memory prepared");
     bool stream = rom_stream_wanted(size, H.data_dir);
     data = stream ? NULL : malloc(size);
     if (!stream && !data)
@@ -683,6 +686,7 @@ bool core_host_load(const char *rom_path)
         fclose(f);
     }
 
+    ctr64_time_mark(stream ? "load: ROM streaming set up" : "load: ROM read");
     memset(&info, 0, sizeof(info));
     info.path = rom_path;
     info.data = data;
@@ -699,6 +703,7 @@ bool core_host_load(const char *rom_path)
         return false;
     }
 
+    ctr64_time_mark("load: core loaded the game");
     srm_path_for(rom_path);
     srm_load();
     retro_get_system_av_info(&H.av);
@@ -712,7 +717,9 @@ bool core_host_load(const char *rom_path)
         fprintf(H.log, "heap after load: %u KB used (ROM %ld KB)\n", mi.uordblks / 1024, size / 1024);
     }
     H.loaded = true;
+    ctr64_time_mark("load: audio and video set up");
     rb_load();
+    ctr64_time_mark("load: block list compiled");
     return true;
 }
 

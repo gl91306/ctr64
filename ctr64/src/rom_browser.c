@@ -14,6 +14,9 @@
 #include "ui/icons_img.h"
 #include "ui/ui.h"
 
+void ctr64_time_mark(const char *what); /* main.c: timing.log */
+void ctr64_time_flush(void);
+
 #define MAX_ROMS 200
 #define ROW_H 34  /* row pitch: a 30-pixel card and a 4-pixel gap */
 #define CARD_H 30
@@ -41,6 +44,35 @@ static int cmp_roms(const void *a, const void *b)
     const Rom *x = (const Rom *)a, *y = (const Rom *)b;
     const int c = strcasecmp(x->title, y->title);
     return c ? c : strcasecmp(x->file, y->file);
+}
+
+/* the letter a game is filed under in the list: A-Z, anything else '#' */
+static char rom_letter(int i)
+{
+    const char c = g_roms[i].title[0];
+    if (c >= 'a' && c <= 'z')
+        return (char)(c - 'a' + 'A');
+    return c >= 'A' && c <= 'Z' ? c : '#';
+}
+
+/* left / right on the game list: the first game of the previous / next letter (wrapping) */
+static int letter_jump(int sel, int dir)
+{
+    if (g_count <= 1)
+        return sel;
+    if (dir > 0) {
+        int i = sel;
+        while (i + 1 < g_count && rom_letter(i + 1) == rom_letter(sel))
+            i++;
+        return (i + 1) % g_count;
+    }
+    int i = sel;
+    while (i > 0 && rom_letter(i - 1) == rom_letter(sel))
+        i--; /* the start of this letter */
+    i = (i + g_count - 1) % g_count; /* the last game of the previous letter */
+    while (i > 0 && rom_letter(i - 1) == rom_letter(i))
+        i--;
+    return i;
 }
 
 static void draw_cart_icon(int x, int y, bool sel)
@@ -133,6 +165,7 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
             }
         closedir(d);
     }
+    ctr64_time_mark("game list: ROM headers read");
     qsort(g_roms, g_count, sizeof(g_roms[0]), cmp_roms);
     /* the top screen: box art of the selected game */
     boxart_begin();
@@ -142,6 +175,7 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
         boxart_add(path, g_roms[i].title, g_roms[i].id, strstr(g_roms[i].tags, "hack") != NULL);
     }
     boxart_start();
+    ctr64_time_mark("game list: box art ready");
 
     consoleClear();
     ui_init();
@@ -149,6 +183,8 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
     draw_frame();
     UiTouch touch = {0};
     hidSetRepeatParameters(18, 5);
+    ctr64_time_mark("game list shown");
+    ctr64_time_flush();
     const int max_scroll = g_count * ROW_H > LIST_H ? g_count * ROW_H - LIST_H : 0;
 
     for (bool redraw = true; aptMainLoop(); gspWaitForVBlank()) {
@@ -192,8 +228,12 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
             boxart_end();
             return ROM_BROWSER_PICKED;
         }
-        if (g_count && (rep & (KEY_DDOWN | KEY_DUP | KEY_CPAD_DOWN | KEY_CPAD_UP))) {
-            sel = (sel + ((rep & (KEY_DDOWN | KEY_CPAD_DOWN)) ? 1 : g_count - 1)) % g_count;
+        if (g_count && (rep & (KEY_DDOWN | KEY_DUP | KEY_CPAD_DOWN | KEY_CPAD_UP | KEY_DLEFT | KEY_DRIGHT |
+                               KEY_CPAD_LEFT | KEY_CPAD_RIGHT))) {
+            if (rep & (KEY_DLEFT | KEY_DRIGHT | KEY_CPAD_LEFT | KEY_CPAD_RIGHT)) /* by letter */
+                sel = letter_jump(sel, (rep & (KEY_DRIGHT | KEY_CPAD_RIGHT)) ? 1 : -1);
+            else
+                sel = (sel + ((rep & (KEY_DDOWN | KEY_CPAD_DOWN)) ? 1 : g_count - 1)) % g_count;
             if (sel * ROW_H < scroll)
                 scroll = sel * ROW_H;
             if (sel * ROW_H + CARD_H > scroll + LIST_H)

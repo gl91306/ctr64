@@ -122,6 +122,23 @@ extern int ctr64_flat_stash; /* gSP.cpp: flat-shaded triangles stashed (dev swit
 extern int ctr64_std_fast; /* gSP.cpp: standard vertex fast path (dev switch nostdvtx.txt) */
 extern "C" unsigned int ctr64_gfx_vram_moves[2]; /* KB moved into / out of VRAM (keepInVram) */
 extern "C" unsigned int ctr64_gfx_far_draws; /* draws clipped at the far w limit (GB_WFAR) */
+extern "C" void ctr64_time_mark(const char *what); /* main.c: timing.log */
+/* timing.log: a graphics step that took over 20 ms (frame buffer storage made or moved) */
+struct SlowStep {
+    const char *what;
+    u32 kb;
+    u64 t0 = svcGetSystemTick();
+    SlowStep(const char *w, u32 k) : what(w), kb(k) {}
+    ~SlowStep()
+    {
+        const double ms = (double)(svcGetSystemTick() - t0) * 1000.0 / SYSCLOCK_ARM11;
+        if (ms > 20.0) {
+            char line[96];
+            snprintf(line, sizeof(line), "gfx: %s %lu KB took %.0f ms", what, (unsigned long)kb, ms);
+            ctr64_time_mark(line);
+        }
+    }
+};
 extern "C" unsigned int ctr64_gfx_fb_reads[2];   /* reads of render targets (copies to RDRAM): [0] VRAM, [1] FCRAM */
 extern "C" unsigned int ctr64_gfx_reused;
 extern "C" unsigned int ctr64_game_starts; /* core_host.c */
@@ -1257,6 +1274,8 @@ void set_current_program(const CombinerProgram *p, Kind k)
 void ContextImplPica::init()
 {
     CRUMB("gfx: init");
+    ctr64_time_mark("gfx: init");
+    SlowStep slow("init", 0);
     g_ctx = this;
     g_shadow_heavy = false;
     g_shadow_win_start = g_shadow_win_count = 0;
@@ -1799,6 +1818,7 @@ bool ContextImplPica::evictToFcram(u32 id)
 
 void ContextImplPica::keepInVram(Fbo &f, int use)
 {
+    SlowStep slow("keepInVram", 0);
     const u32 now = pica_frame_number();
     const u32 ids[2] = {f.depth, f.color}; /* the depth buffer first: read and written by every draw */
     for (int k = 0; k < (use == USE_DEPTH_ONLY ? 1 : 2); k++) {
@@ -1968,6 +1988,7 @@ void ContextImplPica::ensureStorage(u32 id)
     Tex *t = tex(id);
     if (!t || t->data || !t->lazy)
         return;
+    SlowStep slow(t->rt ? "frame buffer storage" : "texture storage", storageBytes(*t) >> 10);
     allocStorage(*t, t->rt, true);
     t->lazy = !t->data;
     storageChanged(id);
