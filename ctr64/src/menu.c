@@ -696,10 +696,13 @@ static void draw_footer(void)
     ui_footer_begin();
     g_nfoot = 0;
     int x = 8;
+    /* the controls page has five items while a game runs: closer together, or "START Game" ran
+     * off the screen */
+    const int squeeze = g_page == PAGE_CONTROLS && !g_no_game ? 5 : 0;
 #define FOOT(glyph, label, key)                                                                       \
     do {                                                                                              \
         const int x0 = x;                                                                             \
-        x = ui_footer_button(x, glyph, label, false);                                                 \
+        x = ui_footer_button(x, glyph, label, false) - squeeze;                                       \
         g_foot[g_nfoot++] = (typeof(g_foot[0])){{(s16)(x0 - 6), UI_H - UI_FOOTER_H, (s16)(x - x0), UI_FOOTER_H}, key}; \
     } while (0)
     if (g_page == PAGE_MAIN && g_no_game) {

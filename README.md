@@ -10,8 +10,9 @@ Basically this project is mupen64plus-next + gliden64 ported to the 3ds with a c
 
 - **New 3DS / New 2DS XL**: what ive tested on. The CPU emulation, video and audio run on the separate
   cores. Several games run at or close to full speed (Super Mario 64, Ocarina of Time, Paper
-  Mario, Super Smash Bros., Mario Kart 64 and others), with optional 2× anti-aliasing. 64 MB games
-  (Conker's Bad Fur Day) are read from the SD card while they run, as on the Old 3DS below.
+  Mario, Super Smash Bros., Mario Kart 64 and others), with optional 2× anti-aliasing. With the
+  CIA even 64 MB games (Conker's Bad Fur Day) are loaded whole into memory; bigger ROM hacks are
+  read from the SD card while they run, as on the Old 3DS below.
 - **Old 3DS / 2DS**: works, but slower. ctr64 runs in the Old 3DS's 80 MB extended memory mode,
   which leaves room for only the smallest games in memory; most games (Super Mario 64, Mario
   Kart 64, Ocarina of Time, Paper Mario...) are read from the SD card while they run. Their first start reads the whole file once (a progress bar shows
@@ -49,6 +50,8 @@ sdmc:/3ds/ctr64/roms/              your games (.z64 / .n64 / .v64)
 sdmc:/3ds/ctr64/saves/<ROM>.srm    in-game saves (EEPROM, SRAM, FlashRAM, Controller Pak)
 sdmc:/3ds/ctr64/states/<ROM>.stateN  save states, slots 0-9
 sdmc:/3ds/ctr64/settings.txt       settings and button mapping (written by the menu)
+sdmc:/3ds/ctr64/controls/          per-game button mappings (when a game has its own)
+sdmc:/3ds/ctr64/boxart/            downloaded box art
 sdmc:/3ds/ctr64/jit/               per-game lists of compiled code (makes later starts smoother)
 sdmc:/3ds/ctr64/core.log           log of the last session; crash.txt if it crashed
 ```
@@ -60,8 +63,11 @@ both ways (the name must match the ROM's file name).
 
 ![The pause menu, button mapping on the N64 controller picture, and the game list in dark mode](docs/screenshots/menus.png)
 
-The **game list** shows the game titles. Tap a game to select it and tap it again (or press **A**) to start it; **Y** switches
-dark mode on or off; **START** quits.
+![The game list: box art of the selected game on the top screen, the list on the bottom screen](docs/screenshots/gamelist.png)
+
+The **game list** shows the game titles. Tap a game to select it and tap it again (or press **A**) to start it.
+Up/down moves one game, **left/right** jumps to the first game of the previous/next letter (handy
+with a lot of games); **X** opens the settings, **Y** switches dark mode on or off; **START** quits.
 
 The top screen shows the box art of the selected game. With Wi-Fi on, ctr64 downloads the art
 of your games from [libretro-thumbnails](https://github.com/libretro-thumbnails/Nintendo_-_Nintendo_64)
@@ -79,11 +85,16 @@ pauses and opens the menu:
 - **Audio**: volume, sound on or off
 - **Video**: frameskip (Auto by default: it skips drawing only while the game runs behind),
   fps limit, anti-aliasing (New 3DS), screen shape (4:3, stretch, widescreen),
-  **dark mode**, frame buffer emulation and copy mode, and options for threads and compiling
+  **dark mode**, **bottom screen in game** (Menu, Blank, or Off: the backlight goes off; any
+  tap still opens the menu), frame buffer emulation and copy mode, and options for threads and
+  compiling
 - **Controls**: tap a button on the N64 controller picture (or pick it with the D-pad), press A,
-  then the 3DS button you want for it. X clears, Y restores the defaults. On the control stick,
-  A selects the Circle Pad range, which left/right then change. On a New 3DS the C-Stick works
-  for the C buttons in addition to their mapped buttons.
+  then the 3DS button you want for it; hold two 3DS buttons to put it on both (for example
+  shield on L and ZL). X clears, Y resets to the defaults. On the control stick, A selects the
+  Circle Pad range, which left/right then change. On the D-pad, A swaps the 3DS D-Pad and Circle
+  Pad (the D-Pad then works as the stick, nice for racing games). With a game running, **START**
+  saves the controls for just that game (`controls/` folder); START again goes back to the shared
+  ones. On a New 3DS the C-Stick works for the C buttons in addition to their mapped buttons.
 - **Reset**, **Game list**, **Exit**
 
 Default controls:
