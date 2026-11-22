@@ -40,6 +40,10 @@ Opening and closing the CIA takes about 10-20 seconds: it asks for an extended m
 system to switch memory modes, once when ctr64 opens and again when it goes back to the HOME Menu.
 That's normal, it's not frozen.
 
+You can also install (or update) with a QR code: it's on the
+[latest release](https://github.com/gl91306/ctr64/releases/latest) page, scan it in FBI
+(Remote Install > Scan QR Code).
+
 **3DSX (Homebrew Launcher):** copy `ctr64.3dsx` to `sdmc:/3ds/`. Under the Homebrew Launcher an
 Old 3DS gives the app less memory, so use the CIA there.
 
