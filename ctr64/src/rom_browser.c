@@ -230,10 +230,13 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
         }
         if (g_count && (rep & (KEY_DDOWN | KEY_DUP | KEY_CPAD_DOWN | KEY_CPAD_UP | KEY_DLEFT | KEY_DRIGHT |
                                KEY_CPAD_LEFT | KEY_CPAD_RIGHT))) {
-            if (rep & (KEY_DLEFT | KEY_DRIGHT | KEY_CPAD_LEFT | KEY_CPAD_RIGHT)) /* by letter */
-                sel = letter_jump(sel, (rep & (KEY_DRIGHT | KEY_CPAD_RIGHT)) ? 1 : -1);
+            /* D-pad left / right: by letter. The Circle Pad moves one game whichever way it is
+             * pushed (right/down next, left/up previous): a letter jump from a sideways push felt
+             * unexpected. */
+            if (rep & (KEY_DLEFT | KEY_DRIGHT))
+                sel = letter_jump(sel, (rep & KEY_DRIGHT) ? 1 : -1);
             else
-                sel = (sel + ((rep & (KEY_DDOWN | KEY_CPAD_DOWN)) ? 1 : g_count - 1)) % g_count;
+                sel = (sel + ((rep & (KEY_DDOWN | KEY_CPAD_DOWN | KEY_CPAD_RIGHT)) ? 1 : g_count - 1)) % g_count;
             if (sel * ROW_H < scroll)
                 scroll = sel * ROW_H;
             if (sel * ROW_H + CARD_H > scroll + LIST_H)

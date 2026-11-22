@@ -33,8 +33,12 @@ Basically this project is mupen64plus-next + gliden64 ported to the 3ds with a c
 ## Install
 
 **CIA (recommended, required for Old 3DS):** copy `ctr64.cia` to the SD card and install it with
-FBI or Universal-Updater. ctr64 then appears on the HOME Menu. The CIA might ask for larger memory
-mode.
+FBI. ctr64 then appears on the HOME Menu.
+
+Opening and closing the CIA takes about 10-20 seconds: it asks for an extended memory mode (New
+3DS: 178 MB, so even 64 MB games fit in memory; Old 3DS: 80 MB), and the 3DS has to restart its
+system to switch memory modes, once when ctr64 opens and again when it goes back to the HOME Menu.
+That's normal, it's not frozen.
 
 **3DSX (Homebrew Launcher):** copy `ctr64.3dsx` to `sdmc:/3ds/`. Under the Homebrew Launcher an
 Old 3DS gives the app less memory, so use the CIA there.
@@ -66,8 +70,8 @@ both ways (the name must match the ROM's file name).
 ![The game list: box art of the selected game on the top screen, the list on the bottom screen](docs/screenshots/gamelist.png)
 
 The **game list** shows the game titles. Tap a game to select it and tap it again (or press **A**) to start it.
-Up/down moves one game, **left/right** jumps to the first game of the previous/next letter (handy
-with a lot of games); **X** opens the settings, **Y** switches dark mode on or off; **START** quits.
+Up/down moves one game, **D-pad left/right** jumps to the first game of the previous/next letter
+(handy with a lot of games; the Circle Pad just moves one game whichever way you push it); **X** opens the settings, **Y** switches dark mode on or off; **START** quits.
 
 The top screen shows the box art of the selected game. With Wi-Fi on, ctr64 downloads the art
 of your games from [libretro-thumbnails](https://github.com/libretro-thumbnails/Nintendo_-_Nintendo_64)
