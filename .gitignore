@@ -19,12 +19,10 @@
 
 /tools/*
 !/tools/ui/
-# HOME Menu icon and banner: only the scripts that make ctr64/cia/icon.png and banner.bnr
-!/tools/icon/
-/tools/icon/*
-!/tools/icon/render_marks.py
-!/tools/icon/banner_gltf.py
-!/tools/icon/make_final.py
+# the art generators stay local; their outputs (ctr64/cia/icon.png, banner.bnr,
+# ctr64/src/ui/icons_img.h, n64pad_img.h) are in the repository
+/tools/ui/icons.py
+/tools/ui/n64pad.py
 
 # the controller picture was traced from a photo that is not ours to publish
 /tools/ui/ref/

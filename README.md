@@ -15,9 +15,9 @@ Basically this project is mupen64plus-next + gliden64 ported to the 3ds with a c
   read from the SD card while they run, as on the Old 3DS below.
 - **Old 3DS / 2DS**: works, but slower. ctr64 runs in the Old 3DS's 80 MB extended memory mode,
   which leaves room for only the smallest games in memory; most games (Super Mario 64, Mario
-  Kart 64, Ocarina of Time, Paper Mario...) are read from the SD card while they run. Their first start reads the whole file once (a progress bar shows
-  it), and there can be short pauses when the game loads new areas. Use the **.cia** on an Old
-  3DS (see below).
+  Kart 64, Ocarina of Time, Paper Mario...) are read from the SD card while they run. Their
+  first start reads the whole file once (a progress bar shows it), and there can be short
+  pauses when the game loads new areas. Use the **.cia** on an Old 3DS (see below).
 
 ![Ocarina of Time, Mario Kart 64, Paper Mario, Super Smash Bros., Majora's Mask and Conker's Bad Fur Day running in ctr64](docs/screenshots/games.png)
 
