@@ -68,9 +68,9 @@ with open(out, 'w', newline='\n') as f:
     f.write(f'static const u8 {name}_rle[{len(rle)}] = {{\n{arr(rle)}}};\n')
     f.write(f'static const UiImage {name} = {{{w}, {h}, {len(palette)}, {name}_pal, {name}_alpha, {name}_rle}};\n')
     if hot:
-        f.write('\ntypedef struct { const char *name; s16 x, y, r; const char *kind; } PadHot;\n')
+        f.write('\ntypedef struct { const char *name; float x, y; s16 r; const char *kind; } PadHot; /* x, y: exact centre in image pixels */\n')
         f.write(f'static const PadHot {name}_hot[{len(hot)}] = {{\n')
         for e in hot:
-            f.write(f'    {{"{e["name"]}", {e["x"]}, {e["y"]}, {e["r"]}, "{e["kind"]}"}},\n')
+            f.write(f'    {{"{e["name"]}", {float(e["x"]):.1f}f, {float(e["y"]):.1f}f, {e["r"]}, "{e["kind"]}"}},\n')
         f.write('};\n')
 print(f'{w}x{h}, {len(palette)} colours, {len(rle)} bytes RLE')

@@ -337,9 +337,14 @@ static int texel(const u8 *sheet, int x, int y);
 
 static const u8 *glyph_cell(int gi, int *ox, int *oy)
 {
+    /* cells are cellWidth x cellHeight with a 1-texel border on the left and top (libctru's
+     * fontCalcGlyphPos: +1). Without the +1 the glyph's last column and row were cut off and a
+     * blank border column read in front (Nintendo's font: button circles clipped on the right,
+     * letters one texel narrower and closer together; the emulators' font pads its glyphs, so
+     * there it did not show). */
     const int per = g_tglp->nRows * g_tglp->nLines, in = gi % per;
-    *ox = (in % g_tglp->nRows) * (g_tglp->cellWidth + 1);
-    *oy = (in / g_tglp->nRows) * (g_tglp->cellHeight + 1);
+    *ox = (in % g_tglp->nRows) * (g_tglp->cellWidth + 1) + 1;
+    *oy = (in / g_tglp->nRows) * (g_tglp->cellHeight + 1) + 1;
     return (const u8 *)fontGetGlyphSheetTex(NULL, gi / per);
 }
 
@@ -688,13 +693,14 @@ void ui_background(int y, int h)
     }
 }
 
-void ui_header(const char *title, const char *right)
+void ui_header_tag(const char *title, const char *tag, const char *right)
 {
     ui_vgrad(0, 0, UI_W, UI_HEADER_H - 1, UI_HEAD_TOP, UI_HEAD_BOT);
     ui_fill(0, UI_HEADER_H - 1, UI_W, 1, UI_LINE);
     ui_blend_fill(0, UI_HEADER_H, UI_W, 2, UI_RGB(0, 0, 0), 3);
     const int cy = UI_HEADER_H / 2;
-    const int tw = ui_text_width(UI_TITLE, title);
+    const int gap = tag ? ui_text_width(UI_TITLE, " ") : 0;
+    const int tw = ui_text_width(UI_TITLE, title) + (tag ? gap + ui_text_width(UI_TITLE, tag) : 0);
     int rw = 0;
     if (right && *right) {
         int room = UI_W - 30 - tw;
@@ -702,7 +708,14 @@ void ui_header(const char *title, const char *right)
         rw = ui_text_fit(UI_W - 10, ui_text_y(UI_SMALL, cy), UI_SMALL, UI_TEXT_DIM, UI_RIGHT, room, right) + 10;
     }
     const int size = tw <= UI_W - 20 - rw ? UI_TITLE : UI_BODY; /* long game names: one size down */
-    ui_text_fit(10, ui_text_y(size, cy), size, UI_TEXT, UI_LEFT, UI_W - 20 - rw, title);
+    const int w = ui_text_fit(10, ui_text_y(size, cy), size, UI_TEXT, UI_LEFT, UI_W - 20 - rw, title);
+    if (tag && 10 + w + gap < UI_W - 20 - rw)
+        ui_text_fit(10 + w + gap, ui_text_y(size, cy), size, UI_SEL, UI_LEFT, UI_W - 20 - rw - w - gap, tag);
+}
+
+void ui_header(const char *title, const char *right)
+{
+    ui_header_tag(title, NULL, right);
 }
 
 int ui_footer_begin(void)

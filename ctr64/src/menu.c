@@ -224,7 +224,7 @@ static u64 g_capture_until;
 static u32 g_capture_keys;    /* controls: 3DS buttons pressed so far while capturing */
 static Rect g_w[32];
 static int g_nw;
-static struct { Rect r; u32 key; } g_foot[4];
+static struct { Rect r; u32 key; } g_foot[8]; /* up to 5 buttons (controls page in a game) */
 static int g_nfoot;
 
 #define LIST_Y (UI_HEADER_H + 6)
@@ -307,7 +307,7 @@ static void layout(void)
     } else if (g_page == PAGE_CONTROLS) {
         for (int h = 0; h < PAD_N; h++) {
             const int r = k_n64pad_hot[h].r + 4;
-            g_w[h] = (Rect){(s16)(PAD_X + k_n64pad_hot[h].x - r), (s16)(PAD_Y + k_n64pad_hot[h].y - r), (s16)(2 * r),
+            g_w[h] = (Rect){(s16)lroundf(PAD_X + k_n64pad_hot[h].x - r), (s16)lroundf(PAD_Y + k_n64pad_hot[h].y - r), (s16)(2 * r),
                             (s16)(2 * r)};
         }
         g_nw = PAD_N;
@@ -821,7 +821,7 @@ static void draw_page(void)
             ui_header(game_title(), "Paused");
     } else {
         const bool own = g_page == PAGE_CONTROLS && !g_no_game && settings_game_controls_active();
-        ui_header(own ? "Controls (this game)" : titles[g_page], g_no_game ? "Settings" : game_title());
+        ui_header_tag(titles[g_page], own ? "(this game)" : NULL, g_no_game ? "Settings" : game_title());
         if (g_page == PAGE_CONTROLS)
             draw_pad();
         else
@@ -1087,7 +1087,8 @@ static int widget_at(int x, int y)
             return -1;
         if (g_page == PAGE_CONTROLS) {
             const PadHot *p = &k_n64pad_hot[i];
-            const int dx = x - (PAD_X + p->x), dy = y - (PAD_Y + p->y), rr = p->r + 6;
+            const float dx = (float)x + 0.5f - (PAD_X + p->x), dy = (float)y + 0.5f - (PAD_Y + p->y);
+            const float rr = (float)(p->r + 6);
             if (dx * dx + dy * dy <= rr * rr)
                 return i;
             continue;
@@ -1134,6 +1135,22 @@ MenuResult menu_run(void)
         ui_scan(&down, &held, &up);
         u32 rep = hidKeysDownRepeat() | (down & (KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT));
         ui_touch_update(&touch, down, held, up);
+
+        /* controls: a message in the footer ("N64 A = A", "Controls saved for this game") goes
+         * away after a second and the buttons come back (they are hidden while it shows) */
+        {
+            static char seen[sizeof(g_status)];
+            static u64 since;
+            if (strcmp(seen, g_status)) {
+                memcpy(seen, g_status, sizeof(seen));
+                since = osGetTime();
+            }
+            if (g_page == PAGE_CONTROLS && g_status[0] && g_capture < 0 && osGetTime() - since >= 1000) {
+                g_status[0] = seen[0] = 0;
+                draw_footer();
+                ui_present();
+            }
+        }
 
         /* controls: waiting for the 3DS button of an N64 input */
         if (g_capture >= 0) {

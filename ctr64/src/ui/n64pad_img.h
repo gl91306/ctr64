@@ -449,18 +449,18 @@ static const u8 k_n64pad_rle[9871] = {
     97, 23, 23, 130, 8, 211, 0};
 static const UiImage k_n64pad = {189, 176, 237, k_n64pad_pal, k_n64pad_alpha, k_n64pad_rle};
 
-typedef struct { const char *name; s16 x, y, r; const char *kind; } PadHot;
+typedef struct { const char *name; float x, y; s16 r; const char *kind; } PadHot; /* x, y: exact centre in image pixels */
 static const PadHot k_n64pad_hot[12] = {
-    {"L", 28, 22, 9, "shoulder"},
-    {"R", 161, 22, 9, "shoulder"},
-    {"Z", 52, 119, 11, "z"},
-    {"START", 94, 64, 7, "start"},
-    {"B", 129, 63, 8, "b"},
-    {"A", 142, 76, 8, "a"},
-    {"C-Up", 156, 42, 6, "c"},
-    {"C-Down", 156, 63, 6, "c"},
-    {"C-Left", 145, 52, 6, "c"},
-    {"C-Right", 166, 52, 6, "c"},
-    {"Stick", 94, 100, 19, "stick"},
-    {"D-Pad", 38, 58, 17, "dpad"},
+    {"L", 28.4f, 22.0f, 9, "shoulder"},
+    {"R", 160.7f, 22.0f, 9, "shoulder"},
+    {"Z", 51.7f, 118.6f, 11, "z"},
+    {"START", 94.5f, 63.6f, 7, "start"},
+    {"B", 129.2f, 62.5f, 8, "b"},
+    {"A", 141.8f, 75.9f, 8, "a"},
+    {"C-Up", 155.9f, 41.8f, 6, "c"},
+    {"C-Down", 155.9f, 62.7f, 6, "c"},
+    {"C-Left", 145.2f, 52.3f, 6, "c"},
+    {"C-Right", 166.5f, 52.3f, 6, "c"},
+    {"Stick", 94.5f, 99.6f, 19, "stick"},
+    {"D-Pad", 38.3f, 58.1f, 17, "dpad"},
 };

@@ -1,7 +1,9 @@
 #include "rom_title.h"
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Display names: a table of well-known games by the two-letter game id of the ROM header
@@ -147,6 +149,51 @@ static void from_header(const unsigned char *h, char *title, size_t tn)
 }
 
 /* the header's internal name (letters and digits, upper case) contains one of names */
+/* Known dumps: the header checksums (0x10-0x17, CRC1 CRC2) of every ROM in the core's ROM catalog
+ * (mupen64plus.ini, built into the core as `inifile`: ~3200 entries, retail games plus known
+ * translations and fixes). A hack that changes the first megabyte of the game must fix these
+ * checksums or the boot code refuses it, so a ROM with a well-known game's ID but checksums that are
+ * not in the catalog is a hack even when it kept the internal name (TTYD64 is "PAPER MARIO"). */
+extern char inifile[];
+static uint64_t *g_known;
+static int g_known_n = -1;
+
+static int cmp_u64(const void *a, const void *b)
+{
+    const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static bool crc_known(const unsigned char *h)
+{
+    if (g_known_n < 0) { /* first call: collect and sort the catalog's "CRC=XXXXXXXX YYYYYYYY" lines */
+        g_known_n = 0;
+        int cap = 0;
+        for (const char *p = inifile; (p = strstr(p, "\nCRC=")) != NULL; p += 5) {
+            char *e;
+            const unsigned long a = strtoul(p + 5, &e, 16);
+            if (e != p + 13 || *e != ' ')
+                continue;
+            const unsigned long b = strtoul(e + 1, &e, 16);
+            if (g_known_n == cap) {
+                cap = cap ? cap * 2 : 4096;
+                uint64_t *n = realloc(g_known, (size_t)cap * sizeof(*n));
+                if (!n)
+                    break;
+                g_known = n;
+            }
+            g_known[g_known_n++] = (uint64_t)a << 32 | (uint32_t)b;
+        }
+        qsort(g_known, (size_t)g_known_n, sizeof(*g_known), cmp_u64);
+    }
+    if (g_known_n == 0)
+        return true; /* no catalog: cannot tell */
+    const uint64_t k = (uint64_t)h[0x10] << 56 | (uint64_t)h[0x11] << 48 | (uint64_t)h[0x12] << 40 |
+                       (uint64_t)h[0x13] << 32 | (uint64_t)h[0x14] << 24 | (uint64_t)h[0x15] << 16 |
+                       (uint64_t)h[0x16] << 8 | h[0x17];
+    return bsearch(&k, g_known, (size_t)g_known_n, sizeof(*g_known), cmp_u64) != NULL;
+}
+
 static bool internal_name_matches(const unsigned char *h, const char *names)
 {
     char n[24];
@@ -190,6 +237,17 @@ void rom_title_from_header(const unsigned char hdr[64], const char *file, char *
                     snprintf(tags, gn, "%s hack", k_games[i].title);
                     return;
                 }
+            }
+            if (file && !crc_known(h)) { /* a hack with the game's own name: listed by its file name */
+                char ft[16];
+                if (!from_file(file, title, tn, ft, sizeof(ft))) {
+                    snprintf(title, tn, "%s", file);
+                    char *dot = strrchr(title, '.');
+                    if (dot)
+                        *dot = 0;
+                }
+                snprintf(tags, gn, "%s hack", k_games[i].title);
+                return;
             }
             snprintf(title, tn, "%s", k_games[i].title);
             const char *r = region_name((char)h[0x3E]);

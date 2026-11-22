@@ -128,6 +128,8 @@ void ui_mask(const UiMask *m, int x, int y, UiCol c);
 /* the common screen frame: background, header with a title, footer bar */
 void ui_background(int y, int h);
 void ui_header(const char *title, const char *right);
+/* the same, with a tag after the title in the accent colour ("Controls" "(this game)") */
+void ui_header_tag(const char *title, const char *tag, const char *right);
 #define UI_HEADER_H 26
 #define UI_FOOTER_H 26
 /* footer buttons, drawn left to right from x; returns the next x */
