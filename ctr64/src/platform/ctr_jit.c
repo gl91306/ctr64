@@ -291,6 +291,22 @@ int ctr64_core1_ready(void)
     static int known = -1;
     if (known >= 0)
         return known;
+    /* New 3DS: core 1 is left alone, its threads (audio, compile, saves) run on core 2 with the
+     * video thread. A thread on core 2 while the app has CPU time on core 1 froze the 3DS when
+     * the Luma3DS Rosalina menu opened (GitHub #7; on hardware: menu drawn, no button works,
+     * power-off needed; with either one alone the menu works). Same speed in the HW tests of
+     * 2026-11-22 (Banjo-Tooie, Conker, Gauntlet, Mario Golf). Dev switch core1.txt: core 1 again. */
+    bool new3ds = false;
+    APT_CheckNew3DS(&new3ds);
+    if (new3ds) {
+        FILE *c1 = fopen("sdmc:/3ds/ctr64/core1.txt", "r");
+        if (c1)
+            fclose(c1);
+        else {
+            DebugMessage(M64MSG_INFO, "core 1: not used on a New 3DS (Rosalina menu freeze)");
+            return known = 0;
+        }
+    }
     u32 cur = 0;
     const Result g = APT_GetAppCpuTimeLimit(&cur);
     Result s1 = 0;

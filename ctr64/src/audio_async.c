@@ -1,4 +1,4 @@
-/* RSP audio tasks on another CPU core (New 3DS core 1; core 2 if that fails).
+/* RSP audio tasks on another CPU core (New 3DS: core 2, see ctr64_core1_ready).
  *
  * The audio HLE (mupen64plus-rsp-hle's alist code) runs on its own thread (higher priority than
  * the video worker, gfx_async.c, should they share core 2). The task runs on a second HLE instance whose RSP
@@ -6,8 +6,8 @@
  * to RDRAM. The core (rsp_core.c) reports the task done from the SP interrupt event once the
  * thread has finished (ctr64_audio_ready, ctr64_audio_finish); the game's audio timing follows
  * when its tasks finish, so that is at most 1/4 VI after the start (then the CPU waits).
- * A separate setting, on by default (New 3DS): the thread runs on core 1 (core 2 if that fails),
- * beside the video worker on core 2. */
+ * A separate setting, on by default (New 3DS): the thread runs on core 2 beside the video worker
+ * (core 1 only with the dev switch core1.txt). */
 int ctr64_core1_ready(void); /* platform/ctr_jit.c */
 #include <3ds.h>
 #include <stdbool.h>
