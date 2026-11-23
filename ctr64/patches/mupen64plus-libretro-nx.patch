@@ -98,10 +98,10 @@ index 66c8f62..da74b78 100644
  		return;
  
 diff --git a/GLideN64/src/BufferCopy/DepthBufferToRDRAM.cpp b/GLideN64/src/BufferCopy/DepthBufferToRDRAM.cpp
-index 8cf3913..838f41b 100644
+index 8cf3913..9e0110e 100644
 --- a/GLideN64/src/BufferCopy/DepthBufferToRDRAM.cpp
 +++ b/GLideN64/src/BufferCopy/DepthBufferToRDRAM.cpp
-@@ -22,7 +22,13 @@
+@@ -22,7 +22,17 @@
  using namespace graphics;
  
  #define DEPTH_TEX_WIDTH 640
@@ -112,10 +112,14 @@ index 8cf3913..838f41b 100644
 +#else
  #define DEPTH_TEX_HEIGHT 580
 +#endif
++
++#ifdef __3DS__
++extern "C" bool ctr64_depth_to_rdram(unsigned fbo, unsigned w, unsigned h, unsigned scale, unsigned address, unsigned short *dst);
++#endif
  
  DepthBufferToRDRAM::DepthBufferToRDRAM()
  	: m_frameCount(-1)
-@@ -224,7 +230,7 @@ bool DepthBufferToRDRAM::_copy(u32 _startAddress, u32 _endAddress)
+@@ -224,7 +234,7 @@ bool DepthBufferToRDRAM::_copy(u32 _startAddress, u32 _endAddress)
  {
  	DepthBuffer * pDepthBuffer = m_pCurFrameBuffer->m_pDepthBuffer;
  	const u32 stride = m_pCurFrameBuffer->m_width << 1;
@@ -124,6 +128,35 @@ index 8cf3913..838f41b 100644
  
  	u32 numPixels = (_endAddress - _startAddress) >> 1;
  	if (numPixels / m_pCurFrameBuffer->m_width > max_height) {
+@@ -280,6 +290,28 @@ bool DepthBufferToRDRAM::copyToRDRAM(u32 _address)
+ 	if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender)
+ 		return true;
+ 
++#ifdef __3DS__
++	/* ctr64: the PICA backend copies the depth itself (it has no depth blit and no float read back;
++	 * zeros were written here before, with which Donkey Kong 64 took Kong to be hidden) */
++	if (!isMemoryWritable(RDRAM + _address, gDP.colorImage.width * 2) || (VI.width | VI.height) == 0)
++		return false;
++	FrameBuffer * pBuf = frameBufferList().findBuffer(_address);
++	if (pBuf == nullptr || pBuf->isAuxiliary() || pBuf->m_pDepthBuffer == nullptr || !pBuf->m_pDepthBuffer->m_cleared)
++		return false;
++	DepthBuffer * pDepth = pBuf->m_pDepthBuffer;
++	if (pBuf->m_width != pDepth->m_width)
++		return false;
++	const u32 rows = cutHeight(pDepth->m_address, pBuf->m_height, pBuf->m_width * 2);
++	if (rows == 0 || pDepth->m_address + pBuf->m_width * rows * 2 > RDRAMSize + 1)
++		return false;
++	const bool wrote = ctr64_depth_to_rdram(u32(pBuf->m_FBO), pBuf->m_width, rows, u32(pBuf->m_scale + 0.5f),
++		pDepth->m_address, reinterpret_cast<u16*>(RDRAM + pDepth->m_address));
++	pDepth->m_cleared = false;
++	if (FrameBuffer * pDepthBuf = frameBufferList().findBuffer(pDepth->m_address))
++		pDepthBuf->m_cleared = false;
++	return wrote;
++#endif
++
+ 	if (!m_pbuf)
+ 		return false;
+ 
 diff --git a/GLideN64/src/BufferCopy/RDRAMtoColorBuffer.cpp b/GLideN64/src/BufferCopy/RDRAMtoColorBuffer.cpp
 index bb4fe0e..77ff54b 100644
 --- a/GLideN64/src/BufferCopy/RDRAMtoColorBuffer.cpp
@@ -648,7 +681,7 @@ index ac4e150..855667d 100644
  	void setCleared(bool _cleared);
  	DepthBuffer *findBuffer(u32 _address);
 diff --git a/GLideN64/src/FrameBuffer.cpp b/GLideN64/src/FrameBuffer.cpp
-index 68cf2bf..609edcb 100644
+index 68cf2bf..9798c93 100644
 --- a/GLideN64/src/FrameBuffer.cpp
 +++ b/GLideN64/src/FrameBuffer.cpp
 @@ -1,3 +1,4 @@
@@ -656,7 +689,38 @@ index 68cf2bf..609edcb 100644
  #include <assert.h>
  #include <math.h>
  #include <algorithm>
-@@ -146,6 +147,10 @@ bool FrameBuffer::isAuxiliary() const
+@@ -94,6 +95,10 @@ void FrameBuffer::_initTexture(u16 _width, u16 _height, u16 _format, u16 _size,
+ 	_initFrameBufferTexture(m_startAddress, _width, _height, m_scale, _format, _size, _pTexture);
+ }
+ 
++#ifdef __3DS__
++bool ctr64_fb_is16; /* ctr64: the color buffer texture being made is of a 16-bit N64 buffer (pica_ContextImpl.cpp) */
++#endif
++
+ static
+ void _setAndAttachBufferTexture(ObjectHandle _fbo, CachedTexture *_pTexture, u32 _t, bool _multisampling)
+ {
+@@ -107,6 +112,9 @@ void _setAndAttachBufferTexture(ObjectHandle _fbo, CachedTexture *_pTexture, u32
+ 	initParams.height = _pTexture->height;
+ 	if (_pTexture->size > G_IM_SIZ_8b) {
+ 		initParams.internalFormat = fbTexFormat.colorInternalFormat;
++#ifdef __3DS__
++		ctr64_fb_is16 = _pTexture->size == G_IM_SIZ_16b;
++#endif
+ 		initParams.format = fbTexFormat.colorFormat;
+ 		initParams.dataType = fbTexFormat.colorType;
+ 	} else {
+@@ -115,6 +123,9 @@ void _setAndAttachBufferTexture(ObjectHandle _fbo, CachedTexture *_pTexture, u32
+ 		initParams.dataType = fbTexFormat.monochromeType;
+ 	}
+ 	gfxContext.init2DTexture(initParams);
++#ifdef __3DS__
++	ctr64_fb_is16 = false;
++#endif
+ 
+ 	if (!_multisampling) {
+ 		Context::TexParameters texParams;
+@@ -146,6 +157,10 @@ bool FrameBuffer::isAuxiliary() const
  	return m_width != VI.width || m_size < G_IM_SIZ_16b;
  }
  
@@ -667,7 +731,7 @@ index 68cf2bf..609edcb 100644
  void FrameBuffer::init(u32 _address, u16 _format, u16 _size, u16 _width, bool _cfb)
  {
  	m_startAddress = _address;
-@@ -161,6 +166,24 @@ void FrameBuffer::init(u32 _address, u16 _format, u16 _size, u16 _width, bool _c
+@@ -161,6 +176,24 @@ void FrameBuffer::init(u32 _address, u16 _format, u16 _size, u16 _width, bool _c
  	} else {
  		m_scale = std::max(dwnd().getScaleX(), 1.0f);
  	}
@@ -692,7 +756,29 @@ index 68cf2bf..609edcb 100644
  	m_cfb = _cfb;
  	m_cleared = false;
  	m_fingerprint = false;
-@@ -251,6 +274,9 @@ void FrameBuffer::setDirty()
+@@ -212,6 +245,11 @@ void FrameBuffer::setBufferClearParams(u32 _fillcolor, s32 _ulx, s32 _uly, s32 _
+ 	m_clearParams.lry = _lry;
+ }
+ 
++#ifdef __3DS__
++/* gfx_async.c: RDRAM the video thread writes to (a cartridge DMA into it waits for pending lists) */
++extern "C" void ctr64_gfx_wrote(unsigned start, unsigned end);
++#endif
++
+ void FrameBuffer::copyRdram()
+ {
+ 	const u32 stride = m_width << m_size >> 1;
+@@ -239,6 +277,9 @@ void FrameBuffer::copyRdram()
+ 				pData[start++] = 0;
+ 		}
+ 		m_fingerprint = true;
++#ifdef __3DS__
++		ctr64_gfx_wrote(m_startAddress, m_startAddress + dataSize);
++#endif
+ 		return;
+ 	}
+ 	m_RdramCopy.resize(dataSize);
+@@ -251,6 +292,9 @@ void FrameBuffer::setDirty()
  	m_RdramCopy.clear();
  }
  
@@ -702,7 +788,7 @@ index 68cf2bf..609edcb 100644
  bool FrameBuffer::isValid(bool _forceCheck) const
  {
  	if (!_forceCheck) {
-@@ -272,6 +298,54 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -272,6 +316,54 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  		const u32 start = (m_startAddress >> 2) + static_cast<u32>(m_clearParams.uly) * ci_width_in_dwords;
  		const u32 * dst = pData + start;
  		u32 wrongPixels = 0;
@@ -757,7 +843,7 @@ index 68cf2bf..609edcb 100644
  		for (s32 y = m_clearParams.uly; y < lry; ++y) {
  			for (s32 x = m_clearParams.ulx; x < m_clearParams.lrx; ++x) {
  				if ((dst[x] & 0xFFFEFFFE) != testColor)
-@@ -280,6 +354,7 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -280,6 +372,7 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  			dst += ci_width_in_dwords;
  		}
  		return wrongPixels < (m_endAddress - m_startAddress) / 400; // threshold level 1% of dwords
@@ -765,7 +851,7 @@ index 68cf2bf..609edcb 100644
  	} else if (m_fingerprint) {
  			//check if our fingerprint is still there
  			u32 start = m_startAddress >> 2;
-@@ -293,11 +368,56 @@ bool FrameBuffer::isValid(bool _forceCheck) const
+@@ -293,11 +386,56 @@ bool FrameBuffer::isValid(bool _forceCheck) const
  		const u32 size_dwords = size >> 2;
  		u32 start = m_startAddress >> 2;
  		u32 wrongPixels = 0;
@@ -822,7 +908,7 @@ index 68cf2bf..609edcb 100644
  	}
  	return true; // No data to decide
  }
-@@ -471,6 +591,12 @@ CachedTexture * FrameBuffer::getTexture(u32 _t)
+@@ -471,6 +609,12 @@ CachedTexture * FrameBuffer::getTexture(u32 _t)
  	const bool getDepthTexture = m_isDepthBuffer &&
  								 gDP.colorImage.address == gDP.depthImageAddress &&
  								 m_pDepthBuffer != nullptr &&
@@ -835,15 +921,103 @@ index 68cf2bf..609edcb 100644
  								 (config.generalEmulation.hacks & hack_ZeldaMM) == 0;
  	CachedTexture *pTexture = getDepthTexture ? m_pDepthBuffer->m_pDepthBufferTexture : m_pTexture;
  
-@@ -771,6 +897,7 @@ void FrameBufferList::_createScreenSizeBuffer()
+@@ -769,8 +913,13 @@ void FrameBufferList::_createScreenSizeBuffer()
+ 	buffer.init(VI.width * 2, G_IM_FMT_RGBA, G_IM_SIZ_16b, static_cast<u16>(VI.width), false);
+ }
  
++#ifdef __3DS__
++extern bool ctr64_bg_copy_rects; /* GraphicsDrawer.cpp */
++#endif
++
  void FrameBufferList::saveBuffer(u32 _address, u16 _format, u16 _size, u16 _width, bool _cfb)
  {
 +	CTR64_PROF(8);
  	if (_width > 640)
  		return;
  
-@@ -1464,6 +1591,7 @@ void FrameBufferList::OverscanBuffer::draw(u32 _fullHeight, bool _PAL)
+@@ -812,12 +961,29 @@ void FrameBufferList::saveBuffer(u32 _address, u16 _format, u16 _size, u16 _widt
+ 		removeIntersections();
+ 	}
+ 
++#ifdef __3DS__
++	/* ctr64: Yoshi's Story draws new columns of its 8 bit background pictures with copy rectangles.
++	 * They are done in RDRAM (texturedRectBGCopy), which then drops the buffer: no buffer for them.
++	 * Each one took 5 ms (a 2x texture, the picture copied in from RDRAM, HW 2026-11-22). */
++	if (ctr64_bg_copy_rects && _size <= G_IM_SIZ_8b && !_cfb && _address != gDP.depthImageAddress) {
++		removeBuffer(_address);
++		if (m_pCurrent != nullptr) {
++			m_pCurrent = nullptr;
++			gfxContext.bindFramebuffer(bufferTarget::DRAW_FRAMEBUFFER, ObjectHandle::defaultFramebuffer);
++		}
++		return;
++	}
++#endif
++
+ 	const float scaleX = config.frameBufferEmulation.nativeResFactor == 0 ?
+ 		wnd.getScaleX() :
+ 		static_cast<float>(config.frameBufferEmulation.nativeResFactor);
+ 
+ 	if (m_pCurrent == nullptr || m_pCurrent->m_startAddress != _address || m_pCurrent->m_width != _width)
+ 		m_pCurrent = findBuffer(_address);
++#ifdef __3DS__
++	bool redrawn = false;
++#endif
+ 
+ 	auto isSubBuffer = [_address, _width, _size, &wnd](const FrameBuffer * _pBuffer) -> bool
+ 	{
+@@ -866,9 +1032,37 @@ void FrameBufferList::saveBuffer(u32 _address, u16 _format, u16 _size, u16 _widt
+ 				removeBuffer(m_pCurrent->m_startAddress);
+ 				m_pCurrent = nullptr;
+ 			}
++#ifdef __3DS__
++		/* ctr64: a small buffer used with 8 bit texels, now with 16 (Mario Tennis draws each
++		 * player's shadow in a 64x32 one: cleared as 16 bit, drawn as 8 bit, 2-3 times a frame).
++		 * Emptied and kept: made anew each time, and filled with the 64x240 texels RDRAM has there
++		 * (other data: the buffer has 32 rows), it took 2 ms. */
++		} else if (m_pCurrent->m_width == _width && m_pCurrent->m_size < _size && _size == G_IM_SIZ_16b &&
++					m_pCurrent->m_scale == scaleX && _width != VI.width && _width <= 64 && !_cfb &&
++					!m_pCurrent->m_cfb && !m_pCurrent->m_isDepthBuffer && _address != gDP.depthImageAddress &&
++					!gDP.m_subscreen && m_pCurrent->m_pTexture->frameBufferTexture == CachedTexture::fbOneSample) {
++			gfxContext.bindFramebuffer(bufferTarget::FRAMEBUFFER, m_pCurrent->m_FBO);
++			wnd.getDrawer().clearColorBuffer(nullptr);
++			m_pCurrent->m_resolved = false;
++			m_pCurrent->m_size = _size;
++			m_pCurrent->m_height = 1;
++			m_pCurrent->m_cleared = m_pCurrent->m_fingerprint = false;
++			m_pCurrent->m_changed = m_pCurrent->m_copiedToRdram = false;
++			m_pCurrent->m_RdramCopy.clear();
++			m_pCurrent->m_pTexture->format = _format;
++			m_pCurrent->m_pTexture->size = _size;
++			m_pCurrent->updateEndAddress();
++#endif
+ 		} else if ((m_pCurrent->m_width != _width) ||
+ 					(m_pCurrent->m_size < _size) ||
+ 					(m_pCurrent->m_scale != scaleX)) {
++#ifdef __3DS__
++			/* ctr64: drawn in this frame at another width: RDRAM does not have what is there (the
++			 * copy below would bring older data). Goemon's diary screen uses one address 8 and 256
++			 * texels wide in turn, 12 times a frame, each time with a copy of 240 rows. */
++			redrawn = m_pCurrent->m_swapCount == wnd.getBuffersSwapCount() && m_pCurrent->isAuxiliary() &&
++				_width != VI.width && !_cfb && !m_pCurrent->m_isDepthBuffer && _address != gDP.depthImageAddress;
++#endif
+ 			removeBuffer(m_pCurrent->m_startAddress);
+ 			m_pCurrent = nullptr;
+ 		} else {
+@@ -897,6 +1091,13 @@ void FrameBufferList::saveBuffer(u32 _address, u16 _format, u16 _size, u16 _widt
+ 		FrameBuffer & buffer = m_list.front();
+ 		buffer.init(_address, _format, _size, _width, _cfb);
+ 		m_pCurrent = &buffer;
++#ifdef __3DS__
++		if (redrawn) {
++			f32 black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
++			gfxContext.bindFramebuffer(bufferTarget::FRAMEBUFFER, m_pCurrent->m_FBO);
++			wnd.getDrawer().clearColorBuffer(black);
++		} else
++#endif
+ 		RDRAMtoColorBuffer::get().copyFromRDRAM(m_pCurrent);
+ 		if (_cfb)
+ 			m_pCurrent->copyRdram();
+@@ -1464,6 +1665,7 @@ void FrameBufferList::OverscanBuffer::draw(u32 _fullHeight, bool _PAL)
  
  void FrameBufferList::renderBuffer()
  {
@@ -851,12 +1025,16 @@ index 68cf2bf..609edcb 100644
  	if (g_debugger.isDebugMode()) {
  		g_debugger.draw();
  		return;
-@@ -1711,12 +1839,27 @@ void FrameBufferList::fillRDRAM(s32 ulx, s32 uly, s32 lrx, s32 lry)
+@@ -1711,12 +1913,31 @@ void FrameBufferList::fillRDRAM(s32 ulx, s32 uly, s32 lrx, s32 lry)
  	dst += static_cast<u32>(uly) * ci_width_in_dwords;
  	if (!isMemoryWritable(dst, lowerBound - gDP.colorImage.address))
  		return;
 +#ifdef __3DS__
 +	/* ctr64: full-screen clears every frame (MM, OoT): 8 words a step */
++	if (lry > uly) {
++		const u32 rowBytes = ci_width_in_dwords * 4;
++		ctr64_gfx_wrote(gDP.colorImage.address + static_cast<u32>(uly) * rowBytes, gDP.colorImage.address + static_cast<u32>(lry) * rowBytes);
++	}
 +	const u32 fill = gDP.fillColor.color;
 +	for (s32 y = uly; y < lry; ++y) {
 +		u32 *p = dst + ulx, *const e = dst + (lrx > ulx ? lrx : ulx);
@@ -965,7 +1143,7 @@ index 2041bac..35d026f 100644
  
  		void drawTriangles(const DrawTriangleParameters & _params);
 diff --git a/GLideN64/src/GraphicsDrawer.cpp b/GLideN64/src/GraphicsDrawer.cpp
-index a2fb0af..f84fa2f 100644
+index a2fb0af..1c1dc7f 100644
 --- a/GLideN64/src/GraphicsDrawer.cpp
 +++ b/GLideN64/src/GraphicsDrawer.cpp
 @@ -1,3 +1,8 @@
@@ -1240,15 +1418,29 @@ index a2fb0af..f84fa2f 100644
  	const float W = 1.0f;
  	m_rect[0].x = static_cast<f32>(_ulx);
  	m_rect[0].y = static_cast<f32>(_uly);
-@@ -1321,6 +1468,7 @@ static bool(*texturedRectSpecial)(const GraphicsDrawer::TexturedRectParams & _pa
+@@ -1319,8 +1466,21 @@ bool texturedRectPaletteMod(const GraphicsDrawer::TexturedRectParams & _params)
+ // Return true if actuial rendering is not necessary
+ static bool(*texturedRectSpecial)(const GraphicsDrawer::TexturedRectParams & _params) = nullptr;
  
++#ifdef __3DS__
++bool ctr64_bg_copy_rects; /* texturedRectBGCopy in use: see FrameBufferList::saveBuffer */
++#endif
++
  void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  {
 +	CTR64_PROF(3);
++#ifdef __3DS__
++	/* done in RDRAM alone: no texture to load for it */
++	if (ctr64_bg_copy_rects && _params.texrectCmd && gDP.colorImage.size <= G_IM_SIZ_8b) {
++		m_texrectDrawer.draw();
++		texturedRectBGCopy(_params);
++		return;
++	}
++#endif
  	gSP.changed &= ~CHANGED_GEOMETRYMODE; // Don't update cull mode
  	m_drawingState = DrawingState::TexRect;
  	m_statistics.texRects++;
-@@ -1369,7 +1517,7 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
+@@ -1369,7 +1529,7 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  		&& (cache.current[0] != nullptr)
  		//		&& (cache.current[0] == nullptr || cache.current[0]->format == G_IM_FMT_RGBA || cache.current[0]->format == G_IM_FMT_CI)
  		&& !bUseFbTexture && !bUseHdTexture);
@@ -1257,7 +1449,7 @@ index a2fb0af..f84fa2f 100644
  	const float W = 1.0f;
  	const f32 ulx = _params.ulx;
  	const f32 uly = _params.uly;
-@@ -1514,6 +1662,15 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
+@@ -1514,6 +1674,15 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  	m_rect[3].bc1 = 1.0f;
  
  
@@ -1273,6 +1465,17 @@ index a2fb0af..f84fa2f 100644
  	if (bUseTexrectDrawer) {
  		if (m_bBGMode) {
  			m_texrectDrawer.addBackgroundRect();
+@@ -1848,6 +2017,10 @@ void GraphicsDrawer::_setSpecialTexrect() const
+ 		texturedRectSpecial = texturedRectPaletteMod;
+ 	else
+ 		texturedRectSpecial = nullptr;
++#ifdef __3DS__
++	extern bool ctr64_bg_copy_rects;
++	ctr64_bg_copy_rects = texturedRectSpecial == texturedRectBGCopy;
++#endif
+ }
+ 
+ void GraphicsDrawer::_initData()
 diff --git a/GLideN64/src/GraphicsDrawer.h b/GLideN64/src/GraphicsDrawer.h
 index 466620d..e2ff56c 100644
 --- a/GLideN64/src/GraphicsDrawer.h
@@ -1357,6 +1560,77 @@ index 4fdd01f..0db2c6d 100644
  extern u32 RDRAMSize;
  extern bool ConfigOpen;
  
+diff --git a/GLideN64/src/RDP.cpp b/GLideN64/src/RDP.cpp
+index 4a1bebf..90beec0 100644
+--- a/GLideN64/src/RDP.cpp
++++ b/GLideN64/src/RDP.cpp
+@@ -243,8 +243,8 @@ bool _getTexRectParams(u32 & w2, u32 & w3)
+ 		halfTexRect
+ 	} texRectMode = gdpTexRect;
+ 
+-	const u32 cmd1 = (*(u32*)&RDRAM[RSP.PC[RSP.PCi] + 0]) >> 24;
+-	const u32 cmd2 = (*(u32*)&RDRAM[RSP.PC[RSP.PCi] + 8]) >> 24;
++	const u32 cmd1 = (DL_WORD(RSP.PC[RSP.PCi] + 0)) >> 24;
++	const u32 cmd2 = (DL_WORD(RSP.PC[RSP.PCi] + 8)) >> 24;
+ 	if (cmd1 == G_RDPHALF_1) {
+ 		if (cmd2 == G_RDPHALF_2)
+ 			texRectMode = gspTexRect;
+@@ -255,10 +255,10 @@ bool _getTexRectParams(u32 & w2, u32 & w3)
+ 
+ 	switch (texRectMode) {
+ 	case gspTexRect:
+-		w2 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 4];
++		w2 = DL_WORD(RSP.PC[RSP.PCi] + 4);
+ 		RSP.PC[RSP.PCi] += 8;
+ 
+-		w3 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 4];
++		w3 = DL_WORD(RSP.PC[RSP.PCi] + 4);
+ 		RSP.PC[RSP.PCi] += 8;
+ 		break;
+ 	case gdpTexRect:
+@@ -269,19 +269,19 @@ bool _getTexRectParams(u32 & w2, u32 & w3)
+ 		{
+ 			const u32 ucode = GBI.getMicrocodeType();
+ 			if (ucode == F5Rogue || ucode == F5Indi_Naboo) {
+-				w2 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 8];
+-				w3 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 12];
++				w2 = DL_WORD(RSP.PC[RSP.PCi] + 8);
++				w3 = DL_WORD(RSP.PC[RSP.PCi] + 12);
+ 				RSP.PC[RSP.PCi] += 8;
+ 				return true;
+ 			}
+ 		}
+-		w2 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 0];
+-		w3 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 4];
++		w2 = DL_WORD(RSP.PC[RSP.PCi] + 0);
++		w3 = DL_WORD(RSP.PC[RSP.PCi] + 4);
+ 		RSP.PC[RSP.PCi] += 8;
+ 		break;
+ 	case halfTexRect:
+ 		w2 = 0;
+-		w3 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 4];
++		w3 = DL_WORD(RSP.PC[RSP.PCi] + 4);
+ 		RSP.PC[RSP.PCi] += 8;
+ 		break;
+ 	default:
+@@ -532,14 +532,14 @@ void RDP_Half_1( u32 _c )
+ 			RDP.cmd_data[RDP.cmd_ptr++] = w1;
+ 			RSP_CheckDLCounter();
+ 
+-			w0 = *(u32*)&RDRAM[RSP.PC[RSP.PCi]];
+-			w1 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 4];
++			w0 = DL_WORD(RSP.PC[RSP.PCi]);
++			w1 = DL_WORD(RSP.PC[RSP.PCi] + 4);
+ 			RSP.cmd = _SHIFTR( w0, 24, 8 );
+ 
+ 			DebugMsg(DEBUG_NORMAL, "0x%08lX: CMD=0x%02lX W0=0x%08lX W1=0x%08lX\n", RSP.PC[RSP.PCi], _SHIFTR(w0, 24, 8), w0, w1);
+ 
+ 			RSP.PC[RSP.PCi] += 8;
+-			// RSP.nextCmd = _SHIFTR( *(u32*)&RDRAM[RSP.PC[RSP.PCi]], 24, 8 );
++			// RSP.nextCmd = _SHIFTR( DL_WORD(RSP.PC[RSP.PCi]), 24, 8 );
+ 		} while (RSP.cmd != 0xb3);
+ 		RDP.cmd_data[RDP.cmd_ptr++] = w1;
+ 		RSP.cmd = (RDP.cmd_data[RDP.cmd_cur] >> 24) & 0x3f;
 diff --git a/GLideN64/src/RDP.h b/GLideN64/src/RDP.h
 index 992548c..00cca35 100644
 --- a/GLideN64/src/RDP.h
@@ -1376,7 +1650,7 @@ index 992548c..00cca35 100644
  
  typedef struct
 diff --git a/GLideN64/src/RSP.cpp b/GLideN64/src/RSP.cpp
-index a6b6078..9045bc9 100644
+index a6b6078..8d0fda0 100644
 --- a/GLideN64/src/RSP.cpp
 +++ b/GLideN64/src/RSP.cpp
 @@ -23,13 +23,53 @@ using namespace std;
@@ -1433,10 +1707,23 @@ index a6b6078..9045bc9 100644
  		if ((RSP.PC[RSP.PCi] + 8) > RDRAMSize) {
  #ifdef DEBUG_DUMP
  			if ((config.debug.dumpMode & DEBUG_DETAIL) != 0)
-@@ -55,10 +95,39 @@ void _ProcessDList()
+@@ -42,8 +82,8 @@ void _ProcessDList()
+ 			break;
+ 		}
+ 
+-		RSP.w0 = *(u32*)&RDRAM[RSP.PC[RSP.PCi]];
+-		RSP.w1 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 4];
++		RSP.w0 = DL_WORD(RSP.PC[RSP.PCi]);
++		RSP.w1 = DL_WORD(RSP.PC[RSP.PCi] + 4);
+ 		RSP.cmd = _SHIFTR(RSP.w0, 24, 8);
+ 
+ #ifdef DEBUG_DUMP
+@@ -54,11 +94,40 @@ void _ProcessDList()
+ 		u32 pci = RSP.PCi;
  		if (RSP.count == 1)
  			--pci;
- 		RSP.nextCmd = _SHIFTR(*(u32*)&RDRAM[RSP.PC[pci]], 24, 8);
+-		RSP.nextCmd = _SHIFTR(*(u32*)&RDRAM[RSP.PC[pci]], 24, 8);
++		RSP.nextCmd = _SHIFTR(DL_WORD(RSP.PC[pci]), 24, 8);
 +#ifdef __3DS__
 +		/* triangles set aside (gSPFlushTriangles) are drawn before any command that may change
 +		 * render state; these only load vertices or matrices, move through display lists or
@@ -1483,7 +1770,18 @@ index a6b6078..9045bc9 100644
  
  		GBI.cmd[RSP.cmd](RSP.w0, RSP.w1);
  		RSP.PC[RSP.PCi] += 8;
-@@ -184,6 +256,19 @@ void RSP_ProcessDList()
+@@ -164,6 +236,10 @@ void RSP_ProcessDList()
+ 			RSP.PC[1] = *(u32*)&DMEM[0xff8];
+ 			*REG.SP_STATUS &= ~0x300;  // clear sig1 | sig2
+ 			*REG.SP_STATUS |= 0x800;   // set sig4
++#ifdef __3DS__
++			/* ctr64: its lists trade signals with the CPU midway: inline, not streamed (gfx_async.c) */
++			ctr64_gfx_infloop_seen = ctr64_gfx_inline_game = true;
++#endif
+ 		}
+ 	}
+ 
+@@ -184,6 +260,19 @@ void RSP_ProcessDList()
  	}
  
  	if (RSP.infloop && REG.SP_STATUS) {
@@ -1503,7 +1801,7 @@ index a6b6078..9045bc9 100644
  		*REG.SP_STATUS &= ~(SP_STATUS_TASKDONE | SP_STATUS_HALT | SP_STATUS_BROKE);
  		return;
  	}
-@@ -287,6 +372,21 @@ void RSP_Init()
+@@ -287,6 +376,21 @@ void RSP_Init()
  		TFH.shutdown();
  
  	strncpy(RSP.romname, romname, 21);
@@ -1526,7 +1824,7 @@ index a6b6078..9045bc9 100644
  	config.generalEmulation.hacks = 0;
  	if (strstr(RSP.romname, (const char *)"OgreBattle64") != nullptr)
 diff --git a/GLideN64/src/RSP.h b/GLideN64/src/RSP.h
-index d9c5801..76ccd88 100644
+index d9c5801..360bb3e 100644
 --- a/GLideN64/src/RSP.h
 +++ b/GLideN64/src/RSP.h
 @@ -9,6 +9,9 @@ typedef struct
@@ -1539,6 +1837,28 @@ index d9c5801..76ccd88 100644
  	u32 w0, w1;
  	s32 count;
  	bool busy, halt, infloop;
+@@ -29,4 +32,21 @@ void RSP_ProcessDList();
+ void RSP_LoadMatrix( f32 mtx[4][4], u32 address );
+ void RSP_CheckDLCounter();
+ 
++#ifdef __3DS__
++/* ctr64: the words of a display list on the video thread, from its own copy where it has one
++ * (gfx_async.c copy_list) */
++extern "C" {
++extern const unsigned char * ctr64_dl_copy;
++extern unsigned ctr64_dl_from, ctr64_dl_len;
++}
++static inline u32 ctr64DlWord(u32 _a)
++{
++	const u32 o = _a - ctr64_dl_from;
++	return o < ctr64_dl_len ? *(const u32*)&ctr64_dl_copy[o] : *(const u32*)&RDRAM[_a];
++}
++#define DL_WORD(a) ctr64DlWord(a)
++#else
++#define DL_WORD(a) (*(u32*)&RDRAM[a])
++#endif
++
+ #endif
 diff --git a/GLideN64/src/SoftwareRender.cpp b/GLideN64/src/SoftwareRender.cpp
 index ae6ada6..392fc29 100644
 --- a/GLideN64/src/SoftwareRender.cpp
@@ -1791,7 +2111,7 @@ index ae6ada6..392fc29 100644
  	}
  
 diff --git a/GLideN64/src/TexrectDrawer.cpp b/GLideN64/src/TexrectDrawer.cpp
-index a7afe6b..b0715a8 100644
+index a7afe6b..96f9e99 100644
 --- a/GLideN64/src/TexrectDrawer.cpp
 +++ b/GLideN64/src/TexrectDrawer.cpp
 @@ -49,8 +49,18 @@ void TexrectDrawer::init()
@@ -1813,6 +2133,26 @@ index a7afe6b..b0715a8 100644
  	m_pTexture->textureBytes = m_pTexture->width * m_pTexture->height * fbTexFormats.colorFormatBytes;
  
  	Context::InitTextureParams initParams;
+@@ -142,8 +152,8 @@ bool TexrectDrawer::_lookAhead(bool _checkCoordinates) const
+ 	}
+ 
+ 	auto sideBySide = [&](u32 pc) ->bool {
+-		const u32 w0 = *(u32*)&RDRAM[pc];
+-		const u32 w1 = *(u32*)&RDRAM[pc + 4];
++		const u32 w0 = DL_WORD(pc);
++		const u32 w1 = DL_WORD(pc + 4);
+ 		const iRect nextRect = _getiRect(w0, w1);
+ 
+ 		if (COMPARE_COORDS(m_curRect.ulx, nextRect.ulx)) {
+@@ -161,7 +171,7 @@ bool TexrectDrawer::_lookAhead(bool _checkCoordinates) const
+ 
+ 	u32 pc = RSP.PC[RSP.PCi];
+ 	while (true) {
+-		switch (_SHIFTR(*(u32*)&RDRAM[pc], 24, 8)) {
++		switch (_SHIFTR(DL_WORD(pc), 24, 8)) {
+ 		case G_RDPLOADSYNC:
+ 		case G_RDPPIPESYNC:
+ 		case G_RDPTILESYNC:
 @@ -185,6 +195,19 @@ bool TexrectDrawer::_lookAhead(bool _checkCoordinates) const
  	return false;
  }
@@ -1884,7 +2224,7 @@ index e62ff60..aa89a0b 100644
  
  private:
 diff --git a/GLideN64/src/Textures.cpp b/GLideN64/src/Textures.cpp
-index abfdaa3..0a36dc8 100644
+index abfdaa3..32ea371 100644
 --- a/GLideN64/src/Textures.cpp
 +++ b/GLideN64/src/Textures.cpp
 @@ -1,3 +1,4 @@
@@ -1964,7 +2304,77 @@ index abfdaa3..0a36dc8 100644
  
  		int mask_width = (pTile->masks == 0) ? (tile_width) : (1 << pTile->masks);
  		int mask_height = (pTile->maskt == 0) ? (tile_height) : (1 << pTile->maskt);
-@@ -1358,6 +1400,44 @@ void TextureCache::_getTextureDestData(CachedTexture& tmptex,
+@@ -945,6 +987,18 @@ void _calcTileSizes(u32 _t, TileSizes & _sizes, gDPTile * _pLoadTile)
+ 					pTile->maskt == 0) ?
+ 					_sizes.clampHeight :
+ 					height;
++
++#ifdef __3DS__
++	/* ctr64: a tile set up as large as can be (clamped, no mask, 1024x256) for a load of up to
++	 * 2048 texels: the texture gets what the TMEM holds, its lines as wide as they are. Mario
++	 * Tennis's VS screen copies its frame buffer that way, 28 textures of 512 KB; the memory
++	 * was full, a frame buffer stayed out of the VRAM (HW 2026-11-22: 6 VI/s). */
++	if (pTile->clamps && pTile->clampt && pTile->masks == 0 && pTile->maskt == 0 && pTile->line != 0 &&
++		pTile->size <= G_IM_SIZ_16b && _sizes.width * _sizes.height > 0x10000) {
++		_sizes.width = min<u32>(_sizes.width, (pTile->line << 4) >> pTile->size);
++		_sizes.height = min<u32>(_sizes.height, (512 - (pTile->tmem & 0x1FF) + pTile->line - 1) / pTile->line);
++	}
++#endif
+ }
+ 
+ void TextureCache::_updateCachedTexture(const GHQTexInfo & _info, CachedTexture *_pTexture, u16 widthOrg, u16 heightOrg)
+@@ -1058,6 +1112,14 @@ void TextureCache::_loadBackground(CachedTexture *pTexture)
+ 	pSwapped = (u8*)malloc(numBytes);
+ 	if (pSwapped == nullptr)
+ 		return;
++#ifdef __3DS__
++	/* ctr64: 8 bit pictures (Yoshi's Story's scrolling ones change often): the 256 texel values
++	 * once, then a table look-up per byte. Same result as the loop below. */
++	const bool fast8 = pTexture->size == G_IM_SIZ_8b &&
++		gSP.bgImage.address + numBytes <= RDRAMSize &&
++		(gSP.bgImage.address & 3) == 0;
++	if (!fast8)
++#endif
+ 	UnswapCopyWrap(RDRAM, gSP.bgImage.address, pSwapped, 0, RDRAMSize, numBytes);
+ 	pDest = (u32*)malloc(pTexture->textureBytes);
+ 	if (pDest == nullptr) {
+@@ -1070,6 +1132,35 @@ void TextureCache::_loadBackground(CachedTexture *pTexture)
+ 	clampTClamp = pTexture->height - 1;
+ 
+ 	j = 0;
++#ifdef __3DS__
++	if (fast8) {
++		alignas(8) u8 idx[256];
++		for (u32 i = 0; i < 256; ++i)
++			idx[i] = (u8)i;
++		const u8 * src = RDRAM + gSP.bgImage.address;
++		if (glInternalFormat == internalcolorFormat::RGBA8) {
++			u32 lut[256];
++			for (u32 i = 0; i < 256; ++i)
++				lut[i] = GetTexel((u64*)idx, i, 0, pTexture->palette);
++			for (u32 i = 0; i < numBytes; ++i)
++				pDest[i] = lut[src[i ^ 3]];
++		} else {
++			u16 lut[256];
++			for (u32 i = 0; i < 256; ++i)
++				lut[i] = static_cast<u16>(GetTexel((u64*)idx, i, 0, pTexture->palette));
++			u32 i = 0;
++			for (; i + 4 <= numBytes; i += 4) {
++				const u32 w = *reinterpret_cast<const u32*>(src + i);
++				pDest16[i] = lut[w >> 24];
++				pDest16[i + 1] = lut[(w >> 16) & 0xFF];
++				pDest16[i + 2] = lut[(w >> 8) & 0xFF];
++				pDest16[i + 3] = lut[w & 0xFF];
++			}
++			for (; i < numBytes; ++i)
++				pDest16[i] = lut[src[i ^ 3]];
++		}
++	} else
++#endif
+ 	for (y = 0; y < pTexture->height; y++) {
+ 		ty = min(y, (u32)clampTClamp);
+ 
+@@ -1358,6 +1449,44 @@ void TextureCache::_getTextureDestData(CachedTexture& tmptex,
  	} else {
  		j = 0;
  		const u32 tMemMask = gDP.otherMode.textureLUT == G_TT_NONE ? 0x1FF : 0xFF;
@@ -2009,7 +2419,7 @@ index abfdaa3..0a36dc8 100644
  		for (y = 0; y < tmptex.height; ++y) {
  			ty = min(y, clampTClamp) & maskTMask;
  
-@@ -1373,6 +1453,7 @@ void TextureCache::_getTextureDestData(CachedTexture& tmptex,
+@@ -1373,6 +1502,7 @@ void TextureCache::_getTextureDestData(CachedTexture& tmptex,
  					((u16*)pDest)[j++] = GetTexel(tmemOffset, tx, i, tmptex.palette);
  			}
  		}
@@ -2017,7 +2427,7 @@ index abfdaa3..0a36dc8 100644
  	}
  }
  
-@@ -1399,6 +1480,7 @@ void doubleTexture(T* pTex, u32 width, u32 height)
+@@ -1399,6 +1529,7 @@ void doubleTexture(T* pTex, u32 width, u32 height)
  
  void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
  {
@@ -2025,7 +2435,7 @@ index abfdaa3..0a36dc8 100644
  	u64 ricecrc = 0;
  	u64 strongcrc = 0;
  	if (_loadHiresTexture(_tile, _pTexture, ricecrc, strongcrc))
-@@ -1480,7 +1562,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
+@@ -1480,7 +1611,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
  				const u16 texHeight = tmptex.height;
  				tmptex.width = mipTile.lrs - mipTile.uls + 1;
  				tmptex.height = mipTile.lrt - mipTile.ult + 1;
@@ -2034,7 +2444,7 @@ index abfdaa3..0a36dc8 100644
  				if (sizeShift == 2)
  					doubleTexture<u32>(m_tempTextureHolder.data(), tmptex.width, tmptex.height);
  				else
-@@ -1488,7 +1570,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
+@@ -1488,7 +1619,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
  				tmptex.width = texWidth;
  				tmptex.height = texHeight;
  			} else {
@@ -2043,7 +2453,7 @@ index abfdaa3..0a36dc8 100644
  			}
  		}
  
-@@ -1606,6 +1688,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
+@@ -1606,6 +1737,7 @@ void TextureCache::_loadFast(u32 _tile, CachedTexture *_pTexture)
  
  void TextureCache::_loadAccurate(u32 _tile, CachedTexture *_pTexture)
  {
@@ -2051,7 +2461,7 @@ index abfdaa3..0a36dc8 100644
  	u64 ricecrc = 0;
  	u64 strongcrc = 0;
  	if (_loadHiresTexture(_tile, _pTexture, ricecrc, strongcrc))
-@@ -1736,7 +1819,10 @@ void TextureCache::_loadAccurate(u32 _tile, CachedTexture *_pTexture)
+@@ -1736,7 +1868,10 @@ void TextureCache::_loadAccurate(u32 _tile, CachedTexture *_pTexture)
  	else
  	{
  		getLoadParams(tmptex.format, tmptex.size);
@@ -2063,7 +2473,7 @@ index abfdaa3..0a36dc8 100644
  
  		if ((config.generalEmulation.hacks&hack_LoadDepthTextures) != 0 && gDP.colorImage.address == gDP.depthImageAddress) {
  			_loadDepthTexture(_pTexture, (u16*)m_tempTextureHolder.data());
-@@ -1835,6 +1921,9 @@ struct TextureParams
+@@ -1835,6 +1970,9 @@ struct TextureParams
  	u32 flags;
  };
  
@@ -2073,7 +2483,7 @@ index abfdaa3..0a36dc8 100644
  static
  u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
  {
-@@ -1853,13 +1942,69 @@ u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
+@@ -1853,13 +1991,69 @@ u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
  	if (!rgba32 && (tileTmemInBytes + _bytes > maxBytes))
  		_bytes = maxBytes - tileTmemInBytes;
  	u64 crc = UINT64_MAX;
@@ -2143,7 +2553,7 @@ index abfdaa3..0a36dc8 100644
  	if (gDP.otherMode.textureLUT != G_TT_NONE || gSP.textureTile[_t]->format == G_IM_FMT_CI) {
  		if (gSP.textureTile[_t]->size == G_IM_SIZ_4b)
  			crc = CRC_Calculate( crc, &gDP.paletteCRC16[gSP.textureTile[_t]->palette], sizeof(u64) );
-@@ -1871,6 +2016,7 @@ u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
+@@ -1871,6 +2065,7 @@ u64 _calculateCRC(u32 _t, const TextureParams & _params, u32 _bytes)
  		crc = CRC_Calculate(crc, &gSP.texture.level, 4);
  
  	crc = CRC_Calculate(crc, &_params, sizeof(_params));
@@ -2151,7 +2561,7 @@ index abfdaa3..0a36dc8 100644
  
  	return crc;
  }
-@@ -1960,6 +2106,14 @@ void TextureCache::activateMSDummy(u32 _t)
+@@ -1960,6 +2155,14 @@ void TextureCache::activateMSDummy(u32 _t)
  
  void TextureCache::_updateBackground()
  {
@@ -2166,7 +2576,7 @@ index abfdaa3..0a36dc8 100644
  	u32 numBytes = gSP.bgImage.width * gSP.bgImage.height << gSP.bgImage.size >> 1;
  	u64 crc;
  
-@@ -2063,6 +2217,7 @@ void TextureCache::toggleDumpTex()
+@@ -2063,6 +2266,7 @@ void TextureCache::toggleDumpTex()
  
  void TextureCache::update(u32 _t)
  {
@@ -2174,7 +2584,7 @@ index abfdaa3..0a36dc8 100644
  	const gDPTile * pTile = gSP.textureTile[_t];
  	switch (pTile->textureMode) {
  	case TEXTUREMODE_BGIMAGE:
-@@ -2110,7 +2265,11 @@ void TextureCache::update(u32 _t)
+@@ -2110,7 +2314,11 @@ void TextureCache::update(u32 _t)
  	params.width = sizes.width;
  	params.height = sizes.height;
  
@@ -2187,7 +2597,7 @@ index abfdaa3..0a36dc8 100644
  
  	if (current[_t] != nullptr && current[_t]->crc == crc) {
  		activateTexture(_t, current[_t]);
-@@ -2135,7 +2294,10 @@ void TextureCache::update(u32 _t)
+@@ -2135,7 +2343,10 @@ void TextureCache::update(u32 _t)
  
  		if (currentTex.bHDTexture)
  			m_hdTexCacheSize -= currentTex.textureBytes;
@@ -2752,7 +3162,7 @@ index adf9d4a..90928d8 100644
  		FrameBuffer_CopyToRDRAM(gDP.colorImage.address, config.frameBufferEmulation.copyToRDRAM == Config::ctSync);
  
 diff --git a/GLideN64/src/gSP.cpp b/GLideN64/src/gSP.cpp
-index d6662d9..d109f3e 100644
+index d6662d9..0206bfb 100644
 --- a/GLideN64/src/gSP.cpp
 +++ b/GLideN64/src/gSP.cpp
 @@ -1,3 +1,4 @@
@@ -3429,7 +3839,7 @@ index d6662d9..d109f3e 100644
  		}
  	}
  }
-@@ -2065,7 +2585,7 @@ void gSPSprite2DBase(u32 _base)
+@@ -2065,18 +2585,18 @@ void gSPSprite2DBase(u32 _base)
  	gSPTexture( 1.0f, 1.0f, 0, 0, TRUE );
  	gDP.otherMode.texturePersp = 1;
  
@@ -3438,6 +3848,20 @@ index d6662d9..d109f3e 100644
  	const f32 w = 1.0f;
  
  	f32 scaleX = 1.0f, scaleY = 1.0f;
+ 	u32 flipX = 0, flipY = 0;
+ 	do {
+-		u32 w0 = *(u32*)&RDRAM[RSP.PC[RSP.PCi]];
+-		u32 w1 = *(u32*)&RDRAM[RSP.PC[RSP.PCi] + 4];
++		u32 w0 = DL_WORD(RSP.PC[RSP.PCi]);
++		u32 w1 = DL_WORD(RSP.PC[RSP.PCi] + 4);
+ 		RSP.cmd = _SHIFTR( w0, 24, 8 );
+ 
+ 		RSP.PC[RSP.PCi] += 8;
+-		RSP.nextCmd = _SHIFTR( *(u32*)&RDRAM[RSP.PC[RSP.PCi]], 24, 8 );
++		RSP.nextCmd = _SHIFTR( DL_WORD(RSP.PC[RSP.PCi]), 24, 8 );
+ 
+ 		if ( RSP.cmd == 0xBE ) { // gSPSprite2DScaleFlip
+ 			scaleX  = _FIXED2FLOAT( _SHIFTR(w1, 16, 16), 10 );
 diff --git a/GLideN64/src/gSP.h b/GLideN64/src/gSP.h
 index 84e50b2..90165f3 100644
 --- a/GLideN64/src/gSP.h
@@ -3551,7 +3975,7 @@ index 3648c05..562c161 100644
  		_drawer.getCurrentDMAVertex() = vtx;
  	}
 diff --git a/GLideN64/src/uCodes/S2DEX.cpp b/GLideN64/src/uCodes/S2DEX.cpp
-index 013f13d..487a7b0 100644
+index 013f13d..cc6eeea 100644
 --- a/GLideN64/src/uCodes/S2DEX.cpp
 +++ b/GLideN64/src/uCodes/S2DEX.cpp
 @@ -455,7 +455,7 @@ struct ObjCoordinates
@@ -3572,7 +3996,78 @@ index 013f13d..487a7b0 100644
  		w = 1.0f;
  	}
  };
-@@ -774,7 +774,7 @@ void gSPObjSprite(u32 _sp)
+@@ -651,6 +651,70 @@ void gSPDrawObjRect(const ObjCoordinates & _coords)
+ 	drawer.drawScreenSpaceTriangle(4);
+ }
+ 
++#ifdef __3DS__
++/* ctr64: a scrolling background runs past the image's edge and goes on at the other side. The
++ * hardware only repeats power of two textures (Yoshi's Story's pictures are 336 wide), so the
++ * rectangle is cut where the picture wraps. As in the microcode, whose rows follow each other in
++ * memory, the part past the right edge starts one row lower. */
++static
++void gSPDrawBgRect(const ObjCoordinates & _c, bool _fbImage)
++{
++	const f32 W = f32(gSP.bgImage.width), H = f32(gSP.bgImage.height);
++	const f32 ds = _c.lrs - _c.uls, dt = _c.lrt - _c.ult;
++	if (_fbImage || W < 1.0f || H < 1.0f || ds <= 0.0f || dt <= 0.0f || ds > W || dt > H ||
++		_c.uls < 0.0f || _c.ult < 0.0f || (_c.lrs <= W && _c.lrt <= H)) {
++		gSPDrawObjRect(_c);
++		return;
++	}
++	GraphicsDrawer & drawer = dwnd().getDrawer();
++	drawer.setDMAVerticesSize(6 * 4);
++	SPVertex * pVtx = drawer.getDMAVerticesData();
++	u32 num = 0;
++	f32 s0 = _c.uls, t0 = _c.ult;
++	while (s0 >= W) {
++		s0 -= W;
++		t0 += 1.0f;
++	}
++	const f32 dx = (_c.lrx - _c.ulx) / ds, dy = (_c.lry - _c.uly) / dt;
++	f32 doneS = 0.0f;
++	while (ds - doneS > 0.001f) {
++		const f32 ns = std::min(ds - doneS, W - s0);
++		f32 t = t0;
++		while (t >= H)
++			t -= H;
++		f32 doneT = 0.0f;
++		while (dt - doneT > 0.001f) {
++			const f32 nt = std::min(dt - doneT, H - t);
++			const f32 x[2] = { _c.ulx + doneS * dx, _c.ulx + (doneS + ns) * dx };
++			const f32 y[2] = { _c.uly + doneT * dy, _c.uly + (doneT + nt) * dy };
++			static const u8 corner[6] = { 0, 1, 2, 2, 1, 3 };
++			for (u32 i = 0; i < 6 && num < 6 * 4; ++i) {
++				const u32 cx = corner[i] & 1, cy = corner[i] >> 1;
++				SPVertex & v = pVtx[num++];
++				v.x = x[cx];
++				v.y = y[cy];
++				v.z = _c.z;
++				v.w = _c.w;
++				v.s = cx ? s0 + ns : s0;
++				v.t = cy ? t + nt : t;
++			}
++			doneT += nt;
++			t = 0.0f;
++		}
++		doneS += ns;
++		s0 = 0.0f;
++		t0 += 1.0f;
++	}
++	drawer.drawScreenSpaceTriangle(num, graphics::drawmode::TRIANGLES);
++}
++#else
++static
++void gSPDrawBgRect(const ObjCoordinates & _c, bool)
++{
++	gSPDrawObjRect(_c);
++}
++#endif
++
+ static
+ void gSPSetSpriteTile(const uObjSprite *_pObjSprite)
+ {
+@@ -774,7 +838,7 @@ void gSPObjSprite(u32 _sp)
  	if (pObjSprite->imageFlags & G_BG_FLAG_FLIPT)
  		std::swap(ult, lrt);
  
@@ -3581,7 +4076,7 @@ index 013f13d..487a7b0 100644
  
  	GraphicsDrawer & drawer = dwnd().getDrawer();
  	drawer.setDMAVerticesSize(4);
-@@ -866,7 +866,7 @@ void _loadBGImage(const uObjScaleBg * _pBgInfo, bool _loadScale, bool _fbImage)
+@@ -866,7 +930,7 @@ void _loadBGImage(const uObjScaleBg * _pBgInfo, bool _loadScale, bool _fbImage)
  		gDP.tiles[0].frameBufferAddress = pBuffer->m_startAddress;
  		gDP.tiles[0].textureMode = TEXTUREMODE_FRAMEBUFFER_BG;
  		gDP.tiles[0].loadType = LOADTYPE_TILE;
@@ -3590,6 +4085,34 @@ index 013f13d..487a7b0 100644
  
  		if ((config.generalEmulation.hacks & hack_ZeldaMM) != 0) {
  			if (gDP.colorImage.address == gDP.depthImageAddress)
+@@ -922,11 +986,11 @@ void BgRect1CycOnePiece(u32 _bg, bool _fbImage)
+ 		gSP.bgImage.address == gDP.depthImageAddress)
+ 	{
+ 		drawer.setBgDepthCopyMode(GraphicsDrawer::BgDepthCopyMode::eBg1cyc);
+-		gSPDrawObjRect(objCoords);
++		gSPDrawBgRect(objCoords, _fbImage);
+ 		drawer.setBgDepthCopyMode(GraphicsDrawer::BgDepthCopyMode::eCopyDone);
+ 	}
+ 
+-	gSPDrawObjRect(objCoords);
++	gSPDrawBgRect(objCoords, _fbImage);
+ 	drawer.setBgDepthCopyMode(GraphicsDrawer::BgDepthCopyMode::eNone);
+ 	DebugMsg(DEBUG_NORMAL, "BgRect1CycOnePiece\n");
+ }
+@@ -950,11 +1014,11 @@ void BgRectCopyOnePiece(u32 _bg, bool _fbImage)
+ 		depthBufferList().findBuffer(gSP.bgImage.address) != nullptr)
+ 	{
+ 		drawer.setBgDepthCopyMode(GraphicsDrawer::BgDepthCopyMode::eBgCopy);
+-		gSPDrawObjRect(objCoords);
++		gSPDrawBgRect(objCoords, _fbImage);
+ 		drawer.setBgDepthCopyMode(GraphicsDrawer::BgDepthCopyMode::eCopyDone);
+ 	}
+ 
+-	gSPDrawObjRect(objCoords);
++	gSPDrawBgRect(objCoords, _fbImage);
+ 	drawer.setBgDepthCopyMode(GraphicsDrawer::BgDepthCopyMode::eNone);
+ 	DebugMsg(DEBUG_NORMAL, "BgRectCopyOnePiece\n");
+ }
 diff --git a/custom/GLideN64/GLideN64.custom.ini.h b/custom/GLideN64/GLideN64.custom.ini.h
 index bc377cf..1d16d1e 100644
 --- a/custom/GLideN64/GLideN64.custom.ini.h
@@ -3621,7 +4144,7 @@ index 8e3d81e..5631e74 100644
  
  #ifdef ANDROID
 diff --git a/custom/GLideN64/mupenplus/Config_mupenplus.cpp b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
-index fb51f34..5f4ecf6 100644
+index fb51f34..a4c929a 100644
 --- a/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 +++ b/custom/GLideN64/mupenplus/Config_mupenplus.cpp
 @@ -11,6 +11,8 @@
@@ -3675,7 +4198,7 @@ index fb51f34..5f4ecf6 100644
  
  	config.generalEmulation.hacks = hacks;
  
-@@ -230,5 +252,108 @@ extern "C" void Config_LoadConfig()
+@@ -230,5 +252,102 @@ extern "C" void Config_LoadConfig()
  		LoadCustomSettings(false);
  	}
  
@@ -3701,9 +4224,7 @@ index fb51f34..5f4ecf6 100644
 +	 *   delay) could finish inside that gap, when other threads ran first: the mark then stayed
 +	 *   set with nothing running, the next audio task asked a yield of an idle RSP and the game
 +	 *   waited forever (HW freezes after 1-15 minutes of racing, 2026-11-20). A real RSP takes
-+	 *   milliseconds per frame: report display lists done 50000 counts (~1 ms) on.
-+	 * - Star Fox 64: no anti-aliasing: with 2x frame buffers its copies to RDRAM brought back
-+	 *   4-pixel garbage strips at the picture's edges (HW only; none without AA, 2026-11-20). */
++	 *   milliseconds per frame: report display lists done 50000 counts (~1 ms) on. */
 +	bool ctr64_no_aa = false;
 +	{
 +		extern unsigned ctr64_copy_every;
@@ -3725,10 +4246,6 @@ index fb51f34..5f4ecf6 100644
 +					ctr64_copy_every = 4;
 +				}
 +			}
-+			if (strstr(RSP.romname, "YOSHI STORY") != nullptr)
-+				config.graphics2D.bgMode = Config::BGMode::bgStripped;
-+			if (strncmp(RSP.romname, "STARFOX64", 9) == 0)
-+				ctr64_no_aa = true;
 +			if (strncmp(RSP.romname, "HYDRO THUNDER", 13) == 0)
 +				ctr64_gfx_sp_delay = 50000;
 +		}
@@ -4994,7 +5511,7 @@ index adcae2d..4488d21 100644
      bl     dynamic_linker
      mov    pc, r0
 diff --git a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
-index 1e8f261..0fc0764 100644
+index 1e8f261..1f6548c 100644
 --- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
 +++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
 @@ -55,7 +55,10 @@
@@ -7936,7 +8453,28 @@ index 1e8f261..0fc0764 100644
  int new_recompile_block(int addr)
  {
  #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
-@@ -8925,6 +10910,7 @@ int new_recompile_block(int addr)
+@@ -8903,8 +10888,20 @@ int new_recompile_block(int addr)
+   }
+   else {
+     //DebugMessage(M64MSG_VERBOSE, "Compile at bogus memory address: %x ", (int)addr);
++#if defined(__3DS__)
++    /* ctr64: the game jumped into nowhere (it crashed). It gets the exception, as on the N64 where
++     * its own handler stops the thread; ending the program here took the console down with it
++     * (kernel crash, HW 2026-11-22 Star Fox 64, TTYD64 bush). */
++    static int told;
++    if (told < 8) {
++      told++;
++      DebugMessage(M64MSG_ERROR, "Compile at bogus memory address: %x", (int)addr);
++    }
++    return 1;
++#else
+     DebugMessage(M64MSG_ERROR, "Compile at bogus memory address: %x", (int)addr);
+     exit(1);
++#endif
+   }
+ 
+   /* Pass 1: disassemble */
+@@ -8925,6 +10922,7 @@ int new_recompile_block(int addr)
    //DebugMessage(M64MSG_VERBOSE, "addr = %x source = %x %x", addr,source,source[0]);
  
    /* Pass 1 disassembly */
@@ -7944,7 +8482,7 @@ index 1e8f261..0fc0764 100644
  
    for(i=0;!done;i++) {
      bt[i]=0;likely[i]=0;ooo[i]=0;op2=0;
-@@ -9429,7 +11415,7 @@ int new_recompile_block(int addr)
+@@ -9429,7 +11427,7 @@ int new_recompile_block(int addr)
          // Stop if we're compiling junk
          if(type==UJUMP||type==CJUMP||type==SJUMP||type==RJUMP||type==FJUMP)
          {
@@ -7953,7 +8491,7 @@ index 1e8f261..0fc0764 100644
            itype[i]=NOP;
            DebugMessage(M64MSG_VERBOSE, "Disabled speculative precompilation");
          }
-@@ -9440,7 +11426,15 @@ int new_recompile_block(int addr)
+@@ -9440,7 +11438,15 @@ int new_recompile_block(int addr)
          if((source[i+1]&0xfc00003f)==0x0d) done=1;
        }
        // Don't recompile stuff that's already compiled
@@ -7969,7 +8507,7 @@ index 1e8f261..0fc0764 100644
        // Don't get too close to the limit
        if(i>MAXBLOCK/2) done=1;
      }
-@@ -9451,11 +11445,19 @@ int new_recompile_block(int addr)
+@@ -9451,11 +11457,19 @@ int new_recompile_block(int addr)
      if (i==MAXBLOCK-1) done=1;
      // Stop if we're compiling junk
      if(itype[i]==NI&&opcode[i]==0x11) {
@@ -7990,7 +8528,7 @@ index 1e8f261..0fc0764 100644
    if(itype[i-1]==UJUMP||itype[i-1]==CJUMP||itype[i-1]==SJUMP||itype[i-1]==RJUMP||itype[i-1]==FJUMP) {
      if(start+i*4==pagelimit) {
        itype[i-1]=SPAN;
-@@ -9464,10 +11466,12 @@ int new_recompile_block(int addr)
+@@ -9464,10 +11478,12 @@ int new_recompile_block(int addr)
    assert(slen>0);
  
    /* Pass 2 - Register dependencies and branch targets */
@@ -8003,7 +8541,7 @@ index 1e8f261..0fc0764 100644
  
    struct regstat current; // Current register allocations/status
    current.is32=1;
-@@ -9828,7 +11832,11 @@ int new_recompile_block(int addr)
+@@ -9828,7 +11844,11 @@ int new_recompile_block(int addr)
                  if(rs2[i]) alloc_reg64(&current,i,rs2[i]);
                }
              }
@@ -8016,7 +8554,7 @@ index 1e8f261..0fc0764 100644
              {
                ooo[i]=1;
                delayslot_alloc(&current,i+1);
-@@ -10051,7 +12059,11 @@ int new_recompile_block(int addr)
+@@ -10051,7 +12071,11 @@ int new_recompile_block(int addr)
        }
  
        // Make sure the allocator didn't do anything bad
@@ -8028,7 +8566,7 @@ index 1e8f261..0fc0764 100644
        {
          int r;
          r=current.regmap[hr];
-@@ -10063,7 +12075,7 @@ int new_recompile_block(int addr)
+@@ -10063,7 +12087,7 @@ int new_recompile_block(int addr)
                {
                  //FIXME: delayslot_alloc realloc registers removed from cache by jump instruction, thus the missing dirty flag
                  assert(itype[i]==CJUMP);
@@ -8037,7 +8575,7 @@ index 1e8f261..0fc0764 100644
                }
                //assert (((current.dirty>>hr)&1)!=0);
              }
-@@ -10086,7 +12098,21 @@ int new_recompile_block(int addr)
+@@ -10086,7 +12110,21 @@ int new_recompile_block(int addr)
        }
  
        // Create entry (branch target) regmap
@@ -8059,7 +8597,7 @@ index 1e8f261..0fc0764 100644
        {
          int r,or;
          r=current.regmap[hr];
-@@ -10445,6 +12471,10 @@ int new_recompile_block(int addr)
+@@ -10445,6 +12483,10 @@ int new_recompile_block(int addr)
        regs[i].isconst=current.isconst;
        memcpy(constmap[i],current.constmap,sizeof(current.constmap));
      }
@@ -8070,7 +8608,7 @@ index 1e8f261..0fc0764 100644
      for(hr=0;hr<HOST_REGS;hr++) {
        if(hr!=EXCLUDE_REG&&regs[i].regmap[hr]>=0) {
          if(regmap_pre[i][hr]!=regs[i].regmap[hr]) {
-@@ -10452,12 +12482,14 @@ int new_recompile_block(int addr)
+@@ -10452,12 +12494,14 @@ int new_recompile_block(int addr)
          }
        }
      }
@@ -8086,7 +8624,7 @@ index 1e8f261..0fc0764 100644
  
    for (i=slen-1;i>=0;i--)
    {
-@@ -10467,18 +12499,18 @@ int new_recompile_block(int addr)
+@@ -10467,18 +12511,18 @@ int new_recompile_block(int addr)
        if(ba[i]<start || ba[i]>=(start+slen*4))
        {
          // Branch out of this block, don't need anything
@@ -8108,7 +8646,7 @@ index 1e8f261..0fc0764 100644
            }
          }
        }
-@@ -10487,95 +12519,149 @@ int new_recompile_block(int addr)
+@@ -10487,95 +12531,149 @@ int new_recompile_block(int addr)
        {
          if(i<slen-2) {
            nr|=needed_reg[i+2];
@@ -8301,7 +8839,7 @@ index 1e8f261..0fc0764 100644
        }
        // Don't store a register immediately after writing it,
        // may prevent dual-issue.
-@@ -10584,25 +12670,87 @@ int new_recompile_block(int addr)
+@@ -10584,25 +12682,87 @@ int new_recompile_block(int addr)
        if(i>0&&!bt[i]&&((regs[i].wasdirty>>hr)&1)) {
          if((regmap_pre[i][hr]>0&&regmap_pre[i][hr]<64&&!((unneeded_reg[i]>>regmap_pre[i][hr])&1)) ||
             (regmap_pre[i][hr]>64&&!((unneeded_reg_upper[i]>>(regmap_pre[i][hr]&63))&1)) ) {
@@ -8395,7 +8933,7 @@ index 1e8f261..0fc0764 100644
      for(hr=0;hr<HOST_REGS;hr++)
      {
        if(!((nr>>hr)&1)) {
-@@ -10685,7 +12833,8 @@ int new_recompile_block(int addr)
+@@ -10685,7 +12845,8 @@ int new_recompile_block(int addr)
            if(i>0)
            {
              int d1=0,d2=0,map=-1,temp=-1;
@@ -8405,7 +8943,7 @@ index 1e8f261..0fc0764 100644
              {
                d1=dep1[i];
                d2=dep2[i];
-@@ -10730,6 +12879,13 @@ int new_recompile_block(int addr)
+@@ -10730,6 +12891,13 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 5 - Pre-allocate registers */
@@ -8419,7 +8957,7 @@ index 1e8f261..0fc0764 100644
  
    // If a register is allocated during a loop, try to allocate it for the
    // entire loop, if possible.  This avoids loading/storing registers
-@@ -10762,10 +12918,15 @@ int new_recompile_block(int addr)
+@@ -10762,10 +12930,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -8435,7 +8973,7 @@ index 1e8f261..0fc0764 100644
                // and alloc new one
                f_regmap[hr]=regs[i].regmap[hr];
              }
-@@ -10779,10 +12940,15 @@ int new_recompile_block(int addr)
+@@ -10779,10 +12952,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=branch_regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -8451,7 +8989,7 @@ index 1e8f261..0fc0764 100644
                // and alloc new one
                f_regmap[hr]=branch_regs[i].regmap[hr];
              }
-@@ -10872,10 +13038,10 @@ int new_recompile_block(int addr)
+@@ -10872,10 +13050,10 @@ int new_recompile_block(int addr)
                          regs[k].regmap_entry[hr]=f_regmap[hr];
                          regs[k].regmap[hr]=f_regmap[hr];
                          regmap_pre[k+1][hr]=f_regmap[hr];
@@ -8466,7 +9004,7 @@ index 1e8f261..0fc0764 100644
                          regs[k].wasconst&=~(1LL<<hr);
                          regs[k].isconst&=~(1LL<<hr);
                          k++;
-@@ -10890,24 +13056,24 @@ int new_recompile_block(int addr)
+@@ -10890,24 +13068,24 @@ int new_recompile_block(int addr)
                        //DebugMessage(M64MSG_VERBOSE, "OK fill %x (r%d)",start+i*4,hr);
                        regs[i].regmap_entry[hr]=f_regmap[hr];
                        regs[i].regmap[hr]=f_regmap[hr];
@@ -8501,7 +9039,7 @@ index 1e8f261..0fc0764 100644
                          assert((branch_regs[i].is32&(1LL<<(f_regmap[hr]&63)))==
                            (regs[i+2].was32&(1LL<<(f_regmap[hr]&63))));
                        }
-@@ -10918,18 +13084,18 @@ int new_recompile_block(int addr)
+@@ -10918,18 +13096,18 @@ int new_recompile_block(int addr)
                      // but may dirty it in pass 6
                      regs[k].regmap_entry[hr]=f_regmap[hr];
                      regs[k].regmap[hr]=f_regmap[hr];
@@ -8523,7 +9061,7 @@ index 1e8f261..0fc0764 100644
                          assert((branch_regs[k].is32&(1LL<<(f_regmap[hr]&63)))==
                            (regs[k+2].was32&(1LL<<(f_regmap[hr]&63))));//DebugMessage(M64MSG_VERBOSE, "Extend CC, %x -> %x",start+k*4,start+j*4);
                        }
-@@ -10937,7 +13103,7 @@ int new_recompile_block(int addr)
+@@ -10937,7 +13115,7 @@ int new_recompile_block(int addr)
                      else
                      {
                        regmap_pre[k+1][hr]=f_regmap[hr];
@@ -8532,7 +9070,7 @@ index 1e8f261..0fc0764 100644
                      }
                    }
                    if(regs[j].regmap[hr]==f_regmap[hr])
-@@ -10998,7 +13164,11 @@ int new_recompile_block(int addr)
+@@ -10998,7 +13176,11 @@ int new_recompile_block(int addr)
        }
      }else{
        // Non branch or undetermined branch target
@@ -8544,7 +9082,7 @@ index 1e8f261..0fc0764 100644
        {
          if(hr!=EXCLUDE_REG) {
            if(regs[i].regmap[hr]>64) {
-@@ -11009,10 +13179,15 @@ int new_recompile_block(int addr)
+@@ -11009,10 +13191,15 @@ int new_recompile_block(int addr)
              if(f_regmap[hr]!=regs[i].regmap[hr]) {
                // dealloc old register
                int n;
@@ -8560,7 +9098,7 @@ index 1e8f261..0fc0764 100644
                // and alloc new one
                f_regmap[hr]=regs[i].regmap[hr];
              }
-@@ -11035,8 +13210,8 @@ int new_recompile_block(int addr)
+@@ -11035,8 +13222,8 @@ int new_recompile_block(int addr)
              regs[k].regmap_entry[HOST_CCREG]=CCREG;
              regs[k].regmap[HOST_CCREG]=CCREG;
              regmap_pre[k+1][HOST_CCREG]=CCREG;
@@ -8571,7 +9109,7 @@ index 1e8f261..0fc0764 100644
              regs[k].wasconst&=~(1<<HOST_CCREG);
              regs[k].isconst&=~(1<<HOST_CCREG);
              k++;
-@@ -11062,8 +13237,8 @@ int new_recompile_block(int addr)
+@@ -11062,8 +13249,8 @@ int new_recompile_block(int addr)
                regs[k].regmap_entry[HOST_CCREG]=CCREG;
                regs[k].regmap[HOST_CCREG]=CCREG;
                regmap_pre[k+1][HOST_CCREG]=CCREG;
@@ -8582,7 +9120,7 @@ index 1e8f261..0fc0764 100644
                regs[k].wasconst&=~(1<<HOST_CCREG);
                regs[k].isconst&=~(1<<HOST_CCREG);
                k++;
-@@ -11084,6 +13259,10 @@ int new_recompile_block(int addr)
+@@ -11084,6 +13271,10 @@ int new_recompile_block(int addr)
      }
    }
  
@@ -8593,7 +9131,7 @@ index 1e8f261..0fc0764 100644
    // Cache memory offset or tlb map pointer if a register is available
    #ifndef HOST_IMM_ADDR32
    #ifndef RAM_OFFSET
-@@ -11224,18 +13403,18 @@ int new_recompile_block(int addr)
+@@ -11224,18 +13415,18 @@ int new_recompile_block(int addr)
              assert(regs[j].regmap[maxscore]<0);
              if(j>loop_start[maxscore]) regs[j].regmap_entry[maxscore]=reg;
              regs[j].regmap[maxscore]=reg;
@@ -8616,7 +9154,7 @@ index 1e8f261..0fc0764 100644
                }
                // loop optimization (loop_preload)
                int t=(ba[j]-start)>>2;
-@@ -11248,7 +13427,7 @@ int new_recompile_block(int addr)
+@@ -11248,7 +13439,7 @@ int new_recompile_block(int addr)
              {
                if(j<1||(itype[j-1]!=RJUMP&&itype[j-1]!=UJUMP&&itype[j-1]!=CJUMP&&itype[j-1]!=SJUMP&&itype[j-1]!=FJUMP)) {
                  regmap_pre[j+1][maxscore]=reg;
@@ -8625,7 +9163,7 @@ index 1e8f261..0fc0764 100644
                }
              }
            }
-@@ -11264,6 +13443,10 @@ int new_recompile_block(int addr)
+@@ -11264,6 +13455,10 @@ int new_recompile_block(int addr)
    }
    #endif
  
@@ -8636,7 +9174,7 @@ index 1e8f261..0fc0764 100644
    // This allocates registers (if possible) one instruction prior
    // to use, which can avoid a load-use penalty on certain CPUs.
    for(i=0;i<slen-1;i++)
-@@ -11288,8 +13471,8 @@ int new_recompile_block(int addr)
+@@ -11288,8 +13483,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -8647,7 +9185,7 @@ index 1e8f261..0fc0764 100644
                  free_regs--;
                }
              }
-@@ -11305,8 +13488,8 @@ int new_recompile_block(int addr)
+@@ -11305,8 +13500,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -8658,7 +9196,7 @@ index 1e8f261..0fc0764 100644
                  free_regs--;
                }
              }
-@@ -11323,8 +13506,8 @@ int new_recompile_block(int addr)
+@@ -11323,8 +13518,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -8669,7 +9207,7 @@ index 1e8f261..0fc0764 100644
                  free_regs--;
                }
              }
-@@ -11345,8 +13528,8 @@ int new_recompile_block(int addr)
+@@ -11345,8 +13540,8 @@ int new_recompile_block(int addr)
                    regs[i].isconst&=~(1<<hr);
                    regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                    constmap[i][hr]=constmap[i+1][hr];
@@ -8680,7 +9218,7 @@ index 1e8f261..0fc0764 100644
                    free_regs--;
                  }
                  else if((nr=get_reg2(regs[i].regmap,regs[i+1].regmap,-1))>=0&&free_regs>0)
-@@ -11361,10 +13544,10 @@ int new_recompile_block(int addr)
+@@ -11361,10 +13556,10 @@ int new_recompile_block(int addr)
                    regs[i+1].regmap_entry[nr]=MGEN1+((i+1)&1);
                    regs[i].isconst&=~(1<<nr);
                    regs[i+1].isconst&=~(1<<nr);
@@ -8695,7 +9233,7 @@ index 1e8f261..0fc0764 100644
                    free_regs--;
                  }
                }
-@@ -11386,8 +13569,8 @@ int new_recompile_block(int addr)
+@@ -11386,8 +13581,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -8706,7 +9244,7 @@ index 1e8f261..0fc0764 100644
                  free_regs--;
                }
              }
-@@ -11405,8 +13588,8 @@ int new_recompile_block(int addr)
+@@ -11405,8 +13600,8 @@ int new_recompile_block(int addr)
                  regs[i].isconst&=~(1<<hr);
                  regs[i].isconst|=regs[i+1].isconst&(1<<hr);
                  constmap[i][hr]=constmap[i+1][hr];
@@ -8717,7 +9255,7 @@ index 1e8f261..0fc0764 100644
                  free_regs--;
                }
                else if((nr=get_reg2(regs[i].regmap,regs[i+1].regmap,-1))>=0&&free_regs>0)
-@@ -11421,10 +13604,10 @@ int new_recompile_block(int addr)
+@@ -11421,10 +13616,10 @@ int new_recompile_block(int addr)
                  regs[i+1].regmap_entry[nr]=rs1[i+1];
                  regs[i].isconst&=~(1<<nr);
                  regs[i+1].isconst&=~(1<<nr);
@@ -8732,7 +9270,7 @@ index 1e8f261..0fc0764 100644
                  free_regs--;
                }
              }
-@@ -11443,8 +13626,8 @@ int new_recompile_block(int addr)
+@@ -11443,8 +13638,8 @@ int new_recompile_block(int addr)
                  regmap_pre[i+1][hr]=AGEN1+((i+1)&1);
                  regs[i+1].regmap_entry[hr]=AGEN1+((i+1)&1);
                  regs[i].isconst&=~(1<<hr);
@@ -8743,7 +9281,7 @@ index 1e8f261..0fc0764 100644
                }
              }
            }
-@@ -11453,10 +13636,18 @@ int new_recompile_block(int addr)
+@@ -11453,10 +13648,18 @@ int new_recompile_block(int addr)
      }
    }
  
@@ -8762,7 +9300,7 @@ index 1e8f261..0fc0764 100644
  
    provisional_r32();
  
-@@ -11560,7 +13751,11 @@ int new_recompile_block(int addr)
+@@ -11560,7 +13763,11 @@ int new_recompile_block(int addr)
  
      // Dirty registers which are 32-bit, require 32-bit input
      // as they will be written as 32-bit values
@@ -8774,7 +9312,7 @@ index 1e8f261..0fc0764 100644
      {
        if(regs[i].regmap_entry[hr]>0&&regs[i].regmap_entry[hr]<64) {
          if((regs[i].was32>>regs[i].regmap_entry[hr])&(regs[i].wasdirty>>hr)&1) {
-@@ -11577,6 +13772,7 @@ int new_recompile_block(int addr)
+@@ -11577,6 +13784,7 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 8 - Assembly */
@@ -8782,7 +9320,7 @@ index 1e8f261..0fc0764 100644
    linkcount=0;stubcount=0;
    ds=0;is_delayslot=0;
    cop1_usable=0;
-@@ -11800,6 +13996,7 @@ int new_recompile_block(int addr)
+@@ -11800,6 +14008,7 @@ int new_recompile_block(int addr)
    }
  
    /* Pass 9 - Linker */
@@ -8790,7 +9328,7 @@ index 1e8f261..0fc0764 100644
    for(i=0;i<linkcount;i++)
    {
      assem_debug("%8x -> %8x",link_addr[i][0],link_addr[i][1]);
-@@ -11867,12 +14064,17 @@ int new_recompile_block(int addr)
+@@ -11867,12 +14076,17 @@ int new_recompile_block(int addr)
            // Don't add new entries.  We'll insert the
            // ones that actually get used in check_addr().
            struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
@@ -8808,7 +9346,7 @@ index 1e8f261..0fc0764 100644
          }
          else
          {
-@@ -11922,19 +14124,45 @@ int new_recompile_block(int addr)
+@@ -11922,19 +14136,45 @@ int new_recompile_block(int addr)
    for(i=start>>12;i<=(int)((start+slen*4-4)>>12);i++) {
      g_dev.r4300.cached_interp.invalid_code[i]=0;
      g_dev.r4300.new_dynarec_hot_state.memory_map[i]|=WRITE_PROTECT;
@@ -8854,7 +9392,7 @@ index 1e8f261..0fc0764 100644
    while(expirep!=end)
    {
      int shift=TARGET_SIZE_2-3; // Divide into 8 blocks
-@@ -11983,5 +14211,7 @@ int new_recompile_block(int addr)
+@@ -11983,5 +14223,7 @@ int new_recompile_block(int addr)
      }
      expirep=(expirep+1)&65535;
    }
@@ -9044,6 +9582,23 @@ index 05ecdd7..e5714cc 100644
      mi->regs[MI_INTR_REG] |= mi_intr;
      r4300_check_interrupt(mi->r4300, CP0_CAUSE_IP2, mi->regs[MI_INTR_REG] & mi->regs[MI_INTR_MASK_REG]);
  }
+diff --git a/mupen64plus-core/src/device/rcp/pi/pi_controller.c b/mupen64plus-core/src/device/rcp/pi/pi_controller.c
+index 6b8918d..482bbf0 100644
+--- a/mupen64plus-core/src/device/rcp/pi/pi_controller.c
++++ b/mupen64plus-core/src/device/rcp/pi/pi_controller.c
+@@ -111,6 +111,12 @@ static void dma_pi_write(struct pi_controller* pi)
+         length += 1;
+     if (length <= 0x80)
+         length = length >= (dram_addr & 0x7) ? length - (dram_addr & 0x7) : 0;
++#if defined(__3DS__)
++    /* ctr64: a display list still on the video thread may yet clear the frame buffer the data goes
++     * to; Star Fox 64 loads compressed data into its frame buffers right after drawing */
++    extern void ctr64_gfx_before_dma(unsigned start, unsigned len);
++    ctr64_gfx_before_dma(dram_addr, length);
++#endif
+     unsigned int cycles = handler->dma_write(opaque, dram, dram_addr, cart_addr, length);
+ 
+     post_framebuffer_write(&pi->dp->fb, dram_addr, length);
 diff --git a/mupen64plus-core/src/device/rcp/rdp/rdp_core.c b/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
 index 3063aa1..f4f99a4 100644
 --- a/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
@@ -9127,7 +9682,7 @@ index 3063aa1..f4f99a4 100644
  }
  
 diff --git a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
-index 99767bc..d918f18 100644
+index 99767bc..91940d7 100644
 --- a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 +++ b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
 @@ -21,7 +21,9 @@
@@ -9400,7 +9955,7 @@ index 99767bc..d918f18 100644
  
      uint32_t sp_delay_time;
  
-@@ -345,6 +567,30 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -345,6 +567,35 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
          new_frame();
  
@@ -9421,17 +9976,22 @@ index 99767bc..d918f18 100644
 +                }
 +            }
 +            ctr64_gfx_pending++;
-+            ctr64_gfx_dp_checks++;
 +            cp0_update_count(sp->mi->r4300);
 +            ctr64_gfx_start_count = r4300_cp0_regs(&sp->mi->r4300->cp0)[CP0_COUNT_REG];
-+            add_interrupt_event(&sp->mi->r4300->cp0, DP_INT, ctr64_gfx_dlist_step());
++            /* the check of a list completed just above is still queued and goes on with this one:
++             * with one more each time, a game sending lists in quick succession filled the event
++             * queue, and the SP interrupt lost then hung it (Kirby 64 from a state, 2026-11-22) */
++            if (ctr64_gfx_dp_checks < ctr64_gfx_pending) {
++                ctr64_gfx_dp_checks++;
++                add_interrupt_event(&sp->mi->r4300->cp0, DP_INT, ctr64_gfx_dlist_step());
++            }
 +        }
 +        else
 +#endif
          if (sp->mi->regs[MI_INTR_REG] & MI_INTR_DP)
          {
              sp->mi->regs[MI_INTR_REG] &= ~MI_INTR_DP;
-@@ -355,12 +601,30 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -355,12 +606,30 @@ void do_SP_Task(struct rsp_core* sp)
                  add_interrupt_event(&sp->mi->r4300->cp0, DP_INT, 4000);
              }
          }
@@ -9462,7 +10022,7 @@ index 99767bc..d918f18 100644
          //audio.processAList();
          sp->regs2[SP_PC_REG] &= 0xfff;
  #if defined(PROFILE)
-@@ -373,6 +637,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -373,6 +642,9 @@ void do_SP_Task(struct rsp_core* sp)
          sp->regs2[SP_PC_REG] |= save_pc;
  
          sp_delay_time = 4000;
@@ -9472,7 +10032,7 @@ index 99767bc..d918f18 100644
      }
      else
      {
-@@ -382,6 +649,9 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -382,6 +654,9 @@ void do_SP_Task(struct rsp_core* sp)
  
          sp_delay_time = 0;
      }
@@ -9482,7 +10042,7 @@ index 99767bc..d918f18 100644
  
      sp->rsp_task_locked = 0;
      sp->mi->r4300->cp0.interrupt_unsafe_state &= ~INTR_UNSAFE_RSP;
-@@ -391,6 +661,32 @@ void do_SP_Task(struct rsp_core* sp)
+@@ -391,6 +666,32 @@ void do_SP_Task(struct rsp_core* sp)
          sp->mi->r4300->cp0.interrupt_unsafe_state |= INTR_UNSAFE_RSP;
          sp->mi->regs[MI_INTR_REG] |= MI_INTR_SP;
      }
@@ -9515,7 +10075,7 @@ index 99767bc..d918f18 100644
      if (sp->mi->regs[MI_INTR_REG] & MI_INTR_SP)
      {
          cp0_update_count(sp->mi->r4300);
-@@ -406,6 +702,39 @@ void rsp_interrupt_event(void* opaque)
+@@ -406,6 +707,39 @@ void rsp_interrupt_event(void* opaque)
  {
      struct rsp_core* sp = (struct rsp_core*)opaque;
  

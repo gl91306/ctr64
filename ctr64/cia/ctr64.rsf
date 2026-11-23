@@ -1,5 +1,5 @@
-# makerom spec for the ctr64 CIA (scripts/build-3ds-cia.sh). New 3DS: 178 MB app memory (main heap capped at 96 MB, main.c), 804 MHz +
-# L2 cache. Old 3DS: 96 MB. The dynarec needs svcControlProcessMemory (0x70) and the I-cache SVC (0x93).
+# makerom spec for the ctr64 CIA (scripts/build-3ds-cia.sh). New 3DS: 124 MB app memory, 804 MHz +
+# L2 cache. Old 3DS: 80 MB. The dynarec needs svcControlProcessMemory (0x70) and the I-cache SVC (0x93).
 
 BasicInfo:
   Title                   : ctr64
@@ -34,8 +34,9 @@ AccessControlInfo:
   # memory: it crashes (data abort in "menu") before ctr64 starts. 64 MB cannot hold
   # code + JIT cache + ROM pages.
   SystemMode              : 80MB
-  # New 3DS: 178 MB, so 64 MB ROMs (Conker) load whole instead of streaming pages from SD
-  SystemModeExt           : 178MB
+  # New 3DS: 124 MB, its normal mode: the 178 MB one (0.9.2) restarts the system when ctr64 opens and
+  # closes, and some New 3DS stayed on a black screen. 64 MB ROMs (Conker) are read from SD as they run.
+  SystemModeExt           : 124MB
   CpuSpeed                : 804MHz
   EnableL2Cache           : true
   IdealProcessor          : 0

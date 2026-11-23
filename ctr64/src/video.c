@@ -39,8 +39,10 @@ bool video_init(void)
             fclose(gt);
         }
     }
+    extern void ctr64_time_mark(const char *what); /* main.c */
     if (!pica_init())
         return false;
+    ctr64_time_mark("GPU queue ready");
     /* The top screen image is drawn once per frame: in FCRAM, so its 375 KB of VRAM bank B
      * holds part of a frame buffer instead (MK64 menus with anti-aliasing: three 2x color
      * buffers + depth + the 2D buffer fit only without it, else 1.25 MB moved per frame). */
@@ -53,6 +55,7 @@ bool video_init(void)
     V.u_proj = shaderInstanceGetUniformLocation(V.prog.vertexShader, "projection");
     pica_mtx_ortho_tilt(V.proj_screen, 0, 400, 240, 0, 0.0f, 1.0f);
     pica_fill_selftest();
+    ctr64_time_mark("GPU fill test done");
     video_npot_selftest();
     return true;
 }
@@ -287,4 +290,9 @@ void video_draw_fullscreen(const void *tex, u16 tw, u16 th, GPU_TEXCOLOR fmt, u1
 void video_present(void)
 {
     pica_frame_end(&V.screen, GFX_TOP);
+}
+
+void video_present_target(const PicaTarget *t)
+{
+    pica_frame_end(t, GFX_TOP);
 }

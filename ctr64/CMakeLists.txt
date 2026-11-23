@@ -29,6 +29,7 @@ add_executable(ctr64
   src/gpu_test.c
   src/rom_browser.c
   src/boxart.c
+  src/jpg.c
   src/rom_title.c
   src/rom_stream.c
   src/ui/ui.c
@@ -58,7 +59,8 @@ endif()
 # The core uses int-sized enums (see core.cmake); libctru's structs shared with ctr64 code
 # do not depend on enum storage size, so the mixed-enum-size link is intentional.
 target_link_options(ctr64 PRIVATE -Wl,--no-enum-size-warning -Wl,--wrap=abort -Wl,--wrap=__system_allocateHeaps -Wl,--wrap=_sbrk_r
-  -Wl,--wrap=fopen) # devfiles.c: missing files in the data folder answered without the SD card
+  -Wl,--wrap=fopen # devfiles.c: missing files in the data folder answered without the SD card
+  -Wl,--wrap=exit)  # crash.c: ctr64's threads end before the process does
 # development: bytes copied by memcpy per caller (src/memcpy_prof.c, sdmc:/3ds/ctr64/memcpy.log)
 option(CTR64_MEMCPY_PROF "count memcpy bytes per caller" OFF)
 if(CTR64_MEMCPY_PROF)
@@ -69,6 +71,10 @@ endif()
 # development: remote test mode (src/remote.c: with remote.txt on the SD card the PC sends files,
 # installs builds and starts test runs over Wi-Fi on port 5050). Never in a release build.
 option(CTR64_REMOTE "remote test mode (development builds only)" OFF)
+option(CTR64_STARTLOG "test build: each step of starting to sdmc:/ctr64_start.txt and the bottom screen" OFF)
+if(CTR64_STARTLOG)
+  target_compile_definitions(ctr64 PRIVATE CTR64_STARTLOG=1)
+endif()
 if(CTR64_REMOTE)
   target_sources(ctr64 PRIVATE src/remote.c)
   target_compile_definitions(ctr64 PRIVATE CTR64_REMOTE=1)
@@ -76,7 +82,7 @@ endif()
 
 # Release version: here, in the CIA's title version (makerom -ver, scripts/build-3ds.ps1) and
 # shown on the game list and in core.log.
-set(CTR64_VERSION "0.9.2")
+set(CTR64_VERSION "0.9.3-dev")
 target_compile_definitions(ctr64 PRIVATE CTR64_VERSION="${CTR64_VERSION}")
 
 ctr_generate_smdh(ctr64.smdh

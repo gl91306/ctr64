@@ -38,6 +38,8 @@ void pica_target_destroy(PicaTarget *t);
 
 bool pica_init(void);
 void pica_exit(void);
+/* the N64 VI's gamma on the top screen (the LCD's colour lookup table) */
+void pica_lcd_gamma(bool on);
 /* Blocks until the GPU has finished everything queued (e.g. before freeing GPU memory). */
 void pica_wait_idle(void);
 
@@ -77,7 +79,7 @@ void pica_cache_invalidate(const void *p, u32 size);
 void pica_untile_rgba8(const void *src, u16 width, u16 rows, void *dst);
 /* Queued untile without waiting; then pica_fence() names it: pica_wait_fence(f) +
  * pica_cache_invalidate(dst, ...) before reading dst */
-void pica_untile_rgba8_async(const void *src, u16 width, u16 rows, void *dst);
+void pica_untile_async(const void *src, u16 width, u16 rows, void *dst, u32 bpp);
 u64 pica_fence(void);
 void pica_wait_fence(u64 fence);
 void pica_clear_depth(const PicaTarget *t, u32 depth24);
@@ -86,14 +88,15 @@ void pica_fill_zero(void *p, u32 bytes);
 /* start-up check: does GX_MemoryFill reach FCRAM (result in pica_fill_report) */
 void pica_fill_selftest(void);
 extern char pica_fill_report[96];
+extern bool pica_early_clear;
 void pica_copy(void *dst, const void *src, u32 bytes);
 void pica_copy_from_vram(void *dst, const void *src, u32 bytes); /* no CPU cache flush of src */
 void pica_copy_gap(void *dst, const void *src, u32 bytes, u32 run16, u32 gap16);
 /* bytes in lines of run16*16 bytes, skipping in_gap16*16 bytes after each source line and
  * out_gap16*16 after each destination line */
 void pica_copy_rect(void *dst, const void *src, u32 bytes, u32 run16, u32 in_gap16, u32 out_gap16);
-void pica_downscale2_rgba8(const void *src, u16 width, u16 rows, void *dst); /* tiled -> linear, 2x2 average */
-void pica_tile_rgba8(const void *src, u16 width, u16 rows, void *dst);        /* linear -> tiled */
+void pica_downscale2(const void *src, u16 width, u16 rows, void *dst, u32 bpp); /* tiled -> linear, 2x2 average */
+void pica_tile(const void *src, u16 width, u16 rows, void *dst, u32 bpp);        /* linear -> tiled */
 
 /* Clears with the PSC fill engine. Correctly ordered against draws already recorded. */
 void pica_clear(const PicaTarget *t, u32 rgba, bool clear_depth, u32 depth24);

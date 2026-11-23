@@ -174,6 +174,7 @@ RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
         snprintf(path, sizeof(path), "%s/%s", dir, g_roms[i].file);
         boxart_add(path, g_roms[i].title, g_roms[i].id, strstr(g_roms[i].tags, "hack") != NULL);
     }
+    ctr64_time_mark("game list: sorted");
     boxart_start();
     ctr64_time_mark("game list: box art ready");
 

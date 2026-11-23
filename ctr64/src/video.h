@@ -56,6 +56,8 @@ void video_draw_fullscreen(const void *tex, u16 tw, u16 th, GPU_TEXCOLOR fmt, u1
                            bool top_is_t0, bool linear);
 
 void video_present(void);
+/* the frame ends with this 240x400 target (already the way round the LCD is) instead of the screen */
+void video_present_target(const PicaTarget *t);
 
 /* start-up check: can the GPU sample non-power-of-two widths (frame buffer textures) */
 void video_npot_selftest(void);

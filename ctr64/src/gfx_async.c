@@ -22,6 +22,7 @@ int ctr64_core1_ready(void); /* platform/ctr_jit.c */
 #include <malloc.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "debug_crumb.h"
@@ -46,6 +47,8 @@ typedef struct {
     Kind kind;
     Regs in;
     u8 dmem[0x1000], imem[0x1000]; /* display lists only */
+    unsigned char *dl; /* its commands (copy_list): dl_len bytes from RDRAM address dl_from */
+    unsigned dl_from, dl_len, dl_cap;
 } Cmd;
 
 typedef struct {
@@ -133,8 +136,26 @@ static void run(Kind kind)
     }
 }
 
+const unsigned char *ctr64_dl_copy; /* the worker's display list (GLideN64 RSP.h), see copy_list */
+unsigned ctr64_dl_from, ctr64_dl_len;
 unsigned ctr64_gfx_worker_ticks[3]; /* worker time: [0] idle, [1] display lists, [2] other calls */
 
+static volatile bool g_abandon; /* ctr64_gfx_async_abandon */
+
+/* The game changed a list's commands before the worker was through with it. They were copied
+ * (copy_list), but not the vertices and matrices: Cruis'n USA rebuilds all of it in place once the
+ * RSP is done, and now and then drew a frame from half of the next one. The second time, its lists
+ * become streamed ones: the RSP task ends when the worker is done reading, as on an N64. */
+static unsigned g_rewritten; /* lists, this game */
+static void list_rewritten(void)
+{
+    extern bool ctr64_gfx_infloop_seen;
+    extern void ctr64_log_line(const char *line);
+    if (++g_rewritten != 2 || ctr64_gfx_infloop_seen)
+        return;
+    ctr64_gfx_infloop_seen = true;
+    ctr64_log_line("video thread: the game reuses its display list memory early; tasks end when read from now on");
+}
 static void worker(void *arg)
 {
     (void)arg;
@@ -144,8 +165,12 @@ static void worker(void *arg)
         LightLock_Lock(&g_lock);
         const u64 t_idle = svcGetSystemTick();
         ctr64_gcrumb = "worker: idle";
-        while (g_got == g_put)
+        while (g_got == g_put && !g_abandon)
             CondVar_WaitTimeout(&g_changed, &g_lock, WAKE_RECHECK_NS);
+        if (g_abandon) {
+            LightLock_Unlock(&g_lock);
+            break;
+        }
         const u64 t_run = svcGetSystemTick();
         ctr64_gfx_worker_ticks[0] += (unsigned)(t_run - t_idle);
         Cmd *c = &g_queue[g_got % QUEUE];
@@ -165,7 +190,14 @@ static void worker(void *arg)
         static const char *const kn[] = {"worker: dlist", "worker: updateScreen", "worker: viStatus", "worker: viWidth",
                                          "worker: showCFB", "worker: quit"};
         ctr64_gcrumb = (unsigned)c->kind < 6 ? kn[c->kind] : "worker: ?";
+        ctr64_dl_copy = c->dl;
+        ctr64_dl_from = c->dl_from;
+        ctr64_dl_len = c->kind == C_DLIST ? c->dl_len : 0;
         run(c->kind);
+        ctr64_dl_len = 0;
+        if (c->kind == C_DLIST && c->dl_len &&
+            memcmp(c->dl, (const unsigned char *)g_dev.rdram.dram + c->dl_from, c->dl_len))
+            list_rewritten();
         ctr64_gfx_worker_ticks[c->kind == C_DLIST ? 1 : 2] += (unsigned)(svcGetSystemTick() - t_run);
         if (res) {
             res->out = g_shadow;
@@ -295,6 +327,82 @@ void ctr64_gfx_drain(void)
         wait_for(&g_got, g_put);
 }
 
+/* RDRAM the video thread writes to (frame and depth buffer clears: FrameBuffer.cpp). On an N64 the
+ * RDP has cleared a frame buffer long before the game loads data into it. Star Fox 64 loads its
+ * compressed data into the frame buffers at a scene's start; the clear of a list still on the
+ * worker wiped it, the decompression ran wild over the memory and the game hung (audio thread in
+ * an endless loop; every third boot in Azahar, HW 2026-11-22: 2 of 2). So a cartridge DMA into
+ * such a range first waits for the lists on the worker. */
+typedef struct {
+    unsigned start, end;
+} Range;
+#define WROTE 12
+static volatile Range g_wrote[WROTE];
+static unsigned g_wrote_next;
+unsigned ctr64_gfx_dma_waits; /* core.log */
+
+void ctr64_gfx_wrote(unsigned start, unsigned end)
+{
+    for (int i = 0; i < WROTE; i++)
+        if (start >= g_wrote[i].start && end <= g_wrote[i].end)
+            return;
+    /* grow the range it touches (a screen cleared in parts), else take the oldest entry */
+    for (int i = 0; i < WROTE; i++) {
+        volatile Range *r = &g_wrote[i];
+        if (!r->end || start > r->end || end < r->start)
+            continue;
+        const unsigned s = start < r->start ? start : r->start, e = end > r->end ? end : r->end;
+        if (e - s > 0x100000)
+            continue;
+        r->start = s;
+        r->end = e;
+        return;
+    }
+    volatile Range *r = &g_wrote[g_wrote_next++ % WROTE];
+    r->end = 0;
+    r->start = start;
+    r->end = end;
+}
+
+void ctr64_gfx_before_dma(unsigned start, unsigned len)
+{
+    if (!g_running || g_dlists_got == g_dlists_put)
+        return;
+    for (int i = 0; i < WROTE; i++)
+        if (start < g_wrote[i].end && start + len > g_wrote[i].start) {
+            ctr64_gfx_dma_waits++;
+            ctr64_gfx_drain();
+            return;
+        }
+}
+
+/* The commands of a display list, as the game's task describes them, copied when it is queued. The
+ * game may use that memory again as soon as the RSP is done with the list, which is reported at
+ * once: Cruis'n USA builds its next list in the same buffer, and the worker then read a list with
+ * no frame buffer yet (it cleared RDRAM from address 0 on; the game stopped on a black screen).
+ * Not for a streamed list, which the game goes on writing. */
+#define DL_MAX 0x40000
+bool ctr64_gfx_nodlcopy; /* dev switch nodlcopy.txt */
+extern bool ctr64_gfx_stream; /* below */
+static void copy_list(Cmd *c)
+{
+    const unsigned from = *(unsigned *)(c->dmem + 0xFF0) & 0xFFFFF8, len = (*(unsigned *)(c->dmem + 0xFF4) + 7) & ~7u;
+    c->dl_len = 0;
+    if (ctr64_gfx_nodlcopy || ctr64_gfx_stream || !len || len > DL_MAX || from + len > 0x800000)
+        return;
+    if (c->dl_cap < len) {
+        const unsigned cap = (len + 0x3FFF) & ~0x3FFFu;
+        unsigned char *p = realloc(c->dl, cap);
+        if (!p)
+            return; /* read in place, as without the copy */
+        c->dl = p;
+        c->dl_cap = cap;
+    }
+    memcpy(c->dl, (const unsigned char *)g_dev.rdram.dram + from, len);
+    c->dl_from = from;
+    c->dl_len = len;
+}
+
 static void enqueue(Kind kind)
 {
     /* wait for a free slot (and for a free display list result) */
@@ -310,6 +418,7 @@ static void enqueue(Kind kind)
     if (kind == C_DLIST) {
         memcpy(c->dmem, g_real_dmem, sizeof(c->dmem));
         memcpy(c->imem, g_real_imem, sizeof(c->imem));
+        copy_list(c);
         g_results[g_dlists_put % RESULTS].start = svcGetSystemTick();
         g_dlists_put++;
     }
@@ -423,6 +532,15 @@ static unsigned vi_count_cycles(void)
     return g_dev.vi.delay ? g_dev.vi.delay : 780000;
 }
 
+/* Scripted tests (determ.txt: a VI number): until then the RDP is done 1/2 VI and an audio task 1/16
+ * VI (audio_async.c) after the start in emulated time, however fast this console is, so the same
+ * inputs go the same way through a game's menus every time. Real timing from then on. */
+unsigned ctr64_determ_until;
+bool ctr64_determ(void)
+{
+    return ctr64_vi_count < ctr64_determ_until;
+}
+
 unsigned ctr64_gfx_dlist_step(void)
 {
     return ctr64_gfx_delay_q4 ? vi_count_cycles() * ctr64_gfx_delay_q4 / 4 : vi_count_cycles() / 16;
@@ -434,6 +552,8 @@ bool ctr64_gfx_dlist_ready(unsigned elapsed)
     if (ctr64_gfx_delay_q4 || g_dlists_taken == g_dlists_put)
         return true;
     const unsigned vi = vi_count_cycles();
+    if (ctr64_determ())
+        return elapsed >= vi / 2;
     if (g_dlists_got != g_dlists_taken) {
         if (ctr64_gfx_rdp_early || elapsed >= ctr64_gfx_cap_vi * vi)
             return true;
@@ -480,6 +600,8 @@ unsigned ctr64_gfx_stream_parts; /* stats.log */
 static bool stream_wait(unsigned elapsed)
 {
     const unsigned vi = vi_count_cycles();
+    if (ctr64_determ())
+        return elapsed >= vi / 2;
     if (elapsed >= ctr64_gfx_cap_vi * vi)
         return true;
     extern volatile bool ctr64_speed_behind;
@@ -497,6 +619,8 @@ int ctr64_gfx_stream_poll(unsigned elapsed, bool *dp)
     *dp = false;
     if (g_dlists_taken == g_dlists_put)
         return 2; /* nothing queued (cannot happen) */
+    if (ctr64_determ() && !stream_wait(elapsed))
+        return 0;
     if (g_dlists_got == g_dlists_taken) {
         if (!stream_wait(elapsed))
             return 0;
@@ -515,10 +639,38 @@ int ctr64_gfx_stream_poll(unsigned elapsed, bool *dp)
     return (sp & 0x1 /* SP_STATUS_HALT */) ? 2 : 1;
 }
 
+/* A microcode not seen yet: its first display list runs inline, so that GLideN64 can say (RSP.cpp,
+ * ctr64_gfx_inline_game) that its lists must all stay inline. Boss Game Studios' (World Driver
+ * Championship) waits in the middle of a list for signals from the CPU and answers with its own:
+ * its first list on the worker already left the game waiting forever (black screen). */
+#define UCODES 16
+static unsigned g_ucodes[UCODES], g_nucodes;
+static bool new_ucode(void)
+{
+    const unsigned uc = g_real_dmem ? *(unsigned *)(g_real_dmem + 0xFD0) : 0;
+    for (unsigned i = 0; i < g_nucodes; i++)
+        if (g_ucodes[i] == uc)
+            return false;
+    if (g_nucodes < UCODES)
+        g_ucodes[g_nucodes++] = uc;
+    else
+        return false;
+    return true;
+}
+
 static void w_process_dlist(void)
 {
     g_dl_calls++;
     ctr64_gfx_stream = false;
+    if (g_running && !ctr64_gfx_infloop_seen && new_ucode()) {
+        extern unsigned ctr64_gfx_pending; /* rsp_core.c */
+        if (g_dlists_taken == g_dlists_put && !ctr64_gfx_pending) {
+            ctr64_gfx_dlist_async = false;
+            run_inline(C_DLIST, NULL);
+            return;
+        }
+        g_nucodes--; /* lists in flight: the next one */
+    }
     if (ctr64_gfx_infloop_seen && !ctr64_gfx_nostream && !ctr64_gfx_inline_game && threaded()) {
         extern unsigned ctr64_gfx_pending; /* rsp_core.c */
         if (g_dlists_taken == g_dlists_put && !ctr64_gfx_pending) {
@@ -602,7 +754,7 @@ static void w_show_cfb(void)
 static void w_process_rdp_list(void) { run_inline(C_QUIT, g_orig.processRDPList); }
 static void w_change_window(void) { ctr64_gfx_drain(); g_orig.changeWindow(); }
 static void w_rom_closed(void) { ctr64_gfx_drain(); g_orig.romClosed(); }
-static int w_rom_open(void) { ctr64_gfx_drain(); ctr64_gfx_infloop_seen = false; ctr64_gfx_inline_game = false; g_nodp_score = 64; g_lost = false; return g_orig.romOpen(); }
+static int w_rom_open(void) { ctr64_gfx_drain(); memset((void *)g_wrote, 0, sizeof(g_wrote)); ctr64_gfx_infloop_seen = false; ctr64_gfx_inline_game = false; g_nucodes = 0; g_rewritten = 0; g_nodp_score = 64; g_lost = false; return g_orig.romOpen(); }
 static void w_move_screen(int x, int y) { ctr64_gfx_drain(); g_orig.moveScreen(x, y); }
 static void w_read_screen(void *d, int *w, int *h, int f) { ctr64_gfx_drain(); g_orig.readScreen(d, w, h, f); }
 static void w_resize(int w, int h) { ctr64_gfx_drain(); g_orig.resizeVideoOutput(w, h); }
@@ -650,6 +802,16 @@ void ctr64_gfx_async_install(gfx_plugin_functions *gfx, GFX_INFO *info)
     if (g_orig.fBRead) gfx->fBRead = w_fb_read;
     if (g_orig.fBWrite) gfx->fBWrite = w_fb_write;
     if (g_orig.fBGetFrameBufferInfo) gfx->fBGetFrameBufferInfo = w_fb_info;
+}
+
+/* the program ends on an error (crash.c): the worker stops after what it is doing, queued work is
+ * dropped; waits at most 2 s */
+void ctr64_gfx_async_abandon(void)
+{
+    if (!g_running || threadGetCurrent() == g_thread)
+        return;
+    g_abandon = true;
+    threadJoin(g_thread, 2000000000LL);
 }
 
 /* frontend shutdown: stops the worker */

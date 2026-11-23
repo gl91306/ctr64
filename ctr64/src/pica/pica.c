@@ -2,6 +2,7 @@
 #include "debug_crumb.h"
 
 #include <malloc.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -407,11 +408,90 @@ regs:; /* GPU registers: a call of its own, last (Azahar asserts on some; GSP co
     fflush(f);
 }
 
+/* ---- the N64 VI's gamma ------------------------------------------------------------------
+ * A game can have the VI raise its output to the power 1/2 (VI_STATUS gamma bit; Chameleon Twist):
+ * without it the picture is far too dark. The top screen's colour lookup table (the LCD
+ * controller's, as Luma's screen filters use) does it for free. It is set back to the identity
+ * while ctr64 is in the background and when the game or ctr64 ends. Dev switch nogamma.txt: off. */
+#define LCD_TOP_LUT_INDEX 0x400480
+#define LCD_TOP_LUT_ELEM 0x400484
+static volatile bool g_gamma_want, g_gamma_shown, g_gamma_away;
+static int g_gamma_off = -1;
+static LightLock g_gamma_lock = 1; /* unlocked */
+
+static void lut_write(bool gamma)
+{
+    /* The index register's auto-increment cannot be relied on: on hardware the table came out
+     * shifted by one entry now and then, which put white in entry 0 (black showed as white, and
+     * stayed so after ctr64 ended). Every entry gets its index written first, and the whole table
+     * is read back and written again where it differs. */
+    int bad = 0, pass;
+    for (pass = 0; pass < 4; pass++) {
+        bad = 0;
+        for (u32 i = 0; i < 256; i++) {
+            const u32 c = gamma ? (u32)lroundf(255.0f * sqrtf(i / 255.0f)) : i;
+            const u32 want = c | c << 8 | c << 16;
+            u32 v = i, r = ~0u;
+            if (pass > 0) {
+                GSPGPU_WriteHWRegs(LCD_TOP_LUT_INDEX, &v, 4);
+                GSPGPU_ReadHWRegs(LCD_TOP_LUT_ELEM, &r, 4);
+                if ((r & 0xFFFFFF) == want)
+                    continue;
+                bad++;
+            }
+            v = i;
+            GSPGPU_WriteHWRegs(LCD_TOP_LUT_INDEX, &v, 4);
+            v = want;
+            GSPGPU_WriteHWRegs(LCD_TOP_LUT_ELEM, &v, 4);
+        }
+        if (pass > 0 && bad == 0)
+            break;
+    }
+    extern void ctr64_log_line(const char *line);
+    char line[96];
+    snprintf(line, sizeof(line), "screen gamma %s (LCD table: %d checks, %d entries rewritten in the last)",
+             gamma ? "on" : "off", pass, bad);
+    ctr64_log_line(line);
+}
+
+static void gamma_update(void)
+{
+    LightLock_Lock(&g_gamma_lock);
+    const bool on = g_gamma_want && !g_gamma_away;
+    if (on != g_gamma_shown) {
+        lut_write(on);
+        g_gamma_shown = on;
+    }
+    LightLock_Unlock(&g_gamma_lock);
+}
+
+void pica_lcd_gamma(bool on)
+{
+    if (g_gamma_off < 0) {
+        FILE *f = fopen("sdmc:/3ds/ctr64/nogamma.txt", "r");
+        g_gamma_off = f != NULL;
+        if (f)
+            fclose(f);
+    }
+    on = on && !g_gamma_off;
+    if (on == g_gamma_want)
+        return;
+    g_gamma_want = on;
+    gamma_update();
+}
+
 static void apt_hook(APT_HookType type, void *param)
 {
     (void)param;
     if (type == APTHOOK_ONSUSPEND || type == APTHOOK_ONEXIT)
         wait_fence(queue_enqueued());
+    if (type == APTHOOK_ONSUSPEND || type == APTHOOK_ONSLEEP || type == APTHOOK_ONEXIT) {
+        g_gamma_away = true;
+        gamma_update();
+    } else if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP) {
+        g_gamma_away = false;
+        gamma_update();
+    }
 }
 
 /* ---- device ---------------------------------------------------------------------------- */
@@ -451,6 +531,7 @@ void pica_exit(void)
     gxCmdQueueClear(&P.queue);
     GX_BindQueue(NULL);
     aptUnhook(&P.apt_cookie);
+    pica_lcd_gamma(false);
     free(P.queue.entries);
     if (P.top_fb[2]) /* hand the screen back to libctru's buffers before freeing ours */
         gfxScreenSwapBuffers(GFX_TOP, false);
@@ -678,43 +759,45 @@ void pica_untile_rgba8(const void *src, u16 width, u16 rows, void *dst)
     pica_cache_invalidate(dst, (u32)width * rows * 4);
 }
 
+static u32 xfer_fmt(u32 bpp) { return bpp == 2 ? GX_TRANSFER_FMT_RGB5A1 : GX_TRANSFER_FMT_RGBA8; }
+
 /* As pica_untile_rgba8, but only queued (after everything submitted so far). Before reading dst:
  * pica_wait_fence(pica_fence() taken right after this call), then pica_cache_invalidate. */
-void pica_untile_rgba8_async(const void *src, u16 width, u16 rows, void *dst)
+void pica_untile_async(const void *src, u16 width, u16 rows, void *dst, u32 bpp)
 {
     PICA_CHECK(!width || !rows || (width & 7) || (rows & 7) || width > 1024 || rows > 1024, "%s %ux%u", __func__, width, rows);
     pica_flush();
     queue_reserve(1);
     GX_DisplayTransfer((u32 *)src, GX_BUFFER_DIM(width, rows), (u32 *)dst, GX_BUFFER_DIM(width, rows),
                        GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
-                           GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
-                           GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
+                           GX_TRANSFER_IN_FORMAT(xfer_fmt(bpp)) | GX_TRANSFER_OUT_FORMAT(xfer_fmt(bpp)) |
+                           GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
 }
 
-/* 2x2 box downscale of a tiled RGBA8 image (width x rows, multiples of 16) into a linear
+/* 2x2 box downscale of a tiled RGBA8 (bpp 4) or RGBA5551 (2) image (width x rows, multiples of 16) into a linear
  * (width/2) x (rows/2) image, queued after everything submitted so far: the transfer engine's
  * supersampling resolve, the average bilinear sampling at exactly half size gives */
-void pica_downscale2_rgba8(const void *src, u16 width, u16 rows, void *dst)
+void pica_downscale2(const void *src, u16 width, u16 rows, void *dst, u32 bpp)
 {
     PICA_CHECK(!width || !rows || (width & 7) || (rows & 7) || width > 1024 || rows > 1024, "%s %ux%u", __func__, width, rows);
     pica_flush();
     queue_reserve(1);
     GX_DisplayTransfer((u32 *)src, GX_BUFFER_DIM(width, rows), (u32 *)dst, GX_BUFFER_DIM(width / 2, rows / 2),
                        GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
-                           GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
-                           GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_XY));
+                           GX_TRANSFER_IN_FORMAT(xfer_fmt(bpp)) | GX_TRANSFER_OUT_FORMAT(xfer_fmt(bpp)) |
+                           GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_XY));
 }
 
-/* linear RGBA8 (width x rows, multiples of 8) to tiled, queued after everything submitted so far */
-void pica_tile_rgba8(const void *src, u16 width, u16 rows, void *dst)
+/* linear RGBA8 or RGBA5551 (width x rows, multiples of 8) to tiled, queued after everything submitted so far */
+void pica_tile(const void *src, u16 width, u16 rows, void *dst, u32 bpp)
 {
     PICA_CHECK(!width || !rows || (width & 7) || (rows & 7) || width > 1024 || rows > 1024, "%s %ux%u", __func__, width, rows);
     pica_flush();
     queue_reserve(1);
     GX_DisplayTransfer((u32 *)src, GX_BUFFER_DIM(width, rows), (u32 *)dst, GX_BUFFER_DIM(width, rows),
                        GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(1) | GX_TRANSFER_RAW_COPY(0) |
-                           GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
-                           GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
+                           GX_TRANSFER_IN_FORMAT(xfer_fmt(bpp)) | GX_TRANSFER_OUT_FORMAT(xfer_fmt(bpp)) |
+                           GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
 }
 
 u64 pica_fence(void)
@@ -930,10 +1013,13 @@ void pica_fill_selftest(void)
 
 void pica_clear(const PicaTarget *t, u32 rgba, bool clear_depth, u32 depth24)
 {
+    const u32 rgba8 = rgba;
     u32 pixels = (u32)t->width * t->height;
     u32 cbpp = color_bytes_per_pixel(t->color_fmt);
     u32 *c0 = (u32 *)t->color, *c1 = (u32 *)((u8 *)t->color + pixels * cbpp);
 
+    if (t->color_fmt == GPU_RB_RGBA5551) /* 0xRRGGBBAA -> the 16 bits */
+        rgba = (rgba >> 16 & 0xF800) | (rgba >> 13 & 0x07C0) | (rgba >> 10 & 0x003E) | (rgba >> 7 & 1);
     /* Draws already recorded must reach the GPU before the fill engine touches the target. */
     submit_commands();
     const bool both_vram = is_vram(t->color) && (!clear_depth || !t->depth || is_vram(t->depth));
@@ -948,10 +1034,10 @@ void pica_clear(const PicaTarget *t, u32 rgba, bool clear_depth, u32 depth24)
             fill_any(c0, pixels * cbpp, rgba, cbpp);
             fill_any(d0, pixels * dbpp, dval, dbpp);
         }
-    } else if (!is_vram(t->color) && !g_fcram_fill && g_fill_scratch && t->color_fmt == GPU_RB_RGBA8 &&
-               !pica_noclrdraw) {
+    } else if (!is_vram(t->color) && !g_fcram_fill && g_fill_scratch &&
+               (t->color_fmt == GPU_RB_RGBA8 || t->color_fmt == GPU_RB_RGBA5551) && !pica_noclrdraw) {
         extern void video_clear_draw(const PicaTarget *t, u32 rgba);
-        video_clear_draw(t, rgba); /* recorded into the command list: in order with the draws */
+        video_clear_draw(t, rgba8); /* recorded into the command list: in order with the draws */
     } else {
         fill_any(c0, pixels * cbpp, rgba, cbpp);
     }

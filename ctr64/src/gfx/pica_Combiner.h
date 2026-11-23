@@ -23,10 +23,11 @@ constexpr int MAX_STAGES = 6;
 
 /* A constant: a combiner input or a fixed expression of inputs, evaluated per channel. */
 struct KRef {
-    enum : u8 { K_NONE, K_IN, K_HALF, K_HALF_1M_PROD, K_POSDIFF, K_NEGDIFF } op = K_NONE;
-    /* K_POSDIFF: max(g1 - g2, 0), K_NEGDIFF: max(g2 - g1, 0) */
-    u8 g1 = 0, g2 = 0; /* G_GCI_* */
-    bool operator==(const KRef &o) const { return op == o.op && g1 == o.g1 && g2 == o.g2; }
+    enum : u8 { K_NONE, K_IN, K_HALF, K_HALF_1M_PROD, K_POSDIFF, K_NEGDIFF, K_CYCLE, K_POSPROD, K_NEGPROD } op = K_NONE;
+    /* K_POSDIFF: max(g1 - g2, 0), K_NEGDIFF: max(g2 - g1, 0), K_CYCLE: (g1 - g2) * g3 + g4,
+     * K_POSPROD: max((g1 - g2) * g3, 0), K_NEGPROD: max((g2 - g1) * g3, 0) */
+    u8 g1 = 0, g2 = 0, g3 = 0, g4 = 0; /* G_GCI_* */
+    bool operator==(const KRef &o) const { return op == o.op && g1 == o.g1 && g2 == o.g2 && g3 == o.g3 && g4 == o.g4; }
     bool operator!=(const KRef &o) const { return !(*this == o); }
 };
 

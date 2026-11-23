@@ -6,6 +6,8 @@
  * SD card (sdmc:/3ds/ctr64/boxart) already shrunk to at most 256x256 and laid out as a GPU texture,
  * so showing it is one file read. Games are matched by cartridge ID (ui/boxart_names.h), so the
  * ROM's file name does not matter. Without Wi-Fi, or for games without art, a title card is shown.
+ * The user's own art: <ROM file name without its ending>.png or .jpg in that folder, converted to
+ * the cache format (and removed) the next time the list is opened.
  * Downloads and file reads run on their own threads; the carousel is drawn with the GPU, which is
  * idle while the game list is open. Everything is freed by boxart_end, before a game starts. */
 

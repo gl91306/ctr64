@@ -166,6 +166,17 @@ struct DrawTimer { /* only with profiling on: a tick read is a kernel call */
 extern "C" bool ctr64_crc_nomemo; /* gln64_ctr.c; dev switch nocrcmemo.txt */
 extern "C" bool ctr64_fbcheck_full; /* gln64_ctr.c; dev switch fbcheckfull.txt */
 
+extern bool ctr64_fb_is16; /* FrameBuffer.cpp: the texture being made is a 16-bit N64 color buffer */
+/* Frame buffers of 16-bit N64 buffers in 16 bits instead of 32 (as on the N64, though without its
+ * dithering: gradients get coarser steps), half the memory and half the bytes per copy. Used only
+ * by a game whose targets do not fit the VRAM: once more than k_fb16_kb were moved into it in each
+ * of two runs of 64 presents, for the rest of the game; buffers there are change at their next
+ * full clear or at the next draw into them (convert16: a GPU copy), new ones are made so. Mario Tennis with anti-aliasing (three 768x480 buffers and a
+ * depth buffer), HW 2026-11-22: 31 -> 47 VI/s where 70 MB/s were moved. Dev switches: fb16.txt = from
+ * the start, nofb16.txt = never. */
+static bool g_fb16, g_nofb16;
+static u32 g_fb16_presents, g_fb16_moved, g_fb16_runs; /* KB moved since the run began */
+static const u32 k_fb16_kb = 12 * 1024;
 namespace {
 
 /* ---- textures ------------------------------------------------------------------------------ */
@@ -175,6 +186,7 @@ struct Tex {
     u16 tw = 0, th = 0; /* power-of-two storage */
     GPU_TEXCOLOR fmt = GPU_RGBA8;
     u8 bpp = 4;
+    bool n16 = false; /* color buffer of a 16-bit N64 buffer (g_fb16) */
     bool depth = false; /* D24S8 storage (depth renderbuffer / texture) */
     bool vram = false;
     void *data = nullptr;
@@ -190,6 +202,11 @@ struct Tex {
     u32 draw_frame = 0;   /* pica frame of the last draw into it (VRAM placement, keepInVram) */
     u32 ndraw = 0;        /* draws since the last present */
     u32 ndraw_last = ~0u; /* draws in the last present interval it was drawn in (~0: none yet) */
+    u32 born = 0;         /* frame its storage was set up in (init2DTexture) */
+    u16 th_full = 0;      /* short storage (materialize): th is less than the target needs, this much */
+    u16 rows_used = 0;    /* rows drawn to (from GL row 0); 0xFFFF: unknown */
+    u32 zclean = 0;       /* depth buffers: texels cleared with nothing drawn since */
+    u32 cleared = 0;      /* the last clear's color, if it was cleared since its storage was set up */
     u32 gen = 0;          /* contents generation: bumped with dirty (shadow copies, shadowOf) */
     u32 nshadow = 0;      /* shadow copies of it in this present interval (rtlog.txt) */
     u32 sh_gen = ~0u;     /* shadowOf: samples of contents generation sh_gen, of the one before */
@@ -245,11 +262,16 @@ u16 pot(u32 v)
 bool g_slowtex; /* dev switch slowtex.txt: texture uploads by the old per-texel paths (A/B) */
 bool g_noguard; /* dev switch noguard.txt: no guard band clipping (A/B) */
 bool g_noshadelin; /* dev switch noshadelin.txt: no screen-linear shade subdivision (A/B) */
-bool g_nooverlayoff; /* dev switch nooverlayoff.txt: transparent-Z overlays get no depth offset (drawTriangles) */
 bool g_novramflush; /* dev switch novramflush.txt: no cache flush after CPU texel writes into VRAM */
+bool g_novpz;      /* dev switch novpz.txt: the N64 viewport's z scale and translation not applied */
 bool g_noproj;     /* dev switch noproj.txt: screen-linear shade by subdivision, not projective draws */
 bool g_noidxdraw;  /* dev switch noidxdraw.txt: indexed triangle lists drawn as plain lists (A/B) */
+
+bool g_nobanks;
 bool g_potfb; /* dev switch potfb.txt: power-of-two frame buffer storage always (as before 2026-11-10) */
+bool g_potheight; /* dev switch potheight.txt: power-of-two heights at exact widths too (A/B) */
+bool g_lruold; /* dev switch lruold.txt: the VRAM target drawn longest ago always gives way (A/B) */
+bool g_noheavy; /* dev switch noheavy.txt: no switch to power-of-two widths (g_shadow_heavy, A/B) */
 bool g_fullshadow; /* dev switch fullshadow.txt: shadow copies take every row (shadowOf) */
 bool g_noalpha1;   /* dev switch noalpha1.txt: alpha compare on the output alpha (setupCombiner) */
 bool g_noshdraw;   /* dev switch noshdraw.txt: shadow copies by the transfer engine only (shadowDraw) */
@@ -282,19 +304,23 @@ static void note_shadow_copy()
         g_shadow_win_start = now;
         g_shadow_win_count = 0;
     }
-    if (++g_shadow_win_count >= 60)
+    if (++g_shadow_win_count >= 60 && !g_noheavy)
         g_shadow_heavy = true;
 }
 
+static u32 g_rt_pot_bytes; /* the targets drawn lately, at power-of-two sizes (present) */
 static bool pot_storage()
 {
     if (video_npot_ok)
         return false;
     const bool aa = config.frameBufferEmulation.enable && config.frameBufferEmulation.nativeResFactor > 1;
-    const bool pot_choice = !aa || g_potfb || g_shadow_heavy;
+    /* power-of-two targets only if those in use fit the VRAM so (Mario Tennis's do not: its depth
+     * buffer grew to 2 MB and a color buffer was moved every frame) */
+    const bool pot_choice = !aa || g_potfb || (g_shadow_heavy && g_rt_pot_bytes <= 5120 * 1024);
     if (aa)
-        snprintf(ctr64_rt_mode, sizeof(ctr64_rt_mode), "%s%s",
-                 pot_choice ? "power-of-two widths" : "exact widths + shadow copies", g_shdraw_report);
+        snprintf(ctr64_rt_mode, sizeof(ctr64_rt_mode), "%s%s%s",
+                 pot_choice ? "power-of-two widths" : "exact widths + shadow copies", g_shdraw_report,
+                 g_fb16 ? " + 16 bit" : "");
     return pot_choice;
 }
 
@@ -305,8 +331,20 @@ u16 fb_width(u32 v)
     return (u16)((v + 31) & ~31u);
 }
 
+/* Storage height of a target stored fb_width(width) wide. At an exact width, sampled through its
+ * shadow anyway, the rows are exact too: Mario Tennis's 768x480 targets take 1440 KB each, not
+ * 1536, and its three color buffers and depth buffer fit the two 3 MB halves of the VRAM (one was
+ * moved out and in per frame, HW 2026-11-22: 7 of 49 ms); PAL games' 640x580 took 1024 rows. */
+u16 fb_height(u16 tw, u32 h)
+{
+    if (g_potheight || (tw & (tw - 1)) == 0 || h < 64 || h > 1024)
+        return pot(h);
+    return (u16)((h + 7) & ~7u);
+}
+
 /* Without non-power-of-two sampling (hardware) a texture stored at such a width is sampled
- * through a power-of-two shadow copy (shadowOf); the width texture coordinates refer to */
+ * through a power-of-two shadow copy (shadowOf); the size texture coordinates refer to. The rows
+ * are stored bottom up, so a shadow has its unused rows first. */
 inline bool needs_shadow(const Tex &t)
 {
     return !video_npot_ok && (t.tw & (t.tw - 1)) != 0;
@@ -314,6 +352,10 @@ inline bool needs_shadow(const Tex &t)
 inline u32 sample_w(const Tex &t)
 {
     return needs_shadow(t) ? pot(t.tw) : t.tw;
+}
+inline u32 sample_h(const Tex &t)
+{
+    return needs_shadow(t) ? pot(t.th) : t.th;
 }
 
 /* GL source texel -> 0xRRGGBBAA */
@@ -888,7 +930,7 @@ u32 collect_inputs(const CombinerStage &st, u32 (*fix)(u32))
  * GLideN64 wants them in */
 struct ReadJob {
     s32 x0 = 0, y0 = 0;
-    u32 w = 0, h = 0, hh = 0, ww = 0, s0 = 0, s1 = 0, tw = 0, th = 0;
+    u32 w = 0, h = 0, hh = 0, ww = 0, s0 = 0, s1 = 0, tw = 0, th = 0, bpp = 4;
     bool rgba16 = false, pm_blue = false;
 };
 
@@ -1001,15 +1043,34 @@ inline float fast_floor(float v)
     return t > v ? t - 1.0f : t;
 }
 
+/* The N64 viewport's z: the RDP's depth is z / w * vscale + vtrans, 511 and 511 (of 1023) for the
+ * whole range. Games use it to move what they draw in depth: Conker's shadow has vtrans 507, which
+ * lifts it 256/65536 over the ground its polygons lie under (the shadow flickered: the desktop
+ * build does this in the fragment shader, uDepthScale). zp = -(z * a + w * b). */
+struct ViewportZ {
+    float a = 0.5f, b = 0.5f;
+    bool set = false; /* not the default */
+    ViewportZ()
+    {
+        const float k = 1024.0f / 1022.0f, vs = gSP.viewport.vscale[2], vt = gSP.viewport.vtrans[2];
+        if (g_novpz || (fabsf(vs - 511.0f / 1024.0f) < 1.5f / 1024.0f && fabsf(vt - 511.0f / 1024.0f) < 1.5f / 1024.0f))
+            return;
+        a = vs * k;
+        b = vt * k;
+        set = true;
+    }
+};
+
+/* The N64's far plane (1022 of 1023) lies just in front of a cleared Z buffer; with the far plane at
+ * the clear value, geometry exactly on it failed the depth test (the backgrounds of WipeOut 64's
+ * menus). */
+constexpr float k_depth_scale = -(1.0f - 1.0f / 32768.0f);
+
 /* Decals (ZMODE_DEC) use GL polygon offset (factor -3, units -3): offset = -3 * max depth slope
  * - 3 * r. The PICA's depth offset is a per-draw constant, so the slope term is computed on the
  * CPU from the draw's triangles (poly_offset_for_draw); this is the floor for flat or
  * screen-aligned geometry (r taken as 2^-16, the PICA interpolating depth with less than 24 bits). */
 const float k_poly_offset = -3.0f / 65536.0f;
-/* see-through overlays (drawTriangles): a fixed offset, no slope term. Conker's shadow on its
- * ground: 3/65536 left most of it out, 32 shows it all but a few pixels; the slope-scaled decal
- * offset also lifted Wave Race's water over the beach sand it lies under (Azahar 2026-11-20) */
-const float k_overlay_offset = -32.0f / 65536.0f;
 constexpr float k_poly_factor = -3.0f;
 
 constexpr u32 WINDOW_W = 400, WINDOW_H = 240;
@@ -1110,6 +1171,7 @@ public:
     void endVI();
     bool skipDraw(bool clear = false);
     const u8 *readTexture(CachedTexture *tex, s32 x0, s32 y0, u32 w, u32 h, std::vector<u8> &out);
+    bool depthToRdram(u32 fbo, u32 w, u32 h, u32 sc, u32 key, u16 *dst);
     const u8 *readTextureAsync(CachedTexture *tex, s32 x0, s32 y0, u32 w, u32 h, AsyncReadback &a,
                                std::vector<u8> &out);
 
@@ -1133,15 +1195,49 @@ private:
     TexHit m_texHit[2] = {{0, nullptr}, {0, nullptr}};
     void forgetTexHits() { m_texHit[0] = m_texHit[1] = TexHit{0, nullptr}; }
     Fbo &drawFbo() { return m_drawFbo == 0 ? m_window : m_fbo[m_drawFbo]; }
+    /* The window is stored the way round the LCD is (240x400, turned by 90 degrees), so the display
+     * transfer reads it as it is: no draw of it into a screen target first. Draws into it are
+     * turned: clip space (x, y) -> (y, -x), viewport and scissor with them. nowinrot.txt: off. */
+    bool turned() const { return m_winRot && m_drawFbo == 0; }
+    void turnVertices(GVtx *v, u32 n) const
+    {
+        if (!turned())
+            return;
+        for (u32 i = 0; i < n; i++) {
+            const float x = v[i].x;
+            v[i].x = v[i].y;
+            v[i].y = -x;
+        }
+    }
+    bool m_winRot = true;
     void allocStorage(Tex &t, bool vram, bool reuse = false, bool zero = true);
     void moveToVram(u32 id, bool copy = true);
     void gtDraw(int kind);
     bool evictToFcram(u32 id);
     void keepInVram(Fbo &f, int use);
+    /* sizes of color targets made and deleted within a frame after a few draws, as of late, and
+     * the rows those drew to */
+    struct Brief {
+        u16 w = 0, h = 0, rows = 0;
+        u32 frame = 0;
+    };
+    Brief m_brief[4];
+    u32 m_briefNext = 0;
+    const Brief *brief(const Tex &t) const
+    {
+        if (t.depth || t.ndraw_last != ~0u || t.ndraw > 4)
+            return nullptr;
+        for (const Brief &b : m_brief)
+            if (b.w == t.w && b.h == t.h && b.frame + 4 >= pica_frame_number())
+                return &b;
+        return nullptr;
+    }
+    u16 m_drawTop = 0xFFFF; /* rows the coming draw reaches (drawRects); 0xFFFF: unknown */
+    void growStorage(u32 id);
     bool inFlight(const Tex &t) const;
     void releaseStorage(Tex &t);
     void collectPending(bool all);
-    void *gpuAlloc(u32 bytes, bool vram_first, bool &is_vram);
+    void *gpuAlloc(u32 bytes, bool vram_first, bool &is_vram, bool depth = false);
     void storageChanged(u32 id);
     void ensureStorage(u32 id);
     void writeTexels(Tex &t, const u32 *px, u32 x0, u32 y0, u32 w, u32 h);
@@ -1173,7 +1269,8 @@ private:
         u16 c0, c1, r0, r1; /* tile columns [c0, c1), tile rows [r0, r1) of the storage */
     };
     void *shadowOf(u32 id, Tex &t, bool &copied, TileRect need, const void *avoid);
-    bool shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need);
+    bool shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need, u16 th16 = 0);
+    void convert16(u32 id);
     int shadowDrawTest();
     int m_shdrawState = 0; /* shadowDraw self-test: 0 not run, 1 running, 2 passed, 3 failed, 4 no memory yet */
     u32 m_shdrawRetry = 0, m_shdrawTries = 0;
@@ -1313,6 +1410,18 @@ void ContextImplPica::init()
         fclose(pf);
         g_potfb = true;
     }
+    if (FILE *ph = fopen("sdmc:/3ds/ctr64/potheight.txt", "r")) {
+        fclose(ph);
+        g_potheight = true;
+    }
+    if (FILE *nh = fopen("sdmc:/3ds/ctr64/lruold.txt", "r")) {
+        fclose(nh);
+        g_lruold = true;
+    }
+    if (FILE *nh = fopen("sdmc:/3ds/ctr64/noheavy.txt", "r")) {
+        fclose(nh);
+        g_noheavy = true;
+    }
     if (FILE *ff = fopen("sdmc:/3ds/ctr64/fullshadow.txt", "r")) {
         fclose(ff);
         g_fullshadow = true;
@@ -1324,6 +1433,26 @@ void ContextImplPica::init()
     if (FILE *fd = fopen("sdmc:/3ds/ctr64/nodrawnrows.txt", "r")) {
         fclose(fd);
         g_nodrawnrows = true;
+    }
+    if (FILE *fs = fopen("sdmc:/3ds/ctr64/nobanks.txt", "r")) {
+        fclose(fs);
+        g_nobanks = true;
+    }
+    {   /* dev switch edclear.txt: the early depth buffer cleared at each target switch, as before */
+        FILE *fs = fopen("sdmc:/3ds/ctr64/edclear.txt", "r");
+        pica_early_clear = fs != nullptr;
+        if (fs)
+            fclose(fs);
+    }
+    g_fb16 = g_nofb16 = false;
+    g_fb16_presents = g_fb16_moved = g_fb16_runs = 0;
+    if (FILE *fs = fopen("sdmc:/3ds/ctr64/fb16.txt", "r")) {
+        fclose(fs);
+        g_fb16 = true;
+    }
+    if (FILE *fs = fopen("sdmc:/3ds/ctr64/nofb16.txt", "r")) {
+        fclose(fs);
+        g_nofb16 = true;
     }
     if (FILE *fs = fopen("sdmc:/3ds/ctr64/noshdraw.txt", "r")) {
         fclose(fs);
@@ -1395,9 +1524,9 @@ void ContextImplPica::init()
         fclose(sv);
         ctr64_std_fast = 0;
     }
-    if (FILE *no = fopen("sdmc:/3ds/ctr64/nooverlayoff.txt", "r")) {
+    if (FILE *no = fopen("sdmc:/3ds/ctr64/novpz.txt", "r")) {
         fclose(no);
-        g_nooverlayoff = true;
+        g_novpz = true;
     }
     if (FILE *nv = fopen("sdmc:/3ds/ctr64/novramlru.txt", "r")) {
         fclose(nv);
@@ -1416,10 +1545,16 @@ void ContextImplPica::init()
         win_vram = !(m_vramLru && config.frameBufferEmulation.enable && config.frameBufferEmulation.nativeResFactor > 1);
     }
     Tex &c = m_tex[TEX_WINDOW_COLOR];
-    c.w = WINDOW_W; c.h = WINDOW_H; c.tw = 512; c.th = 256;
+    if (FILE *wr = fopen("sdmc:/3ds/ctr64/nowinrot.txt", "r")) {
+        fclose(wr);
+        m_winRot = false;
+    }
+    c.w = WINDOW_W; c.h = WINDOW_H;
+    c.tw = m_winRot ? WINDOW_H : 512;
+    c.th = m_winRot ? WINDOW_W : 256;
     allocStorage(c, win_vram);
     Tex &d = m_tex[TEX_WINDOW_DEPTH];
-    d.w = WINDOW_W; d.h = WINDOW_H; d.tw = 512; d.th = 256; d.depth = true;
+    d.w = WINDOW_W; d.h = WINDOW_H; d.tw = c.tw; d.th = c.th; d.depth = true;
     /* With anti-aliasing and frame buffer emulation the window depth buffer goes to FCRAM (the
      * window only receives copies there): its 512 KB of VRAM kept the game's second 2x color
      * buffer out (MK64, SSB: one 1.2 MB buffer moved into and one out of VRAM each frame; MK64
@@ -1521,6 +1656,16 @@ void ContextImplPica::clearColorBuffer(f32 r, f32 g, f32 b, f32 a)
  * a clear, which clearColorBuffer does: not here, a deferred window clear runs at a later draw. */
 void ContextImplPica::clearTarget(Fbo &f, u32 rgba)
 {
+    if (Tex *t = g_fb16 ? tex(f.color) : nullptr)
+        if (t->n16 && t->rt && t->fmt == GPU_RGBA8) { /* its contents go now: 16 bits from here on */
+            releaseStorage(*t);
+            t->fmt = GPU_RGBA5551;
+            t->bpp = 2;
+            t->th = t->th_full ? t->th_full : t->th;
+            t->th_full = 0;
+            t->lazy = true;
+            storageChanged(f.color);
+        }
     materialize(f, USE_COLOR_CLEARED);
     if (!f.valid)
         return;
@@ -1528,6 +1673,7 @@ void ContextImplPica::clearTarget(Fbo &f, u32 rgba)
     ctr64_gfx_stats[ST_CLEAR]++;
     pica_clear(&f.rt, rgba, false, 0);
     if (Tex *t = tex(f.color)) {
+        t->cleared = rgba;
         t->dirty = true;
         t->gen++;
         t->used_frame = pica_frame_number();
@@ -1544,7 +1690,15 @@ void ContextImplPica::clearDepthBuffer()
     if (!f.valid || !f.rt.depth)
         return;
     ensureFrame();
-    pica_clear_depth(&f.rt, 0xFFFFFF);
+    /* Mario Tennis's VS screen clears it in 225 strips per frame; each is a clear of all of it
+     * here, 2 ms (HW 2026-11-22: 6 VI/s) */
+    Tex *d = tex(f.depth);
+    const u32 area = (u32)f.rt.width * f.rt.height;
+    if (!d || d->data != f.rt.depth || d->zclean < area) {
+        pica_clear_depth(&f.rt, 0xFFFFFF);
+        if (d && d->data == f.rt.depth)
+            d->zclean = area;
+    }
     m_enScissor = true;
 }
 
@@ -1565,6 +1719,23 @@ void ContextImplPica::deleteTexture(ObjectHandle name)
     Tex *t = tex(id);
     if (!t || id >= TEX_WINDOW_COLOR)
         return;
+    if (t->rt && !t->depth && t->ndraw && t->born == pica_frame_number() && t->rows_used) {
+        Brief *b = nullptr;
+        for (Brief &x : m_brief)
+            if (x.w == t->w && x.h == t->h)
+                b = &x;
+        if (t->ndraw > 4 || t->rows_used == 0xFFFF) {
+            if (b)
+                b->w = 0;
+        } else {
+            if (!b || b->frame + 4 < t->born) {
+                b = b ? b : &m_brief[m_briefNext++ % 4];
+                *b = Brief{t->w, t->h, 0, t->born};
+            }
+            b->frame = t->born;
+            b->rows = std::max(b->rows, t->rows_used);
+        }
+    }
     releaseStorage(*t);
     m_tex.erase(id);
     forgetTexHits();
@@ -1643,7 +1814,19 @@ void ContextImplPica::collectPending(bool all)
     m_pending.resize(keep);
 }
 
-void *ContextImplPica::gpuAlloc(u32 bytes, bool vram_first, bool &is_vram)
+/* VRAM is two halves (A, B) with a bus each: a color and a depth buffer in different halves are
+ * read and written at the same time. Depth buffers go to B when there is room, color to A. Dev
+ * switch nobanks.txt: wherever there is room first. */
+
+static void *vram_alloc(u32 bytes, bool depth)
+{
+    if (g_nobanks)
+        return vramAlloc(bytes);
+    void *p = vramAllocAt(bytes, depth ? VRAM_ALLOC_B : VRAM_ALLOC_A);
+    return p ? p : vramAlloc(bytes);
+}
+
+void *ContextImplPica::gpuAlloc(u32 bytes, bool vram_first, bool &is_vram, bool depth)
 {
     const char *where = ctr64_crumb;
     /* a size that failed after a full GPU drain this frame fails again without another drain
@@ -1651,7 +1834,7 @@ void *ContextImplPica::gpuAlloc(u32 bytes, bool vram_first, bool &is_vram)
     static u32 fail_frame = ~0u, fail_bytes = ~0u;
     bool drained = fail_frame == pica_frame_number() && bytes >= fail_bytes;
     for (int attempt = 0; attempt < 8; attempt++) {
-        void *p = vram_first ? vramAlloc(bytes) : nullptr;
+        void *p = vram_first ? vram_alloc(bytes, depth) : nullptr;
         is_vram = p != nullptr;
         if (!p)
             p = linear_alloc_safe(bytes, 0x80); /* the PICA can also render to and sample FCRAM */
@@ -1710,6 +1893,7 @@ void *ContextImplPica::gpuAlloc(u32 bytes, bool vram_first, bool &is_vram)
 void ContextImplPica::allocStorage(Tex &t, bool vram, bool reuse, bool zero)
 {
     CRUMB("gfx: allocStorage");
+    t.zclean = 0;
     const u32 bytes = storageBytes(t);
     if (reuse) {
         /* Storage of the same size released in the last frames (still pending: the GPU may be
@@ -1737,7 +1921,7 @@ void ContextImplPica::allocStorage(Tex &t, bool vram, bool reuse, bool zero)
             return;
         }
     }
-    t.data = gpuAlloc(bytes, vram, t.vram);
+    t.data = gpuAlloc(bytes, vram, t.vram, t.depth);
     if (t.data && !t.vram) {
         if (zero) {
             memset(t.data, 0, bytes);
@@ -1767,7 +1951,7 @@ void ContextImplPica::moveToVram(u32 id, bool copy)
     if (!t || t->vram || !t->data)
         return;
     const u32 bytes = storageBytes(*t);
-    void *v = vramAlloc(bytes);
+    void *v = vram_alloc(bytes, t->depth);
     if (!v)
         return; /* keep rendering to FCRAM */
     ctr64_gfx_mem[1] += bytes;
@@ -1839,6 +2023,10 @@ void ContextImplPica::keepInVram(Fbo &f, int use)
          * frame, Azahar 2026-11-10) */
         if (!t->depth && t->ndraw_last <= 2)
             continue;
+        /* and one that lasts only a few draws stays where it is (materialize gives it VRAM if there
+         * is room) */
+        if (k == 1 && brief(*t))
+            continue;
         moveToVram(ids[k], copy);
         while (!t->vram) {
             /* the VRAM target drawn longest ago, not in this frame and not this FBO's; among
@@ -1854,7 +2042,15 @@ void ContextImplPica::keepInVram(Fbo &f, int use)
                 if (!v.vram || !v.rt || !v.data || kv.first == f.color || kv.first == f.depth ||
                     (v.draw_frame >= now && !rare))
                     continue;
-                if ((rare && !victim_rare) || (rare == victim_rare && v.draw_frame < oldest)) {
+                /* the one drawn longest ago if it is out of use (4 frames), else the one drawn last:
+                 * of buffers drawn in turn (triple buffering) with one place too few, the next
+                 * needed ones stay (Mario Tennis match, HW 2026-11-22: 51 -> 54 VI/s). Nothing else
+                 * is kept out of the VRAM for it: the window buffer in FCRAM took 9 ms more per
+                 * frame, small targets and the ball trail's buffer 5 ms. */
+                const bool better = rare != victim_rare || !victim ? rare || !victim
+                                    : g_lruold || v.draw_frame + 4 < now || oldest + 4 < now ? v.draw_frame < oldest
+                                                                                             : v.draw_frame > oldest;
+                if (better) {
                     oldest = v.draw_frame;
                     victim = kv.first;
                     victim_rare = rare;
@@ -1866,7 +2062,7 @@ void ContextImplPica::keepInVram(Fbo &f, int use)
             t = tex(ids[k]);
         }
         if (t->vram)
-            ctr64_gfx_vram_moves[0] += copy ? bytes >> 10 : 0;
+            ctr64_gfx_vram_moves[0] += copy ? bytes >> 10 : 0, g_fb16_moved += copy ? bytes >> 10 : 0;
     }
 }
 
@@ -1974,8 +2170,15 @@ void ContextImplPica::init2DTexture(const Context::InitTextureParams &p)
     case IF_RGB5_A1: t->fmt = GPU_RGBA5551; break;
     default: t->fmt = GPU_RGBA8; break;
     }
+    t->n16 = ctr64_fb_is16 && !t->depth;
+    if (t->n16 && g_fb16)
+        t->fmt = GPU_RGBA5551;
     t->bpp = t->depth ? 4 : bytes_per_texel(t->fmt);
     t->tw = fb_width(p.width);
+    t->th = fb_height(t->tw, p.height);
+    t->born = pica_frame_number();
+    t->th_full = t->rows_used = 0;
+    t->cleared = 0;
     /* No data: a render target or a texture filled later. Storage is allocated on first use,
      * so targets GLideN64 creates but never draws to (e.g. the 640x580 TexrectDrawer buffer
      * at native resolution) cost nothing. */
@@ -2320,7 +2523,7 @@ void ContextImplPica::initRenderbuffer(const Context::InitRenderbufferParams &p)
     t->w = (u16)p.width;
     t->h = (u16)p.height;
     t->tw = fb_width(p.width);
-    t->th = pot(p.height);
+    t->th = fb_height(t->tw, p.height);
     t->depth = true;
     t->bpp = 4;
     t->rt = true;
@@ -2363,17 +2566,126 @@ GPU_BLENDFACTOR blend_factor(u32 f)
     }
 }
 
+/* A target with short storage (materialize) is drawn to or read beyond it: all of it now. */
+void ContextImplPica::growStorage(u32 id)
+{
+    Tex *t = tex(id);
+    if (!t || !t->th_full)
+        return;
+    const u16 th = t->th;
+    const u32 bytes = storageBytes(*t);
+    t->th = t->th_full;
+    t->th_full = 0;
+    if (!t->data) {
+        t->lazy = true;
+        storageChanged(id);
+        return;
+    }
+    const u32 all = storageBytes(*t);
+    bool vram = false;
+    void *n = gpuAlloc(all, true, vram);
+    if (!n) { /* no memory at all: keeps what it has */
+        t->th_full = t->th;
+        t->th = th;
+        return;
+    }
+    if (!vram)
+        pica_cache_flush(n, all); /* no dirty CPU lines left to overwrite what the GPU writes */
+    PicaTarget rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.color = n;
+    rt.width = t->tw;
+    rt.height = t->th;
+    rt.color_fmt = t->fmt == GPU_RGBA4 ? GPU_RB_RGBA4 : t->fmt == GPU_RGBA5551 ? GPU_RB_RGBA5551 : GPU_RB_RGBA8;
+    ensureFrame();
+    pica_clear(&rt, t->cleared, false, 0);
+    /* rows are stored bottom up: what there is goes to the end */
+    u8 *to = static_cast<u8 *>(n) + (all - bytes);
+    if (t->vram)
+        pica_copy_from_vram(to, t->data, bytes);
+    else
+        pica_copy(to, t->data, bytes);
+    t->used_frame = pica_frame_number();
+    const u16 full = t->th;
+    t->th = th;
+    releaseStorage(*t);
+    t->th = full;
+    t->data = n;
+    t->vram = vram;
+    t->used_frame = pica_frame_number();
+    t->dirty = true;
+    t->gen++;
+    storageChanged(id);
+}
+
+/* A frame buffer's 32-bit storage becomes 16-bit (g_fb16), its picture with it. In FCRAM at first:
+ * the old storage has the VRAM until the GPU is done with it (keepInVram moves it in then). */
+void ContextImplPica::convert16(u32 id)
+{
+    Tex *t = tex(id);
+    if (!t || !t->n16 || !t->rt || t->fmt != GPU_RGBA8 || t->th_full)
+        return;
+    if (t->data) {
+        Tex n = *t;
+        n.fmt = GPU_RGBA5551;
+        n.bpp = 2;
+        n.vram = false;
+        n.data = gpuAlloc(storageBytes(n), false, n.vram);
+        if (!n.data)
+            return;
+        pica_cache_flush(n.data, storageBytes(n)); /* no dirty CPU lines of its last owner */
+        ensureFrame();
+        if (!shadowDraw(n.data, t->tw, *t, TileRect{0, (u16)(t->tw / 8), 0, (u16)(t->th / 8)}, t->th)) {
+            freeNow(n.data, false, storageBytes(n));
+            return;
+        }
+        t->used_frame = pica_frame_number();
+        releaseStorage(*t);
+        t->data = n.data;
+        t->vram = false;
+        t->used_frame = pica_frame_number();
+        t->dirty = true;
+        t->gen++;
+    }
+    t->fmt = GPU_RGBA5551;
+    t->bpp = 2;
+    storageChanged(id);
+}
+
 void ContextImplPica::materialize(Fbo &f, int use)
 {
+    if (g_fb16 && use == USE_DRAW)
+        convert16(f.color);
+    /* Short storage: a target like those made and deleted within a frame after a few draws gets
+     * the rows those used (with some to spare) and the rest only once something reaches there.
+     * Goemon's diary screen makes 12 targets per frame for a few rows each; whole ones (512x480)
+     * moved the game's own targets out of the VRAM and in again, 14 MB per frame, and cost their
+     * clears (HW 2026-11-22: 26 VI/s). */
+    if (Tex *c = tex(f.color)) {
+        if (use == USE_DRAW)
+            c->rows_used = std::max(c->rows_used, m_drawTop);
+        if (!c->data && c->lazy && c->rt && !c->th_full && !needs_shadow(*c)) {
+            if (const Brief *b = brief(*c)) {
+                const u16 th = (u16)std::max<u32>(pot(b->rows + 8u), 64);
+                if (th < c->th) {
+                    c->th_full = c->th;
+                    c->th = th;
+                }
+            }
+        }
+        if (c->th_full && (use == USE_DEPTH_ONLY || (use == USE_DRAW && m_drawTop > c->th)))
+            growStorage(f.color);
+    }
     ensureStorage(f.color);
     /* after the switch to power-of-two storage (g_shadow_heavy) a new color buffer can be wider
      * than the depth buffer made before it, which rebuildFbo would then leave off: the depth
      * buffer gets the color buffer's width (its contents go once; games clear it per frame) */
     if (g_shadow_heavy) {
         Tex *c = tex(f.color), *d = tex(f.depth);
-        if (c && d && d->depth && c->tw > d->tw && d->th >= c->th) {
+        if (c && d && d->depth && (c->tw > d->tw || c->th > d->th) && c->w <= d->w && c->h <= d->h) {
             releaseStorage(*d);
-            d->tw = c->tw;
+            d->tw = std::max(c->tw, d->tw);
+            d->th = std::max(c->th, d->th);
             d->lazy = true;
             storageChanged(f.depth);
         }
@@ -2396,7 +2708,10 @@ bool ContextImplPica::applyState(bool depth_allowed)
     pica_bind_target(&f.rt);
     pica_bind_program(&m_shader);
     pica_vertex_layout(k_layout, 4, sizeof(GVtx));
-    pica_viewport((u16)m_vp[0], (u16)m_vp[1], (u16)m_vp[2], (u16)m_vp[3]);
+    if (turned())
+        pica_viewport((u16)m_vp[1], (u16)(WINDOW_W - m_vp[0] - m_vp[2]), (u16)m_vp[3], (u16)m_vp[2]);
+    else
+        pica_viewport((u16)m_vp[0], (u16)m_vp[1], (u16)m_vp[2], (u16)m_vp[3]);
 
     /* GL clips drawing to the frame buffer's logical size; with scissor on, to the scissor box */
     Tex *c = tex(f.color);
@@ -2409,12 +2724,18 @@ bool ContextImplPica::applyState(bool depth_allowed)
         if (x1 <= x0 || y1 <= y0)
             return false;
     }
-    pica_scissor(GPU_SCISSOR_NORMAL, (u16)x0, (u16)y0, (u16)x1, (u16)y1);
+    if (turned())
+        pica_scissor(GPU_SCISSOR_NORMAL, (u16)y0, (u16)(WINDOW_W - x1), (u16)y1, (u16)(WINDOW_W - x0));
+    else
+        pica_scissor(GPU_SCISSOR_NORMAL, (u16)x0, (u16)y0, (u16)x1, (u16)y1);
 
     const bool depth = depth_allowed && m_enDepth && f.rt.depth;
     const GPU_TESTFUNC func = m_depthFunc == CMP_LEQUAL ? GPU_LEQUAL : m_depthFunc == CMP_LESS ? GPU_LESS : GPU_ALWAYS;
     pica_depth_test(depth, depth ? func : GPU_ALWAYS, GPU_WRITE_COLOR | ((depth && m_depthWrite) ? GPU_WRITE_DEPTH : 0));
-    pica_depth_map(-1.0f, (depth && m_enPolyOffset) ? k_poly_offset : 0.0f);
+    if (depth && m_depthWrite)
+        if (Tex *d = tex(f.depth))
+            d->zclean = 0;
+    pica_depth_map(k_depth_scale, (depth && m_enPolyOffset) ? k_poly_offset : 0.0f);
 
     /* Measured against GLideN64's GL output: for the same window coordinates the PICA's cull
      * modes select the opposite winding to GL's (GL culls back = clockwise faces here). */
@@ -2529,7 +2850,7 @@ void ContextImplPica::bindUnit(int unit, bool n64_filter)
             pica_texture(unit, NULL, 0, 0, GPU_RGBA8, 0);
             return;
         }
-        pica_texture(unit, sh, pot(t->tw), t->th, t->fmt, param);
+        pica_texture(unit, sh, pot(t->tw), pot(t->th), t->fmt, param);
     } else {
         pica_texture(unit, t->data, t->tw, t->th, t->fmt, param);
     }
@@ -2559,11 +2880,11 @@ static const unsigned k_shadows_per_size = 3;
 
 void *ContextImplPica::shadowOf(u32 id, Tex &t, bool &copied, TileRect need, const void *avoid)
 {
-    const u16 sw = pot(t.tw);
+    const u16 sw = pot(t.tw), sh = pot(t.th);
     Shadow *s = nullptr, *lru = nullptr;
     unsigned nsize = 0;
     for (Shadow &x : m_shadows) {
-        if (x.tw != sw || x.th != t.th || x.bpp != t.bpp)
+        if (x.tw != sw || x.th != sh || x.bpp != t.bpp)
             continue;
         nsize++;
         if (x.owner == id && x.p != avoid) {
@@ -2576,7 +2897,7 @@ void *ContextImplPica::shadowOf(u32 id, Tex &t, bool &copied, TileRect need, con
     if (!s && lru && nsize >= k_shadows_per_size)
         s = lru;
     if (!s) {
-        const u32 bytes = (u32)sw * t.th * t.bpp;
+        const u32 bytes = (u32)sw * sh * t.bpp;
         void *p = linear_alloc_safe(bytes, 0x80);
         if (!p)
             p = ctr64_xlinear_alloc(bytes, 0x80);
@@ -2588,7 +2909,7 @@ void *ContextImplPica::shadowOf(u32 id, Tex &t, bool &copied, TileRect need, con
             memset(p, 0, bytes);
             pica_cache_flush(p, bytes);
             ctr64_gfx_mem[0] += bytes;
-            m_shadows.push_back(Shadow{p, sw, t.th, t.bpp, 0, 0, nullptr, 0, {}, 0});
+            m_shadows.push_back(Shadow{p, sw, sh, t.bpp, 0, 0, nullptr, 0, {}, 0});
             s = &m_shadows.back();
         }
     }
@@ -2642,7 +2963,7 @@ void *ContextImplPica::shadowOf(u32 id, Tex &t, bool &copied, TileRect need, con
     if (shadowDraw(s->p, sw, t, need)) {
         ctr64_gfx_shadow[4]++;
     } else {
-        pica_copy_rect(static_cast<u8 *>(s->p) + need.r0 * out + need.c0 * tile,
+        pica_copy_rect(static_cast<u8 *>(s->p) + (need.r0 + (sh - t.th) / 8) * out + need.c0 * tile,
                        static_cast<const u8 *>(t.data) + need.r0 * run + need.c0 * tile, chunk * nrows, chunk / 16,
                        (run - chunk) / 16, (out - chunk) / 16);
         ctr64_gfx_shadow[3]++;
@@ -2774,9 +3095,11 @@ int ContextImplPica::shadowDrawTest()
     return result;
 }
 
-bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
+/* th16: dst is storage of sw x th16 in 16 bits that takes the whole texture (convert16) */
+bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need, u16 th16)
 {
-    if (g_noshdraw || t.bpp != 4 || t.fmt != GPU_RGBA8 || !m_shader.vertexShader || sw > 1024 || t.th > 1024)
+    const u32 bpp = t.bpp;
+    if (g_noshdraw || (t.fmt != GPU_RGBA8 && t.fmt != GPU_RGBA5551) || !m_shader.vertexShader || sw > 1024 || t.th > 1024)
         return false;
     /* the test needs ~450 KB of linear memory at once: Banjo-Tooie had none free at its first
      * copy, and the draws stayed off for the session (82 transfer jobs a second). Without the
@@ -2794,7 +3117,7 @@ bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
         return false;
     /* big copies stay transfers: drawing 1.5 MB into the shadow (FCRAM) took longer on hardware
      * than the transfer job (Mario Tennis whole-frame copies, 2026-11-19: 50 -> 40 VI/s) */
-    if (m_shdrawState == 2 && (u32)(need.c1 - need.c0) * (need.r1 - need.r0) * 256u > k_shdraw_max_bytes)
+    if (!th16 && m_shdrawState == 2 && (u32)(need.c1 - need.c0) * (need.r1 - need.r0) * 64u * bpp > k_shdraw_max_bytes)
         return false;
     const u32 tiles = t.tw / 8;
     u32 k = tiles & (0u - tiles);
@@ -2829,7 +3152,8 @@ bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
     if (!v)
         return false;
 
-    const float sx = 2.0f / sw, sy = 2.0f / t.th;
+    const u16 sh = th16 ? th16 : pot(t.th); /* the shadow's rows: storage row r of the source is its row r + sh - th */
+    const float sx = 2.0f / sw, sy = 2.0f / sh;
     u32 q = 0;
     for (u32 r = need.r0; r < need.r1; r++) {
         const u32 base = need.r0 + (r - need.r0) / rpc * rpc;          /* first row of its draw */
@@ -2865,7 +3189,7 @@ bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
          * through a texture of another width and reads stale memory; a transfer of the rows
          * writes them back first (the hardware reads memory) */
         static u8 *fl;
-        const u32 run0 = (u32)t.tw * 8 * 4, fb = run0 * (t.th / 8);
+        const u32 run0 = (u32)t.tw * 8 * bpp, fb = run0 * (t.th / 8);
         static u32 fl_bytes;
         if (fl_bytes < fb) {
             if (fl)
@@ -2889,10 +3213,10 @@ bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
     rt.color = dst;
     rt.depth = nullptr;
     rt.width = sw;
-    rt.height = t.th;
-    rt.color_fmt = GPU_RB_RGBA8;
+    rt.height = sh;
+    rt.color_fmt = th16 || t.fmt == GPU_RGBA5551 ? GPU_RB_RGBA5551 : GPU_RB_RGBA8;
     pica_bind_target(&rt); /* flushes what the draws so far left in the framebuffer cache */
-    pica_viewport(0, 0, sw, t.th);
+    pica_viewport(0, 0, sw, sh);
     pica_scissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
     pica_depth_test(false, GPU_ALWAYS, GPU_WRITE_COLOR);
     pica_depth_map(-1.0f, 0.0f);
@@ -2910,11 +3234,11 @@ bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
         pica_tev(i, &tev);
     pica_texture(1, NULL, 0, 0, GPU_RGBA8, 0);
     pica_texture(2, NULL, 0, 0, GPU_RGBA8, 0);
-    const u32 run = (u32)t.tw * 8 * 4;
+    const u32 run = (u32)t.tw * 8 * bpp;
     for (u32 d = 0; d < draws; d++) {
         const u32 r0 = need.r0 + d * rpc, n_in = need.r1 - r0 < rpc ? need.r1 - r0 : rpc;
         const u32 htex = pot(n_in * parts * 8);
-        pica_texture(0, static_cast<const u8 *>(t.data) + r0 * run, (u16)W, (u16)htex, GPU_RGBA8,
+        pica_texture(0, static_cast<const u8 *>(t.data) + r0 * run, (u16)W, (u16)htex, t.fmt,
                      GPU_TEXTURE_MAG_FILTER(GPU_NEAREST) | GPU_TEXTURE_MIN_FILTER(GPU_NEAREST) |
                          GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE));
         pica_texture_flush_cache(); /* the source was drawn into */
@@ -2924,10 +3248,10 @@ bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
     }
     pica_state_restore();
 
-    if (g_shcheck) { /* Azahar: the same rectangle by the transfer engine, compared */
+    if (g_shcheck && !th16) { /* Azahar: the same rectangle by the transfer engine, compared */
         static u8 *chk;
         static u32 chk_bytes;
-        const u32 out = (u32)sw * 8 * 4, bytes = out * (t.th / 8);
+        const u32 out = (u32)sw * 8 * bpp, bytes = out * (t.th / 8), dr = (sh - t.th) / 8u * out;
         if (chk_bytes < 2 * bytes) {
             if (chk)
                 linearFree(chk);
@@ -2935,14 +3259,14 @@ bool ContextImplPica::shadowDraw(void *dst, u16 sw, const Tex &t, TileRect need)
             chk_bytes = chk ? 2 * bytes : 0;
         }
         if (chk) {
-            const u32 tile = 64u * 4, chunk = (u32)(need.c1 - need.c0) * tile;
+            const u32 tile = 64u * bpp, chunk = (u32)(need.c1 - need.c0) * tile;
             pica_copy_rect(chk + need.r0 * out + need.c0 * tile,
                            static_cast<const u8 *>(t.data) + need.r0 * run + need.c0 * tile, chunk * rows, chunk / 16,
                            (run - chunk) / 16, (out - chunk) / 16);
             /* the draw's result read back the same way (Azahar keeps drawn surfaces on the host
              * until a transfer reads them) */
             u8 *const got = chk + bytes;
-            pica_copy_rect(got + need.r0 * out + need.c0 * tile, static_cast<const u8 *>(dst) + need.r0 * out + need.c0 * tile,
+            pica_copy_rect(got + need.r0 * out + need.c0 * tile, static_cast<const u8 *>(dst) + dr + need.r0 * out + need.c0 * tile,
                            chunk * rows, chunk / 16, (out - chunk) / 16, (out - chunk) / 16);
             pica_wait_idle();
             pica_cache_invalidate(chk, bytes);
@@ -3079,7 +3403,7 @@ void log_draw(const char *what, const CombinerProgram *prog, int kind, const GVt
             gDP.envColor.r, gDP.envColor.g, gDP.envColor.b, gDP.envColor.a);
     /* addresses: color image, depth image, and texture 0 (fb: a frame buffer texture) */
     const CachedTexture *t0 = textureCache().current[0];
-    fprintf(f, "  clamp %d non %d zbuf %d\n", g_ctx ? (int)g_ctx->getClampMode() : -1, (int)GBI.isNoN(),
+    fprintf(f, "  z %g w %g clamp %d non %d zbuf %d\n", (double)v[0].z, (double)v[0].w, g_ctx ? (int)g_ctx->getClampMode() : -1, (int)GBI.isNoN(),
             (int)((gSP.geometryMode & G_ZBUFFER) != 0));
     fprintf(f, "  ci %08x zi %08x t0 %08x fb %d\n", (unsigned)gDP.colorImage.address, (unsigned)gDP.depthImageAddress,
             t0 ? (unsigned)t0->address : 0u, t0 ? (int)t0->frameBufferTexture : -1);
@@ -3452,10 +3776,10 @@ void ContextImplPica::texture_xforms(TexXform tx[2])
                     /* a frame buffer: cache scale = render scale / width, so u * cs * width is the
                      * storage texel (twice u when rendering at 2x) */
                     x.rs = float(ct->width) / sample_w(*p);
-                    x.rt = float(ct->height) / p->th;
+                    x.rt = float(ct->height) / sample_h(*p);
                 } else {
                     x.rs = 1.0f / (x.cs * sample_w(*p));
-                    x.rt = 1.0f / (x.ct * p->th);
+                    x.rt = 1.0f / (x.ct * sample_h(*p));
                 }
             }
     }
@@ -3710,11 +4034,15 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
     const int fogUsage = fog_usage();
     const float fogMul = gSP.fog.multiplierf, fogOff = gSP.fog.offsetf;
     const bool clampZ = m_clamp != ClampMode::ClippingEnabled;
+    /* microcodes without near clipping (NoN) clip at the far plane still, which the GPU does
+     * (Pilotwings: the far part of an ocean triangle floated in the sky, clamped instead) */
+    const bool clampFar = m_clamp == ClampMode::NoClipping;
     TexXform tx[2];
     texture_xforms(tx);
     const bool persp = (RSP.LLE || GBI.isTexturePersp()) ? gDP.otherMode.texturePersp != 0 : true;
     const float tscale_s = gSP.texture.scales, tscale_t = gSP.texture.scalet;
 
+    const ViewportZ vpz;
     bool wPos = true; /* every converted vertex in front of the eye (projective draws) */
     Ctr64ProfScope vtx_scope(33);
     for (u32 i = 0; i < p.verticesCount; i++) {
@@ -3740,10 +4068,10 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
         y += offset * w;
         o.x = (x - 0.5f * SCREEN_SIZE_DIM * w) / (0.5f * SCREEN_SIZE_DIM);
         o.y = (y - 0.5f * SCREEN_SIZE_DIM * w) / (0.5f * SCREEN_SIZE_DIM);
-        float zp = -0.5f * (z + w);
+        float zp = vpz.set ? -(z * vpz.a + w * vpz.b) : -0.5f * (z + w);
         if (clampZ) {
             if (zp > 0.0f) zp = 0.0f;
-            if (zp < -w) zp = -w;
+            if (zp < -w && (clampFar || zp >= -1.0005f * w)) zp = -w; /* at the plane (skies): kept, rounding or not */
         }
         o.z = zp;
         o.w = w;
@@ -3816,21 +4144,11 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
      * instead (pica_projective: the GPU interpolates colour linearly on screen, exactly, and
      * texture 0 stays perspective-correct), with no subdivision. */
     bool proj = false;
-    /* A see-through overlay drawn over geometry already in the Z buffer, with its z compared and
-     * not written (N64 Z mode "transparent"): Conker's and Mario Tennis's character shadows are
-     * the ground's own triangles again, textured with the shadow image. The N64 gets the same z
-     * both times; here the ground went through other paths (shade subdivision, projective) and
-     * its depth came out a hair nearer, so the shadow failed the test: gone (Azahar) or in
-     * fragments (HW). It gets a small fixed depth offset (k_overlay_offset) and the decals'
-     * path. Dev switch nooverlayoff.txt: off. */
-    const bool overlay = m_enDepth && !m_depthWrite && !g_nooverlayoff && gDP.otherMode.depthCompare != 0 &&
-                         gDP.otherMode.depthUpdate == 0 && gDP.otherMode.depthMode == 2;
-    const bool zoffset = m_enDepth && (m_enPolyOffset || overlay);
     /* not for decals (polygon offset): the shader's z / w in 24-bit floats loses the few depth
      * units the offset gives them, so shadows on the ground z-fought into fragments (Mario
      * Tennis on the court, Conker; Azahar and HW 2026-11-18) */
     if (mode == DM_TRIANGLES && m_kind == Kind::Combiner && m_program && !g_noshadelin && !g_noproj && wPos &&
-        !zoffset &&
+        !(m_enDepth && m_enPolyOffset) &&
         pica_proj_bool_bit >= 0 && m_program->usesShade() &&
         !static_cast<const PicaCombinerProgram *>(m_program)->tev().uses_tex[1])
         proj = true;
@@ -3885,10 +4203,9 @@ void ContextImplPica::drawTriangles(const Context::DrawTriangleParameters &p)
             memcpy(idx, elements, elementsCount * 2);
         }
     }
-    if (zoffset && !m_enPolyOffset)
-        pica_depth_map(-1.0f, k_overlay_offset);
     if (m_enPolyOffset && m_enDepth)
-        pica_depth_map(-1.0f, poly_offset_for_draw(v, idx, idx ? elementsCount : count, prim_type));
+        pica_depth_map(k_depth_scale, poly_offset_for_draw(v, idx, idx ? elementsCount : count, prim_type));
+    turnVertices(v, count);
     pica_projective(proj);
     CRUMB("gfx: tri draw");
     if (idx)
@@ -4099,7 +4416,24 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
     if (!p.vertices || !p.verticesCount || m_kind == Kind::Noop || skipDraw())
         return;
     const bool special = m_kind != Kind::Combiner;
-    if (!applyState(!special)) {
+    {   /* the rows it reaches (materialize) */
+        float top = 0.0f;
+        for (u32 i = 0; i < p.verticesCount; i++) {
+            const RectVertex &r = p.vertices[i];
+            if (r.w <= 0.0f) {
+                top = 1e9f;
+                break;
+            }
+            const float n = special ? (r.y / r.w + 1.0f) * 0.5f : (r.y / r.w + 0.5f) / SCREEN_SIZE_DIM;
+            top = std::max(top, (float)m_vp[1] + n * (float)m_vp[3]);
+        }
+        if (m_enScissor)
+            top = std::min(top, (float)(m_sc[1] + m_sc[3]));
+        m_drawTop = top < 2048.0f ? (u16)(top + 1.0f) : 0xFFFF;
+    }
+    const bool ready = applyState(!special);
+    m_drawTop = 0xFFFF;
+    if (!ready) {
         ctr64_gfx_stats[ST_DROP]++;
         return;
     }
@@ -4152,9 +4486,9 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
     /* Texture coordinates are normalized to the logical texture size; scale them into storage. */
     float ss0 = 1.0f, st0 = 1.0f, ss1 = 1.0f, st1 = 1.0f;
     if (Tex *t = tex(m_unit[0]))
-        if (t->tw) { ss0 = (float)t->w / sample_w(*t); st0 = (float)t->h / t->th; }
+        if (t->tw) { ss0 = (float)t->w / sample_w(*t); st0 = (float)t->h / sample_h(*t); }
     if (Tex *t = tex(m_unit[1]))
-        if (t->tw) { ss1 = (float)t->w / sample_w(*t); st1 = (float)t->h / t->th; }
+        if (t->tw) { ss1 = (float)t->w / sample_w(*t); st1 = (float)t->h / sample_h(*t); }
     /* N64 texture rectangles: coordinates come normalised by GLideN64's cache scale, which is
      * 1/pow2(width) with a wrap mask (MK64's title: 320-texel strips, mask 512), so texel u is at
      * u * scale; normalise by the storage size as for triangles (texture_xforms) */
@@ -4167,11 +4501,11 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
                 continue;
             if (ct->frameBufferTexture != CachedTexture::fbNone) { /* see texture_xforms */
                 (u ? ss1 : ss0) = float(ct->width) / sample_w(*t);
-                (u ? st1 : st0) = float(ct->height) / t->th;
+                (u ? st1 : st0) = float(ct->height) / sample_h(*t);
                 continue;
             }
             (u ? ss1 : ss0) = 1.0f / (ct->scaleS * sample_w(*t));
-            (u ? st1 : st0) = 1.0f / (ct->scaleT * t->th);
+            (u ? st1 : st0) = 1.0f / (ct->scaleT * sample_h(*t));
         }
     }
 
@@ -4179,6 +4513,7 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
     const float offset = (config.generalEmulation.enableInaccurateTextureCoordinates == 0 && native) ? 0.5f : 0.0f;
     const u8 rc[4] = {to_u8(gDP.rectColor.r), to_u8(gDP.rectColor.g), to_u8(gDP.rectColor.b), to_u8(gDP.rectColor.a)};
 
+    const ViewportZ vpz;
     for (u32 i = 0; i < p.verticesCount; i++) {
         const RectVertex &s = p.vertices[i];
         GVtx &o = v[i];
@@ -4190,7 +4525,7 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
         }
         o.x = x;
         o.y = y;
-        o.z = -0.5f * (s.z + w);
+        o.z = vpz.set && !special ? -(s.z * vpz.a + w * vpz.b) : -0.5f * (s.z + w);
         o.w = w;
         memcpy(o.c, special ? (const u8[4]){255, 255, 255, 255} : rc, 4);
         /* + 0.0001: ShaderFragmentCorrectTexCoords */
@@ -4204,6 +4539,7 @@ void ContextImplPica::drawRects(const Context::DrawRectParameters &p)
     if (!special)
         noteCoverage(v, p.verticesCount);
     noteDrawnRows(v, p.verticesCount);
+    turnVertices(v, p.verticesCount);
     pica_vertex_buffer(v);
     const u32 mode = u32(p.mode);
     pica_draw_arrays(mode == DM_TRIANGLES ? GPU_TRIANGLES : mode == DM_TRIANGLE_FAN ? GPU_TRIANGLE_FAN : GPU_TRIANGLE_STRIP,
@@ -4239,9 +4575,9 @@ void ContextImplPica::clipRect(GVtx *v, u32 n)
     /* the target plus 16 pixels around it, in clip space (x = ndc * w) */
     const float m = 16.0f;
     const float cx0 = ((-m - m_vp[0]) / m_vp[2] * 2.0f - 1.0f) * w;
-    const float cx1 = (((float)d->tw + m - m_vp[0]) / m_vp[2] * 2.0f - 1.0f) * w;
+    const float cx1 = (((float)(turned() ? d->w : d->tw) + m - m_vp[0]) / m_vp[2] * 2.0f - 1.0f) * w;
     const float cy0 = ((-m - m_vp[1]) / m_vp[3] * 2.0f - 1.0f) * w;
-    const float cy1 = (((float)d->th + m - m_vp[1]) / m_vp[3] * 2.0f - 1.0f) * w;
+    const float cy1 = (((float)(turned() ? d->h : d->th) + m - m_vp[1]) / m_vp[3] * 2.0f - 1.0f) * w;
     if (x0 >= cx0 && x1 <= cx1 && y0 >= cy0 && y1 <= cy1)
         return;
     /* the corners: each at x0 or x1 and y0 or y1 */
@@ -4305,13 +4641,13 @@ void ContextImplPica::gtDraw(int kind)
  * Dev switch noxfercopy.txt: off. */
 bool ContextImplPica::copyByTransfer(const Context::DrawRectParameters &p)
 {
-    if (!m_xferCopy || p.verticesCount != 4 || m_enBlend || m_enDepth)
+    if (!m_xferCopy || p.verticesCount != 4 || m_enBlend || m_enDepth || turned())
         return false;
     CRUMB("gfx: copyByTransfer");
     Tex *s = tex(m_unit[0]);
     Tex *d = tex(drawFbo().color);
-    if (!s || !d || s == d || !s->data || !d->data || s->depth || d->depth || s->fmt != GPU_RGBA8 ||
-        d->fmt != GPU_RGBA8 || !needs_shadow(*s))
+    if (!s || !d || s == d || !s->data || !d->data || s->depth || d->depth || s->fmt != d->fmt ||
+        (d->fmt != GPU_RGBA8 && d->fmt != GPU_RGBA5551) || !needs_shadow(*s))
         return false;
     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, s0 = 1e9f, s1 = -1e9f, t0 = 1e9f, t1 = -1e9f;
     for (u32 i = 0; i < 4; i++) {
@@ -4349,7 +4685,7 @@ bool ContextImplPica::copyByTransfer(const Context::DrawRectParameters &p)
         return false;
     if (m_enScissor && (m_sc[0] > dx0 || m_sc[1] > dy0 || m_sc[0] + m_sc[2] < dx1 || m_sc[1] + m_sc[3] < dy1))
         return false;
-    const u32 bytes = (u32)w * h * 4;
+    const u32 bpp = d->bpp, bytes = (u32)w * h * bpp;
     const bool direct = dx0 == 0 && w == d->tw;
     for (int k = 0; k < (direct ? 1 : 2); k++)
         if (m_xferTempBytes[k] < bytes) {
@@ -4364,16 +4700,17 @@ bool ContextImplPica::copyByTransfer(const Context::DrawRectParameters &p)
             m_xferTempBytes[k] = m_xferTemp[k] ? bytes : 0;
             if (!m_xferTemp[k])
                 return false;
+            pica_cache_flush(m_xferTemp[k], bytes); /* no dirty CPU lines of its last owner left */
             ctr64_gfx_mem[0] += bytes;
         }
-    const u8 *src = static_cast<const u8 *>(s->data) + (size_t)r0 * s->tw * 4;
-    u8 *dst = static_cast<u8 *>(d->data) + (size_t)q0 * d->tw * 4 + (size_t)(dx0 / 8) * 64 * 4;
-    pica_downscale2_rgba8(src, s->tw, (u16)(2 * h), m_xferTemp[0]);
+    const u8 *src = static_cast<const u8 *>(s->data) + (size_t)r0 * s->tw * bpp;
+    u8 *dst = static_cast<u8 *>(d->data) + (size_t)q0 * d->tw * bpp + (size_t)(dx0 / 8) * 64 * bpp;
+    pica_downscale2(src, s->tw, (u16)(2 * h), m_xferTemp[0], bpp);
     if (direct) {
-        pica_tile_rgba8(m_xferTemp[0], (u16)w, (u16)h, dst);
+        pica_tile(m_xferTemp[0], (u16)w, (u16)h, dst, bpp);
     } else {
-        pica_tile_rgba8(m_xferTemp[0], (u16)w, (u16)h, m_xferTemp[1]);
-        pica_copy_gap(dst, m_xferTemp[1], bytes, (u32)w * 8 * 4 / 16, (u32)(d->tw - w) * 8 * 4 / 16);
+        pica_tile(m_xferTemp[0], (u16)w, (u16)h, m_xferTemp[1], bpp);
+        pica_copy_gap(dst, m_xferTemp[1], bytes, (u32)w * 8 * bpp / 16, (u32)(d->tw - w) * 8 * bpp / 16);
     }
     s->used_frame = pica_frame_number();
     ctr64_gfx_shadow[2]++;
@@ -4403,7 +4740,7 @@ static bool dump_wanted(u32 swap)
     return false;
 }
 
-static void write_tga(const Tex &t0, const char *path)
+static void write_tga(const Tex &t0, const char *path, bool is_turned = false)
 {
     if (!t0.data || t0.depth)
         return;
@@ -4412,7 +4749,7 @@ static void write_tga(const Tex &t0, const char *path)
     Tex t = t0;
     void *lin = nullptr;
     if (t0.vram) {
-        const u32 bytes = (u32)t0.tw * t0.th * 4;
+        const u32 bytes = (u32)t0.tw * t0.th * t0.bpp;
         CRUMB("dump: linearAlloc");
         lin = linearAlloc(bytes);
         if (!lin) /* the linear heap can be full (Goemon with nonpot.txt: 256 KB left): the reserve */
@@ -4442,7 +4779,7 @@ static void write_tga(const Tex &t0, const char *path)
     u8 *d = buf + 18;
     for (u32 y = 0; y < t.h; y++)
         for (u32 x = 0; x < t.w; x++, d += 4) {
-            u32 v = load_texel(t, gl_index(x, y, t.tw, t.th));
+            u32 v = load_texel(t, is_turned ? gl_index(y, t.th - 1 - x, t.tw, t.th) : gl_index(x, y, t.tw, t.th));
             d[0] = v >> 8; d[1] = v >> 16; d[2] = v >> 24; d[3] = v; /* BGRA */
         }
     CRUMB("dump: hand over");
@@ -4470,6 +4807,7 @@ void ContextImplPica::present()
     if (m_winClear && !stale && !same)
         clearTarget(m_window, m_winClearColor);
     m_winClear = false;
+    pica_lcd_gamma((*REG.VI_STATUS & 0x08) != 0); /* VI_STATUS_GAMMA_ENABLED */
     if (!ctr64_frameskip_present(stale) || same)
         return; /* the window holds a buffer with dropped draws or the image on screen: it stays */
     m_shown = copies == 1 ? src : 0;
@@ -4477,24 +4815,44 @@ void ContextImplPica::present()
         t->drawn = false;
     if (m_rtLog)
         fprintf(m_rtLog, "P %u:", (unsigned)pica_frame_number());
+    u32 rt_pot = 0;
     for (auto &kv : m_tex) {
         Tex &t = kv.second;
         if (m_rtLog && t.rt && t.data && (t.ndraw || t.draw_frame + 1 >= pica_frame_number()))
             fprintf(m_rtLog, " %u%s %ux%u/%ux%u %s n%u s%u", (unsigned)kv.first, t.depth ? "d" : "c", t.w, t.h, t.tw, t.th,
                     t.vram ? "V" : "F", (unsigned)t.ndraw, (unsigned)t.nshadow);
+        if (t.rt && t.data && t.draw_frame + 8 >= pica_frame_number())
+            rt_pot += (u32)pot(t.tw) * pot(t.th) * (t.depth ? 4 : t.bpp);
         t.nshadow = 0;
         if (t.ndraw)
             t.ndraw_last = t.ndraw;
         t.ndraw = 0;
     }
+    if (m_rtLog && pica_frame_number() % 64 == 0) /* the VRAM's map */
+        for (auto &kv : m_tex)
+            if (kv.second.vram && kv.second.data)
+                fprintf(m_rtLog, "\n  V %u%s %ux%u at %06lx size %lu rt %d", (unsigned)kv.first, kv.second.depth ? "d" : "c", kv.second.tw,
+                        kv.second.th, (unsigned long)((u32)kv.second.data & 0xFFFFFF), (unsigned long)storageBytes(kv.second),
+                        (int)kv.second.rt);
     if (m_rtLog) {
         fprintf(m_rtLog, " | moves %u/%u KB, shadow copies %u (%u KB), transfer copies %u\n", ctr64_gfx_vram_moves[0],
                 ctr64_gfx_vram_moves[1], ctr64_gfx_shadow[0], ctr64_gfx_shadow[1], ctr64_gfx_shadow[2]);
         fflush(m_rtLog);
     }
+    g_rt_pot_bytes = rt_pot;
+    if (!g_fb16 && !g_nofb16 && ++g_fb16_presents >= 64) { /* VRAM too small for the game's targets? */
+        g_fb16_runs = g_fb16_moved > k_fb16_kb ? g_fb16_runs + 1 : 0;
+        g_fb16 = g_fb16_runs >= 2;
+        g_fb16_moved = 0;
+        g_fb16_presents = 0;
+    }
     ctr64_gfx_stats[ST_SWAP]++;
     ensureFrame();
     Tex *c = tex(TEX_WINDOW_COLOR);
+    if (m_winRot) {
+        video_present_target(&m_window.rt);
+        return;
+    }
     pica_texture_flush_cache();
     video_draw_fullscreen(c->data, c->tw, c->th, GPU_RGBA8, c->w, c->h, false, true);
     video_present();
@@ -4516,7 +4874,7 @@ void ContextImplPica::endVI()
         pica_wait_idle();
         char path[64];
         snprintf(path, sizeof(path), "sdmc:/3ds/ctr64/frame_%u.tga", (unsigned)vi);
-        write_tga(*c, path);
+        write_tga(*c, path, m_winRot);
         { /* the top screen buffer transferred last, as the LCD shows it (BGR8, 240x400 columns):
            * frame_<n>_top.raw; tools/remote ctr64remote.py lcd_png converts it */
             unsigned bytes = 0;
@@ -4557,7 +4915,16 @@ void ContextImplPica::endVI()
             pica_wait_fence(fence); /* queued a VI ago: done by now */
             pica_cache_invalidate(lin, lin_bytes);
             /* tiled row 0 is the top (gl_index): the image's top row is tiled row th - h */
-            prof_shot(vi - 1, lin + (size_t)(c->th - c->h) * c->tw * 4, c->tw);
+            if (m_winRot) { /* stored turned: column x of the picture is row x, bottom first */
+                static std::vector<u32> up;
+                up.resize(WINDOW_W * WINDOW_H);
+                const u32 *l = reinterpret_cast<const u32 *>(lin);
+                for (u32 y = 0; y < WINDOW_H; y++)
+                    for (u32 x = 0; x < WINDOW_W; x++)
+                        up[y * WINDOW_W + x] = l[x * WINDOW_H + (WINDOW_H - 1 - y)];
+                prof_shot(vi - 1, reinterpret_cast<u8 *>(up.data()), WINDOW_W);
+            } else
+                prof_shot(vi - 1, lin + (size_t)(c->th - c->h) * c->tw * 4, c->tw);
             linearFree(lin);
             lin = nullptr;
         }
@@ -4566,7 +4933,7 @@ void ContextImplPica::endVI()
             lin = (u8 *)linearAlloc(lin_bytes);
             if (lin) {
                 ensureFrame();
-                pica_untile_rgba8_async(c->data, c->tw, c->th, lin);
+                pica_untile_async(c->data, c->tw, c->th, lin, 4);
                 fence = pica_fence();
             }
         }
@@ -4586,6 +4953,10 @@ void ContextImplPica::endVI()
     if ((int)vi == freeze_at)
         while (aptMainLoop()) {
             ensureFrame();
+            if (m_winRot) {
+                video_present_target(&m_window.rt);
+                continue;
+            }
             video_draw_fullscreen(c->data, c->tw, c->th, GPU_RGBA8, c->w, c->h, false, true);
             video_present();
         }
@@ -4607,11 +4978,12 @@ static inline u16 to_rgba5551(u32 v) /* 0xRRGGBBAA */
  * rows th-y0-h..th-1-y0) into linear memory; false if this read can't take that path */
 static bool plan_read(const Tex *t, s32 x0, s32 y0, u32 w, u32 h, ReadJob &j)
 {
-    if (!t || !t->data || t->depth || t->fmt != GPU_RGBA8 || x0 < 0 || y0 < 0 || (u32)x0 >= t->tw ||
+    if (!t || !t->data || t->depth || (t->fmt != GPU_RGBA8 && t->fmt != GPU_RGBA5551) || x0 < 0 || y0 < 0 || (u32)x0 >= t->tw ||
         (u32)y0 >= t->th)
         return false;
     j.x0 = x0; j.y0 = y0; j.w = w; j.h = h;
     j.tw = t->tw; j.th = t->th;
+    j.bpp = t->bpp;
     j.hh = std::min<u32>(h, t->th - y0);
     j.ww = std::min<u32>(w, t->tw - x0);
     j.s0 = (t->th - y0 - j.hh) & ~7u;
@@ -4623,12 +4995,12 @@ static bool plan_read(const Tex *t, s32 x0, s32 y0, u32 w, u32 h, ReadJob &j)
 
 static size_t read_bytes(const ReadJob &j)
 {
-    return (size_t)j.tw * (j.s1 - j.s0) * 4;
+    return (size_t)j.tw * (j.s1 - j.s0) * j.bpp;
 }
 
 static void queue_untile(const Tex *t, const ReadJob &j, u32 *lin)
 {
-    pica_untile_rgba8_async(static_cast<const u8 *>(t->data) + (size_t)j.s0 * j.tw * 4, j.tw, j.s1 - j.s0, lin);
+    pica_untile_async(static_cast<const u8 *>(t->data) + (size_t)j.s0 * j.tw * j.bpp, j.tw, j.s1 - j.s0, lin, j.bpp);
 }
 
 /* The untiled strips in lin to GLideN64's layout (w*h, RGBA5551 or R,G,B,A bytes, rows from y0) */
@@ -4636,6 +5008,29 @@ static const u8 *convert_read(const u32 *lin, const ReadJob &j, std::vector<u8> 
 {
     CTR64_PROF(21);
     const u32 w = j.w;
+    if (j.bpp == 2) { /* 16-bit frame buffer: the N64's own layout (Paper Mario's blue + 4 of 255
+                       * moves a 5-bit value up by less than one step: 0x1E stays, nothing to do) */
+        const u16 *l = reinterpret_cast<const u16 *>(lin);
+        out.resize((size_t)w * j.h * (j.rgba16 ? 2 : 4));
+        for (u32 y = 0; y < j.hh; y++) {
+            const u16 *src = l + (size_t)(j.th - 1 - j.y0 - y - j.s0) * j.tw + j.x0;
+            if (j.rgba16) {
+                u16 *dst = reinterpret_cast<u16 *>(&out[(size_t)y * w * 2]);
+                memcpy(dst, src, j.ww * 2);
+                std::fill(dst + j.ww, dst + w, (u16)0);
+            } else {
+                u32 *dst = reinterpret_cast<u32 *>(&out[(size_t)y * w * 4]);
+                for (u32 x = 0; x < j.ww; x++) {
+                    const u32 v = src[x];
+                    dst[x] = expand5(v >> 11) | expand5((v >> 6) & 31) << 8 | expand5((v >> 1) & 31) << 16 |
+                             (0u - (v & 1)) << 24;
+                }
+                std::fill(dst + j.ww, dst + w, 0u);
+            }
+        }
+        std::fill(out.begin() + (size_t)j.hh * w * (j.rgba16 ? 2 : 4), out.end(), 0);
+        return out.data();
+    }
     if (j.rgba16) {
         out.resize((size_t)w * j.h * 2);
         for (u32 y = 0; y < j.hh; y++) {
@@ -4679,6 +5074,8 @@ bool AsyncReadback::reserve(size_t need)
         linearFree(lin);
     lin = static_cast<u32 *>(linear_alloc_safe((u32)need, 128));
     bytes = lin ? need : 0;
+    if (lin) /* no dirty CPU lines of its last owner left to overwrite what the GPU writes */
+        pica_cache_flush(lin, (u32)need);
     return lin != nullptr;
 }
 
@@ -4707,6 +5104,8 @@ const u8 *ContextImplPica::readTextureAsync(CachedTexture *ct, s32 x0, s32 y0, u
 {
     CTR64_PROF(19);
     Tex *t = ct ? tex(u32(ct->name)) : nullptr;
+    if (t && t->th_full)
+        growStorage(u32(ct->name)); /* short storage: all of it is wanted */
     ReadJob j;
     if (!plan_read(t, x0, y0, w, h, j)) {
         a.finish();
@@ -4719,7 +5118,7 @@ const u8 *ContextImplPica::readTextureAsync(CachedTexture *ct, s32 x0, s32 y0, u
     if (a.pending || a.valid) {
         a.finish();
         const ReadJob &p = a.job;
-        if (a.valid && p.x0 == j.x0 && p.y0 == j.y0 && p.w == j.w && p.h == j.h && p.rgba16 == j.rgba16)
+        if (a.valid && p.x0 == j.x0 && p.y0 == j.y0 && p.w == j.w && p.h == j.h && p.rgba16 == j.rgba16 && p.bpp == j.bpp)
             result = convert_read(a.lin, p, out);
     }
     if (!a.reserve(read_bytes(j))) {
@@ -4743,6 +5142,8 @@ const u8 *ContextImplPica::readTexture(CachedTexture *ct, s32 x0, s32 y0, u32 w,
     CRUMB("gfx: readTexture");
     ctr64_fb_copies++;
     Tex *t = ct ? tex(u32(ct->name)) : nullptr;
+    if (t && t->th_full)
+        growStorage(u32(ct->name)); /* short storage: all of it is wanted */
     const bool rgba16 = g_ctr64ReadRgba16;
     const u32 bpp = rgba16 ? 2 : 4;
     out.resize((size_t)w * h * bpp); /* zeroed below only where nothing is read */
@@ -4790,6 +5191,84 @@ const u8 *ContextImplPica::readTexture(CachedTexture *ct, s32 x0, s32 y0, u32 w,
     return out.data();
 }
 
+/* The depth buffer of a frame buffer into RDRAM as N64 z (GLideN64 copyDepthToRDRAM; Donkey Kong
+ * 64 reads it to see whether Kong is hidden and moves its camera if so). Never waits for the frame
+ * just drawn: the GPU copies it, the copy made a frame earlier is converted now. One sample per
+ * 4x4 N64 pixels; with anti-aliasing (2x) the GPU copies one quarter of each tile only. */
+struct DepthJob {
+    u32 *lin = nullptr;
+    size_t bytes = 0;
+    u64 fence = 0;
+    bool valid = false;
+    u32 key = 0, w = 0, h = 0, sc = 0, cols = 0, s0 = 0, th = 0;
+};
+static DepthJob g_depth_job;
+
+static inline u32 n64_z(u32 v) /* 24 bit depth -> the N64 16 bit format (GLideN64 DepthBufferList LUT) */
+{
+    const u32 i = (v & 0xFFFFFF) >> 6;
+    const u32 e = (u32)__builtin_clz(~(i << 14) | 0x1000000); /* leading ones of the 18 bits, at most 7 */
+    const u32 m = (i >> (6 - (e > 6 ? 6 : e))) & 0x7FF;
+    return (e << 11 | m) << 2;
+}
+
+bool ContextImplPica::depthToRdram(u32 fbo, u32 w, u32 h, u32 sc, u32 key, u16 *dst)
+{
+    CTR64_PROF(19);
+    DepthJob &j = g_depth_job;
+    bool wrote = false;
+    if (j.valid && j.key == key && j.w == w && j.h == h) {
+        pica_wait_fence(j.fence);
+        pica_cache_invalidate(j.lin, (u32)j.bytes);
+        /* N64 row y = GL row y * sc = storage row th - 1 - y * sc */
+        for (u32 y = 0; y < h; y += 4) {
+            const u32 row = j.th - 1 - (y * j.sc + 2 * j.sc - 1), tr = row / 8 - j.s0 / 8;
+            u32 line[640 / 2];
+            for (u32 x = 0; x < w; x += 4) {
+                const u32 px = x * j.sc + 3, tile = tr * j.cols + px / 8;
+                const u32 q = ((row & 7) >> 2) * 2 + ((px & 7) >> 2);
+                const u32 z = n64_z(j.lin[j.sc == 1 ? tile * 64 + q * 16 + 12 : tile * 16]);
+                line[x / 2] = line[x / 2 + 1] = z << 16 | z;
+            }
+            for (u32 k = 0; k < 4 && y + k < h; k++)
+                memcpy(dst + (size_t)(y + k) * w, line, w * 2);
+        }
+        wrote = true;
+    }
+    j.valid = false;
+    auto it = m_fbo.find(fbo);
+    if (it == m_fbo.end())
+        return wrote;
+    const Fbo &f = it->second;
+    Tex *c = tex(f.color), *d = tex(f.depth);
+    if (!c || !d || !c->data || !d->data || !d->depth || f.rt.depth != d->data || (sc != 1 && sc != 2) ||
+        w * sc > f.rt.width || h * sc > f.rt.height || w > 640 || (w & 3))
+        return wrote;
+    const u32 tw = f.rt.width, th = f.rt.height, s0 = (th - h * sc) & ~7u;
+    const u32 tiles = (tw / 8) * ((th - s0) / 8), bytes = tiles * (sc == 1 ? 256 : 64);
+    if (j.bytes < bytes) {
+        if (j.lin) {
+            pica_wait_fence(j.fence); /* the GPU must not write into freed memory */
+            linearFree(j.lin);
+        }
+        j.lin = static_cast<u32 *>(linear_alloc_safe(bytes, 128));
+        j.bytes = j.lin ? bytes : 0;
+        if (!j.lin)
+            return wrote;
+        pica_cache_flush(j.lin, bytes);
+    }
+    const u8 *src = static_cast<const u8 *>(d->data) + (size_t)s0 * tw * 4;
+    if (sc == 1)
+        pica_copy_rect(j.lin, src, bytes, bytes / 16, 0, 0);
+    else /* the last 4x4 of each tile: its first texel is the tile's (4, 4) */
+        pica_copy_rect(j.lin, src + 192, bytes, 4, 12, 0);
+    j.fence = pica_fence();
+    j.key = key; j.w = w; j.h = h; j.sc = sc;
+    j.cols = tw / 8; j.s0 = s0; j.th = th;
+    j.valid = true;
+    return wrote;
+}
+
 std::vector<u8> g_readback; /* shared by all PicaColorBufferReaders */
 
 const u8 *PicaColorBufferReader::readPixels(s32 x0, s32 y0, u32 width, u32 height, u32, bool sync)
@@ -4827,6 +5306,12 @@ void presentWindow()
 }
 
 } // namespace pica
+
+/* DepthBufferToRDRAM (GLideN64): see ContextImplPica::depthToRdram */
+extern "C" bool ctr64_depth_to_rdram(unsigned fbo, unsigned w, unsigned h, unsigned scale, unsigned address, unsigned short *dst)
+{
+    return g_ctx && g_ctx->depthToRdram(fbo, w, h, scale, address, dst);
+}
 
 /* the frame number GLideN64 code ages things by (DepthBuffer.cpp evictOld) */
 extern "C" unsigned ctr64_frame_now(void)

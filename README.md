@@ -10,9 +10,9 @@ Basically this project is mupen64plus-next + gliden64 ported to the 3ds with a c
 
 - **New 3DS / New 2DS XL**: what ive tested on. The CPU emulation, video and audio run on the separate
   cores. Several games run at or close to full speed (Super Mario 64, Ocarina of Time, Paper
-  Mario, Super Smash Bros., Mario Kart 64 and others), with optional 2× anti-aliasing. With the
-  CIA even 64 MB games (Conker's Bad Fur Day) are loaded whole into memory; bigger ROM hacks are
-  read from the SD card while they run, as on the Old 3DS below.
+  Mario, Super Smash Bros., Mario Kart 64 and others), with optional 2× anti-aliasing. Games
+  over about 48 MB (Conker's Bad Fur Day, Resident Evil 2, some ROM hacks) are read from the SD card
+  while they run, as on the Old 3DS below.
 - **Old 3DS / 2DS**: works, but slower. ctr64 runs in the Old 3DS's 80 MB extended memory mode,
   which leaves room for only the smallest games in memory; most games (Super Mario 64, Mario
   Kart 64, Ocarina of Time, Paper Mario...) are read from the SD card while they run. Their
@@ -35,10 +35,9 @@ Basically this project is mupen64plus-next + gliden64 ported to the 3ds with a c
 **CIA (recommended, required for Old 3DS):** copy `ctr64.cia` to the SD card and install it with
 FBI. ctr64 then appears on the HOME Menu.
 
-Opening and closing the CIA takes about 10-20 seconds: it asks for an extended memory mode (New
-3DS: 178 MB, so even 64 MB games fit in memory; Old 3DS: 80 MB), and the 3DS has to restart its
-system to switch memory modes, once when ctr64 opens and again when it goes back to the HOME Menu.
-That's normal, it's not frozen.
+On an Old 3DS, opening and closing the CIA takes about 10-20 seconds: it asks for an extended memory
+mode (80 MB), and the 3DS has to restart its system to switch to it, once when ctr64 opens and again
+when it goes back to the HOME Menu. That's normal, it's not frozen.
 
 You can also install (or update) with a QR code: it's on the
 [latest release](https://github.com/gl91306/ctr64/releases/latest) page, scan it in FBI
@@ -84,6 +83,12 @@ the screen in `sdmc:/3ds/ctr64/boxart`; games are matched by the cartridge ID in
 matter. Without Wi-Fi, or for games without art (ROM hacks, test ROMs), a card with the title
 is shown. To fetch a game's art again, delete its file from that folder (`.none` marks a game
 that has no art).
+
+You can use your own pictures, for example for ROM hacks: put a `.png` or `.jpg` with the same name
+as the ROM into that folder (`My Hack.z64`: `My Hack.png`) and open ctr64. It converts the picture
+while the game list is open (about a second for a normal one), shows it, and removes the original,
+so keep a copy. Delete `u_My Hack.bin` to go back to the normal art. If a picture does not show up,
+`boxart.log` in that folder says why. Progressive JPGs work, CMYK ones do not.
 
 While a game runs, the bottom screen shows the speed. **SELECT** or a tap on the bottom screen
 pauses and opens the menu:

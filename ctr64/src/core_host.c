@@ -441,6 +441,17 @@ bool core_host_init(const char *data_dir)
             fclose(f);
         }
     }
+    {   /* scripted tests: <data dir>/determ.txt (gfx_async.c) */
+        extern unsigned ctr64_determ_until;
+        ctr64_determ_until = 0;
+        snprintf(path, sizeof(path), "%s/determ.txt", data_dir);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fscanf(f, "%u", &ctr64_determ_until) != 1)
+                ctr64_determ_until = 0;
+            fclose(f);
+        }
+    }
     {   /* development aid: <data dir>/noaudiothread.txt keeps audio tasks on the CPU thread */
         extern bool ctr64_audio_thread_off;
         snprintf(path, sizeof(path), "%s/noaudiothread.txt", data_dir);
@@ -493,6 +504,19 @@ static void srm_load(void)
     if (!mem || !size)
         return;
     char tmp[310];
+    /* a scripted test run (exitafter.txt, inputs.txt, loadstate.st): starts without a save, the
+     * same every time, and never writes the player's (a loaded state brings its own save RAM) */
+    static const char *const test_files[] = {"exitafter.txt", "inputs.txt", "loadstate.st"};
+    for (unsigned i = 0; i < sizeof(test_files) / sizeof(test_files[0]); i++) {
+        snprintf(tmp, sizeof(tmp), "%s/%s", H.data_dir, test_files[i]);
+        FILE *t = fopen(tmp, "rb");
+        if (!t)
+            continue;
+        fclose(t);
+        if (H.log)
+            fprintf(H.log, "save RAM: test run (%s), %s neither read nor written\n", test_files[i], H.srm_path);
+        return;
+    }
     snprintf(tmp, sizeof(tmp), "%s.tmp", H.srm_path);
     FILE *f = fopen(H.srm_path, "rb");
     if (!f && (f = fopen(tmp, "rb"))) /* power lost between removing the old file and the rename */

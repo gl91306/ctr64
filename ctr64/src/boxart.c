@@ -9,11 +9,15 @@
  * Cache file <key>.bin: "C64A", u16 width, u16 height, u32 version, u32 0, then the 256x256 RGBA5551
  * texture in the GPU's tiled layout (8x8 tiles, Morton order inside), image row 0 in memory row 0
  * (which the GPU samples at v = 1: v = 0 is the last row).
- * <key>.none: no art exists (all candidate names were 404); delete it to try again. */
+ * <key>.none: no art exists (all candidate names were 404); delete it to try again.
+ *
+ * u_<ROM file name>.bin: the same, made from the user's own image (boxart.h) by the download thread,
+ * before any download. It is used instead of <key>.bin and never removed by ctr64. */
 #include "boxart.h"
 
 #include <3ds.h>
 #include <curl/curl.h>
+#include <dirent.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509.h>
 #include <malloc.h>
@@ -23,10 +27,12 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "jpg.h"
 #include "net_roots.h"
 #include "pica/pica.h"
 #include "ui/boxart_names.h"
@@ -49,11 +55,15 @@
 #define SOC_BYTES 0x100000
 #define FILE_MAGIC 0x41343643u    /* "C64A" */
 #define FILE_VERSION 1
+#define MAX_IMPORTS 64            /* user images per opening of the list, the rest the next time */
+#define MAX_IMAGE (12u << 20)
 
 enum { SD_UNKNOWN, SD_FILE, SD_NOFILE, SD_NONE };
 
 typedef struct {
     char key[64];         /* cache file name */
+    char stem[100];       /* ROM file name without its ending */
+    volatile bool user;   /* has the user's own art */
     char names[4][100];   /* candidate libretro names, in order */
     int nnames;
     char title[80];
@@ -61,6 +71,7 @@ typedef struct {
     bool tried;           /* download attempted this session (download thread only) */
     int tex;              /* pool slot, -1 = not loaded */
     bool loading;
+    bool stale;           /* a new file: load it again */
     u16 w, h;             /* image size in the texture */
     float in;             /* fade-in 0..1 once loaded */
     int label;            /* label slot, -1 = none */
@@ -83,6 +94,11 @@ static struct {
     volatile bool quit;
     volatile bool dirty;  /* a texture arrived: draw again */
     bool drawn_once;
+    struct {
+        int game;
+        char file[128];
+    } import[MAX_IMPORTS]; /* user images found */
+    int nimport;
     Thread loader, downloader;
     LightEvent wake;      /* selection changed / new file: wake the threads */
     float proj[4][4];
@@ -150,6 +166,7 @@ void boxart_add(const char *path, const char *title, const char *id, bool hack)
     if (dot)
         *dot = 0;
     thumb_safe(stem);
+    snprintf(a->stem, sizeof(a->stem), "%s", stem);
     if (id && id[0] && !hack) {
         snprintf(a->key, sizeof(a->key), "%s", id);
         add_name(a, table_name(id));
@@ -214,8 +231,37 @@ static void resample_axis(const float *src, int sn, int sstride, float *dst, int
     }
 }
 
-/* RGBA8 (w x h) -> the cache file at path; false if out of memory or the write failed */
-static bool save_image(const u8 *rgba, int w, int h, const char *path)
+static u32 tex_sum(const u16 *tex)
+{
+    u32 s = 0;
+    for (int i = 0; i < TEX * TEX; i++)
+        s = s * 31 + tex[i];
+    return s;
+}
+
+/* the cache file of a game */
+static void art_path(char *out, size_t n, const Art *a, bool user)
+{
+    snprintf(out, n, ART_DIR "/%s%s.bin", user ? "u_" : "", user ? a->stem : a->key);
+}
+
+/* the cache file holds this texture */
+static bool saved(const char *path, u32 sum)
+{
+    u32 hdr[4];
+    u16 *tex = malloc(TEX_BYTES);
+    FILE *f = fopen(path, "rb");
+    const bool ok = tex && f && fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == FILE_MAGIC &&
+                    fread(tex, TEX_BYTES, 1, f) == 1 && tex_sum(tex) == sum;
+    if (f)
+        fclose(f);
+    free(tex);
+    return ok;
+}
+
+/* RGBA8 (w x h) -> the cache file at path (check: read back); false if out of memory or the write
+ * failed */
+static bool save_image(const u8 *rgba, int w, int h, const char *path, bool check)
 {
     const float s = fminf((float)TEX / w, (float)TEX / h);
     int dw = (int)lroundf(w * s), dh = (int)lroundf(h * s);
@@ -266,6 +312,8 @@ static bool save_image(const u8 *rgba, int w, int h, const char *path)
             ok = ok && rename(tmp, path) == 0;
             if (!ok)
                 remove(tmp);
+            if (ok && check)
+                ok = saved(path, tex_sum(tex));
         }
     }
     free(src);
@@ -375,6 +423,186 @@ static long fetch(CURL *c, const char *name, Buf *b)
     return code;
 }
 
+typedef struct {
+    const u8 *p, *end;
+} PngIn;
+
+static void png_in(png_structp png, png_bytep out, png_size_t n)
+{
+    PngIn *in = png_get_io_ptr(png);
+    if ((size_t)(in->end - in->p) < n)
+        png_error(png, "cut off");
+    memcpy(out, in->p, n);
+    in->p += n;
+}
+
+static void png_quiet(png_structp png, png_const_charp msg)
+{
+    (void)png;
+    (void)msg;
+}
+
+/* PNG -> RGBA8 (malloc), large ones at 1/2, 1/4... size (the art is shrunk to 256 pixels anyway);
+ * NULL with a reason in *err. Row by row, so that leaving the list stops it. */
+static u8 *png_decode(const u8 *p, size_t n, int *w, int *h, const char **err)
+{
+    PngIn in = {p, p + n};
+    png_infop info = NULL;
+    u8 *volatile full = NULL, *volatile row = NULL, *volatile out = NULL;
+    u32 *volatile acc = NULL;
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, png_quiet);
+    if (png)
+        info = png_create_info_struct(png);
+    *err = "too large for the memory";
+    if (!info) {
+        png_destroy_read_struct(&png, NULL, NULL);
+        return NULL;
+    }
+    volatile bool ok = false;
+    *err = n >= 8 && !png_sig_cmp(p, 0, 8) ? "damaged" : "not a PNG";
+    if (!setjmp(png_jmpbuf(png))) {
+        png_set_read_fn(png, &in, png_in);
+        png_read_info(png, info);
+        const int iw = (int)png_get_image_width(png, info), ih = (int)png_get_image_height(png, info);
+        if (iw < 1 || ih < 1 || iw > 8192 || ih > 8192) {
+            *err = "size not supported";
+            png_error(png, "size");
+        }
+        png_set_expand(png);
+        png_set_strip_16(png);
+        png_set_gray_to_rgb(png);
+        png_set_filler(png, 255, PNG_FILLER_AFTER);
+        const int passes = png_set_interlace_handling(png);
+        png_read_update_info(png, info);
+        int shift = 0;
+        while ((iw > ih ? iw : ih) >> (shift + 1) >= 640)
+            shift++;
+        const int k = 1 << shift;
+        const int ow = (iw + k - 1) / k, oh = (ih + k - 1) / k;
+        *w = ow;
+        *h = oh;
+        out = malloc((size_t)ow * oh * 4);
+        acc = malloc((size_t)ow * 5 * sizeof(u32));
+        if (passes > 1)
+            full = malloc((size_t)iw * ih * 4);
+        else
+            row = malloc((size_t)iw * 4);
+        if (!out || !acc || !(passes > 1 ? full : row) || png_get_rowbytes(png, info) != (size_t)iw * 4) {
+            *err = "too large for the memory";
+            png_error(png, "memory");
+        }
+        for (int pass = 0; pass < passes - 1; pass++)
+            for (int y = 0; y < ih; y++) {
+                if (B.quit) {
+                    *err = "stopped";
+                    png_error(png, "stop");
+                }
+                png_read_row(png, full + (size_t)y * iw * 4, NULL);
+            }
+        u8 *o = out;
+        for (int y = 0; y < ih; y++) {
+            if (B.quit) {
+                *err = "stopped";
+                png_error(png, "stop");
+            }
+            u8 *s = passes > 1 ? full + (size_t)y * iw * 4 : row;
+            png_read_row(png, s, NULL);
+            if (k == 1) {
+                memcpy(o, s, (size_t)iw * 4);
+                o += (size_t)iw * 4;
+                continue;
+            }
+            if ((y & (k - 1)) == 0)
+                memset(acc, 0, (size_t)ow * 5 * sizeof(u32));
+            for (int x = 0; x < iw; x++, s += 4) { /* k x k pixels: the mean, colors by their alpha */
+                u32 *a = acc + (size_t)(x >> shift) * 5;
+                const u32 al = s[3];
+                a[0] += s[0] * al;
+                a[1] += s[1] * al;
+                a[2] += s[2] * al;
+                a[3] += al;
+                a[4]++;
+            }
+            if ((y & (k - 1)) == k - 1 || y == ih - 1)
+                for (int x = 0; x < ow; x++, o += 4) {
+                    const u32 *a = acc + (size_t)x * 5;
+                    for (int c = 0; c < 3; c++)
+                        o[c] = a[3] ? (u8)((a[c] + a[3] / 2) / a[3]) : 0;
+                    o[3] = (u8)((a[3] + a[4] / 2) / a[4]);
+                }
+        }
+        ok = true;
+    }
+    png_destroy_read_struct(&png, &info, NULL);
+    free(full);
+    free(row);
+    free(acc);
+    if (ok)
+        return out;
+    free(out);
+    return NULL;
+}
+
+/* one of the user's images -> the game's own cache file; the image is removed when that worked */
+static void import_one(int game, const char *file)
+{
+    char path[200], bin[160];
+    snprintf(path, sizeof(path), ART_DIR "/%s", file);
+    art_path(bin, sizeof(bin), &B.art[game], true);
+    const char *err = "cannot be read";
+    const u64 t0 = osGetTime();
+    u8 *data = NULL, *rgba = NULL;
+    int w = 0, h = 0;
+    size_t n = 0;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        const long size = ftell(f);
+        rewind(f);
+        if (size > (long)MAX_IMAGE) {
+            err = "file too large";
+        } else if (size > 8 && (data = malloc((size_t)size)) != NULL) {
+            while (n < (size_t)size && !B.quit) {
+                const size_t k = fread(data + n, 1, (size_t)size - n < 0x20000 ? (size_t)size - n : 0x20000, f);
+                if (!k)
+                    break;
+                n += k;
+            }
+            if (n != (size_t)size)
+                n = 0;
+        }
+        fclose(f);
+    }
+    const u64 t1 = osGetTime();
+    if (n)
+        rgba = !memcmp(data, "\x89PNG", 4) ? png_decode(data, n, &w, &h, &err) : jpg_decode(data, n, &w, &h, &B.quit, &err);
+    free(data);
+    const u64 t2 = osGetTime();
+    const bool ok = rgba && save_image(rgba, w, h, bin, true);
+    if (!rgba && B.quit)
+        err = "stopped, the next time";
+    else if (rgba && !ok)
+        err = "not saved (memory or SD card full?)";
+    free(rgba);
+    if (!ok) {
+        blog("%s: %s", file, err);
+        return;
+    }
+    remove(path);
+    blog("%s: now the art of %s (read %d ms, %dx%d decoded %d ms, saved %d ms)", file, B.art[game].stem, (int)(t1 - t0), w, h,
+         (int)(t2 - t1), (int)(osGetTime() - t2));
+    LightLock_Lock(&B.lock);
+    for (int i = 0; i < B.n; i++)
+        if (!strcasecmp(B.art[i].stem, B.art[game].stem)) {
+            B.art[i].user = true;
+            B.art[i].sd = SD_FILE;
+            B.art[i].stale = true;
+        }
+    LightLock_Unlock(&B.lock);
+    B.dirty = true;
+    LightEvent_Signal(&B.wake);
+}
+
 /* one game: true when done (art saved, or none exists), false on a network error */
 static bool download_one(CURL *c, Art *a, Buf *b)
 {
@@ -397,23 +625,13 @@ static bool download_one(CURL *c, Art *a, Buf *b)
             continue;
         if (code != 200)
             return false;
-        png_image im;
-        memset(&im, 0, sizeof(im));
-        im.version = PNG_IMAGE_VERSION;
-        if (!png_image_begin_read_from_memory(&im, b->p, b->n))
+        int w, h;
+        const char *err;
+        u8 *rgba = png_decode(b->p, b->n, &w, &h, &err);
+        if (!rgba && (!strcmp(err, "not a PNG") || !strcmp(err, "size not supported")))
             continue;
-        if (im.width == 0 || im.height == 0 || im.width > 4096 || im.height > 4096) {
-            png_image_free(&im);
-            continue;
-        }
-        im.format = PNG_FORMAT_RGBA;
-        u8 *rgba = malloc(PNG_IMAGE_SIZE(im));
-        bool ok = rgba && png_image_finish_read(&im, NULL, rgba, 0, NULL);
-        png_image_free(&im);
-        if (ok) {
-            snprintf(path, sizeof(path), ART_DIR "/%s.bin", a->key);
-            ok = save_image(rgba, (int)im.width, (int)im.height, path);
-        }
+        snprintf(path, sizeof(path), ART_DIR "/%s.bin", a->key);
+        const bool ok = rgba && save_image(rgba, w, h, path, false);
         free(rgba);
         if (ok) {
             a->sd = SD_FILE;
@@ -445,6 +663,8 @@ static void downloader_main(void *arg)
     bool ac = false, soc = false, curl_ok = false;
     CURL *c = NULL;
     Buf b = {0};
+    for (int i = 0; i < B.nimport && !B.quit; i++)
+        import_one(B.import[i].game, B.import[i].file);
     while (!B.quit) {
         /* the missing art nearest to the selection */
         int best = -1, bestd = 1 << 30;
@@ -567,7 +787,8 @@ static void loader_main(void *arg)
             continue;
         }
         Art *a = &B.art[best];
-        snprintf(path, sizeof(path), ART_DIR "/%s.bin", a->key);
+        const bool user = a->user;
+        art_path(path, sizeof(path), a, user);
         FILE *f = fopen(path, "rb");
         u32 hdr[4] = {0};
         bool ok = f && fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == FILE_MAGIC && hdr[2] == FILE_VERSION &&
@@ -587,8 +808,13 @@ static void loader_main(void *arg)
             a->in = 0;
         } else {
             B.pool_used[slot] = false;
-            remove(path);
-            a->sd = SD_NOFILE; /* bad file: download again */
+            if (!user) {
+                remove(path);
+                if (!a->user)
+                    a->sd = SD_NOFILE; /* bad file: download again */
+            } else {
+                a->user = false; /* stays; the downloaded art instead, if there is any */
+            }
         }
         LightLock_Unlock(&B.lock);
         B.dirty = true;
@@ -597,22 +823,52 @@ static void loader_main(void *arg)
 
 /* ---- start / stop ----------------------------------------------------------------------- */
 
+/* the files in the art folder: one listing (asking for each file is slow on the 3DS) */
+static void list_files(void)
+{
+    for (int i = 0; i < B.n; i++)
+        B.art[i].sd = SD_NOFILE;
+    DIR *d = opendir(ART_DIR);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        char stem[128];
+        snprintf(stem, sizeof(stem), "%.127s", e->d_name);
+        char *dot = strrchr(stem, '.');
+        if (!dot || strlen(e->d_name) >= sizeof(stem))
+            continue;
+        *dot = 0;
+        const char *ext = dot + 1;
+        const bool bin = !strcasecmp(ext, "bin"), none = !strcasecmp(ext, "none");
+        if (bin || none) {
+            for (int i = 0; i < B.n; i++) {
+                Art *a = &B.art[i];
+                if (bin && !strncmp(stem, "u_", 2) && !strcasecmp(a->stem, stem + 2)) {
+                    a->user = true;
+                    a->sd = SD_FILE;
+                } else if (!strcasecmp(a->key, stem) && a->sd != SD_FILE) {
+                    a->sd = bin ? SD_FILE : SD_NONE;
+                }
+            }
+        } else if (!strcasecmp(ext, "png") || !strcasecmp(ext, "jpg") || !strcasecmp(ext, "jpeg")) {
+            thumb_safe(stem); /* as the ROM names are (boxart_add) */
+            for (int i = 0; i < B.n && B.nimport < MAX_IMPORTS; i++)
+                if (!strcasecmp(B.art[i].stem, stem)) {
+                    B.import[B.nimport].game = i;
+                    snprintf(B.import[B.nimport++].file, sizeof(B.import[0].file), "%s", e->d_name);
+                    break;
+                }
+        }
+    }
+    closedir(d);
+}
+
 void boxart_start(void)
 {
     B.active = true;
     mkdir(ART_DIR, 0777);
-    char path[160];
-    struct stat st;
-    for (int i = 0; i < B.n; i++) {
-        Art *a = &B.art[i];
-        snprintf(path, sizeof(path), ART_DIR "/%s.bin", a->key);
-        if (stat(path, &st) == 0)
-            a->sd = SD_FILE;
-        else {
-            snprintf(path, sizeof(path), ART_DIR "/%s.none", a->key);
-            a->sd = stat(path, &st) == 0 ? SD_NONE : SD_NOFILE;
-        }
-    }
+    list_files();
     for (int i = 0; i < POOL; i++)
         B.pool[i] = linearMemAlign(TEX_BYTES, 128);
     for (int i = 0; i < LABELS; i++)
@@ -839,7 +1095,10 @@ void boxart_frame(void)
     /* textures far from the selection go back to the pool */
     for (int i = 0; i < B.n; i++) {
         Art *a = &B.art[i];
-        if (a->tex >= 0 && abs(i - B.sel) > KEEP + 1 && fabsf(i - B.pos) > 3.5f) {
+        const bool stale = a->stale && !a->loading;
+        if (stale)
+            a->stale = false;
+        if (a->tex >= 0 && (stale || (abs(i - B.sel) > KEEP + 1 && fabsf(i - B.pos) > 3.5f))) {
             B.pool_free_after[a->tex] = 1;
             B.pool_used[a->tex] = false;
             a->tex = -1;

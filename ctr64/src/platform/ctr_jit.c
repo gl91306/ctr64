@@ -407,6 +407,17 @@ void ctr_jit_thread_stop(void)
     g_ct_quit = false;
 }
 
+/* the program ends on an error (crash.c): whatever it is doing, for at most 2 s */
+void ctr_jit_thread_abandon(void)
+{
+    if (!g_ct || ctr_jit_on_compile_thread())
+        return;
+    g_ct_quit = true;
+    __sync_synchronize();
+    LightEvent_Signal(&g_ct_go);
+    threadJoin(g_ct, 2000000000LL);
+}
+
 /* core 0: invalidate what the compile thread wrote, before running it */
 void ctr_jit_thread_absorb(void)
 {
@@ -650,6 +661,14 @@ void ctr_jit_init(void *base, unsigned int size)
         ctr64_gfx_noprevdl = np != NULL;
         if (np)
             fclose(np);
+    }
+    {   /* dev switch nodlcopy.txt: display lists read in place (gfx_async.c) */
+        extern bool ctr64_gfx_nodlcopy;
+        FILE *nd = fopen("sdmc:/3ds/ctr64/nodlcopy.txt", "r");
+        if (nd) {
+            ctr64_gfx_nodlcopy = true;
+            fclose(nd);
+        }
     }
     {   /* dev switch nodefer.txt: no deferred RDP-done waits for slow games (gfx_async.c) */
         extern bool ctr64_gfx_nodefer;

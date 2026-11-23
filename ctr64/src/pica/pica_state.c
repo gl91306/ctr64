@@ -89,13 +89,15 @@ void pica_state_reset(void)
     S.effect_valid = true; /* every effect register now holds its shadowed value */
 }
 
+bool pica_early_clear;
 void pica_state_flush_framebuffer(void)
 {
     if (!S.drawn)
         return;
     GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_FLUSH, 1);
     GPUCMD_AddWrite(GPUREG_FRAMEBUFFER_INVALIDATE, 1);
-    GPUCMD_AddWrite(GPUREG_EARLYDEPTH_CLEAR, 1);
+    if (pica_early_clear) /* early depth is never used; the clear takes ~4 us of GPU time */
+        GPUCMD_AddWrite(GPUREG_EARLYDEPTH_CLEAR, 1);
     S.drawn = false;
 }
 

@@ -26,6 +26,8 @@
 #define RS_MAX_PAGES (0xFC00000u / RS_PAGE) /* the cartridge address range (memory.h CTR64_RS_PAGES) */
 #define RS_MIN_SLOTS 48                     /* 3 MB: always kept */
 #define RS_HEADROOM (12u * 1024 * 1024)     /* heap left free for the rest of the emulator */
+#define RS_HEADROOM_NEW (9u * 1024 * 1024)  /* the same on a New 3DS (Paper Mario and TTYD64 took 5-6 MB after loading) */
+#define RS_NEW_WHOLE_MAX (40 * 1024 * 1024) /* never streamed on a New 3DS up to here (Paper Mario) */
 #define RS_LOW (8u * 1024 * 1024)           /* below this, rom_stream_trim gives pages back */
 #define RS_FULL_LOAD_MAX (16 * 1024 * 1024) /* Old 3DS: bigger ROMs are streamed */
 
@@ -60,6 +62,8 @@ static struct {
 } S;
 
 extern char *fake_heap_end;
+
+u32 ctr64_mem_reserve_left(void); /* main.c */
 
 /* heap still available to malloc: never handed out by sbrk, plus free chunks */
 static uint32_t heap_free(void)
@@ -213,9 +217,14 @@ bool rom_stream_wanted(long size, const char *data_dir)
         return true;
     bool new3ds = false;
     APT_CheckNew3DS(&new3ds);
+    /* New 3DS (124 MB mode: about 58 MB for the ROM and the game): a ROM that fits but leaves too
+     * little for the game to run on would run out of memory later, so it is streamed as well (over
+     * about 48 MB; no retail game is between that and the 64 MB ones, which never fit) */
+    if (new3ds)
+        return size > RS_NEW_WHOLE_MAX && (uint32_t)size + RS_HEADROOM_NEW > heap_free() + ctr64_mem_reserve_left();
     /* Old 3DS (80 MB mode): whole only if the heap keeps its headroom for the rest of the emulator
      * (GLideN64 grows by ~7 MB once a game draws; Super Mario 64's 8 MB loaded whole ran out) */
-    return !new3ds && (size > RS_FULL_LOAD_MAX || (uint32_t)size + RS_HEADROOM > heap_free());
+    return size > RS_FULL_LOAD_MAX || (uint32_t)size + RS_HEADROOM > heap_free();
 }
 
 static void md5_path(char *out, size_t n, const char *data_dir, const uint8_t *z64_header)

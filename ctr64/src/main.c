@@ -284,6 +284,12 @@ void *__wrap__sbrk_r(struct _reent *r, ptrdiff_t incr)
     return p;
 }
 
+/* bytes of the reserve the main heap can still take (heap_take_reserve) */
+u32 ctr64_mem_reserve_left(void)
+{
+    return g_xres && g_xres_state == 0 ? XRES_BYTES : 0;
+}
+
 const char *ctr64_mem_reserve_state(void)
 {
     static const char *const names[] = {"free", "GPU", "heap"};
@@ -404,6 +410,18 @@ void ctr64_time_mark(const char *what)
     if (g_timing_len < sizeof(g_timing) - 96)
         g_timing_len += snprintf(g_timing + g_timing_len, sizeof(g_timing) - g_timing_len, "%7.0f ms  %llu  %s\n",
                                  (double)(now - t0) * 1000.0 / SYSCLOCK_ARM11, (unsigned long long)osGetTime(), what);
+#ifdef CTR64_STARTLOG
+    /* test builds for reports of hangs while starting: each step reaches the SD card and the
+     * bottom screen at once */
+    FILE *f = fopen("sdmc:/ctr64_start.txt", "a");
+    if (f) {
+        fprintf(f, "%7.0f ms  %s  (ctr64 %s, app memory %lu KB)\n", (double)(now - t0) * 1000.0 / SYSCLOCK_ARM11,
+                what, CTR64_VERSION, (unsigned long)(osGetMemRegionSize(MEMREGION_APPLICATION) / 1024));
+        fclose(f);
+    }
+    if (strcmp(what, "start"))
+        printf("%s\n", what);
+#endif
 }
 void ctr64_time_flush(void)
 {
@@ -1206,6 +1224,7 @@ int main(void)
     vfp_enable_runfast();
     gfxInitDefault();
     ui_set_console(consoleInit(GFX_BOTTOM, NULL));
+    ctr64_time_mark("screens ready");
     crash_install(crash_extra);
     APT_CheckNew3DS(&new3ds);
     osSetSpeedupEnable(true);
@@ -1312,6 +1331,7 @@ int main(void)
             prof_end(); /* closes the statistics stream too */
             g_stats = NULL;
             core_host_unload();
+            pica_lcd_gamma(false);
             {   /* dev switch blockmap.txt: the rest of the block map (ctr_jit.c) */
                 extern void ctr_jit_blockmap_flush(void);
                 ctr_jit_blockmap_flush();

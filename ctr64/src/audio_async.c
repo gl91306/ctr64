@@ -152,7 +152,8 @@ bool ctr64_audio_task_start(const unsigned char *dmem, const unsigned char *imem
 bool ctr64_audio_ready(unsigned elapsed)
 {
     const unsigned vi = g_dev.vi.delay ? g_dev.vi.delay : 780000;
-    return g_got == g_put || elapsed >= vi / 16;
+    extern bool ctr64_determ(void); /* gfx_async.c */
+    return (g_got == g_put && !ctr64_determ()) || elapsed >= vi / 16;
 }
 
 void ctr64_audio_finish(void)
@@ -164,6 +165,15 @@ unsigned ctr64_audio_step(void)
 {
     const unsigned vi = g_dev.vi.delay ? g_dev.vi.delay : 780000;
     return vi / 64;
+}
+
+/* the program ends on an error (crash.c): waits at most 2 s for the thread */
+void ctr64_audio_async_abandon(void)
+{
+    if (!g_running || threadGetCurrent() == g_thread)
+        return;
+    g_quit = true; /* looked at every WAKE_RECHECK_NS */
+    threadJoin(g_thread, 2000000000LL);
 }
 
 void ctr64_audio_async_stop(void)

@@ -134,12 +134,33 @@ bool is_zero(u32 g) { return g == G_GCI_ZERO; }
 bool is_one(u32 g) { return g == G_GCI_ONE; }
 bool varying(u32 g) { return !is_const(arg_of(g)); }
 
+KRef kref(u8 op, u32 A, u32 B, u32 C = 0, u32 D = 0)
+{
+    KRef k;
+    k.op = (decltype(k.op))op;
+    k.g1 = (u8)A;
+    k.g2 = (u8)B;
+    k.g3 = (u8)C;
+    k.g4 = (u8)D;
+    return k;
+}
+
 /* (A - B) * C + D for one channel, as TEV ops (TEV stages clamp every result to [0, 1]). */
 void emit_cycle(u32 A, u32 B, u32 C, u32 D, Chain &ch)
 {
     const Arg a = arg_of(A), b = arg_of(B), c = arg_of(C), d = arg_of(D);
     if (is_zero(C) || A == B) {
         ch.push(F_REPLACE, 1, d);
+    } else if (!varying(A) && !varying(B) && !varying(C)) {
+        /* a constant, or D plus one: folded (NOISE*PRIM + ENV, the panels of Pokemon Stadium 2's
+         * menus, has three constants, one too many for a TEV stage and its preload: gray) */
+        if (!varying(D)) {
+            ch.push(F_REPLACE, 1, karg(kref(KRef::K_CYCLE, A, B, C, D)));
+        } else {
+            ch.push(F_ADD, 2, d, karg(kref(KRef::K_POSPROD, A, B, C)));
+            if (!is_zero(B))
+                ch.push(F_SUBTRACT, 2, simple(K_PREV), karg(kref(KRef::K_NEGPROD, A, B, C)));
+        }
     } else if (is_zero(B)) {
         if (is_one(C))
             is_zero(D) ? ch.push(F_REPLACE, 1, a) : ch.push(F_ADD, 2, a, d);
@@ -197,6 +218,12 @@ void emit_cycle(u32 A, u32 B, u32 C, u32 D, Chain &ch)
         ch.push(F_MULADD, 3, d, simple(K_HALF), karg(k1));          /* (D + 1 - B*C) / 2 */
         ch.push(F_MULADD, 3, a, karg(k2), simple(K_PREV));          /* (X + 1) / 2 */
         ch.push(F_SUBTRACT, 2, simple(K_PREV), simple(K_HALF)).scale = 1;
+    } else if (!varying(A) && !varying(B)) {
+        /* X = D + (A - B)*C, A - B = P - N with one of P, N 0: D + P*C, then 1 - X = (1 - D - P*C)
+         * + N*C. Exact; the general case would need two constants in its first stage. */
+        ch.push(F_MULADD, 3, karg(kref(KRef::K_POSDIFF, A, B)), c, d);
+        ch.push(F_MULADD, 3, karg(kref(KRef::K_NEGDIFF, A, B)), c, one_minus(simple(K_PREV)));
+        ch.push(F_REPLACE, 1, one_minus(simple(K_PREV)));
     } else {
         /* General: H = (A - B + 1)/2, J = (D - C + 1)/2, (X + 1)/2 = H*C + J, then expand */
         ch.push(F_INTERPOLATE, 3, a, one_minus(b), simple(K_HALF)).write_buf = true;
@@ -351,6 +378,10 @@ f32 kvalue(const KRef &k, int c)
     case KRef::K_HALF_1M_PROD: return 0.5f * (1.0f - input_value(k.g1, c) * input_value(k.g2, c));
     case KRef::K_POSDIFF: return std::max(input_value(k.g1, c) - input_value(k.g2, c), 0.0f);
     case KRef::K_NEGDIFF: return std::max(input_value(k.g2, c) - input_value(k.g1, c), 0.0f);
+    case KRef::K_CYCLE:
+        return (input_value(k.g1, c) - input_value(k.g2, c)) * input_value(k.g3, c) + input_value(k.g4, c);
+    case KRef::K_POSPROD: return std::max((input_value(k.g1, c) - input_value(k.g2, c)) * input_value(k.g3, c), 0.0f);
+    case KRef::K_NEGPROD: return std::max((input_value(k.g2, c) - input_value(k.g1, c)) * input_value(k.g3, c), 0.0f);
     default: return 0.0f;
     }
 }

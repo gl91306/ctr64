@@ -93,6 +93,35 @@ void __wrap_abort(void)
     __real_abort();
 }
 
+/* The core ends the program with exit(1) on errors it cannot handle. The process must not end
+ * with ctr64's threads alive on the other cores: the kernel crashed in a thread switch on core 1 or
+ * 2 (HW 2026-11-22; Luma's exception screen, pc 3fef3ffe). They are stopped first, and ctr64 starts
+ * again (the game list) instead of leaving. */
+void __real_exit(int code) __attribute__((noreturn));
+void __wrap_exit(int code) __attribute__((noreturn));
+void __wrap_exit(int code)
+{
+    static bool ending;
+    if (code && !ending) {
+        ending = true;
+        FILE *f = fopen(CRASH_PATH, "w");
+        if (f) {
+            u32 sp;
+            __asm__ volatile("mov %0, sp" : "=r"(sp));
+            fprintf(f, "ctr64 stopped: exit(%d) called from %08lx\n", code, (u32)__builtin_return_address(0));
+            write_common(f, sp);
+            fclose(f);
+        }
+        extern void ctr_jit_thread_abandon(void), ctr64_gfx_async_abandon(void), ctr64_audio_async_abandon(void);
+        ctr_jit_thread_abandon();
+        ctr64_gfx_async_abandon();
+        ctr64_audio_async_abandon();
+        if (!envIsHomebrew())
+            aptSetChainloaderToSelf();
+    }
+    __real_exit(code);
+}
+
 void crash_install(void (*extra)(FILE *))
 {
     g_extra = extra;
