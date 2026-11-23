@@ -19,6 +19,7 @@
 volatile bool ctr64_speed_behind; /* set by the speed limiter (main.c) */
 unsigned ctr64_frames_skipped;   /* presents dropped per second, for the stats */
 unsigned ctr64_frames_drawskip;  /* frames whose draws were dropped, per second */
+unsigned ctr64_frames_healed;    /* skipped buffers given the last picture shown (backend), per second */
 bool ctr64_render_skip;          /* the current frame is being skipped */
 
 static unsigned g_frame;

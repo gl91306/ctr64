@@ -101,6 +101,7 @@ extern "C" {
 #undef CRUMB
 #define CRUMB(s) (ctr64_gret[1] = ctr64_gret[0], ctr64_gret[0] = __builtin_return_address(0), ctr64_gcrumb = ctr64_crumb = (s))
 extern "C" bool ctr64_render_skip; /* frameskip.c */
+extern "C" unsigned ctr64_frames_healed; /* frameskip.c: skipped buffers given the last picture */
 extern "C" bool ctr64_frameskip_present(bool stale);
 extern "C" bool ctr64_frame_cleared, ctr64_frame_fbtex, ctr64_frame_drew; /* frameskip.c */
 extern "C" unsigned ctr64_fb_copies;
@@ -198,6 +199,7 @@ struct Tex {
     bool rt = false;    /* attached to a frame buffer: prefer VRAM */
     bool skipped = false; /* draws into it were dropped by frameskip since it was last drawn */
     bool drawn = true;    /* drawn or written since the window last presented it */
+    bool ever = false;    /* has an image: drawn, cleared or written at least once */
     u64 copy_fence = 0;   /* a queued GPU copy into it (stagedUpdate) is done at this fence */
     u32 draw_frame = 0;   /* pica frame of the last draw into it (VRAM placement, keepInVram) */
     u32 ndraw = 0;        /* draws since the last present */
@@ -1182,6 +1184,16 @@ public:
     void present();
     void endVI();
     bool skipDraw(bool clear = false);
+    void healSkipped(Tex &c);
+    void healForRead(Tex *t) {
+        /* the game reads the buffer back (Pokemon Stadium snapshots its screen to draw it again as
+         * the entry selection background, GitHub #4): a buffer that missed a frame gets the last
+         * picture shown first, else the snapshot keeps the stale picture for good */
+        if (t && t->skipped) {
+            healSkipped(*t);
+            t->skipped = false;
+        }
+    }
     const u8 *readTexture(CachedTexture *tex, s32 x0, s32 y0, u32 w, u32 h, std::vector<u8> &out);
     bool depthToRdram(u32 fbo, u32 w, u32 h, u32 sc, u32 key, u16 *dst);
     const u8 *readTextureAsync(CachedTexture *tex, s32 x0, s32 y0, u32 w, u32 h, AsyncReadback &a,
@@ -2122,7 +2134,7 @@ void ContextImplPica::init2DTexture(const Context::InitTextureParams &p)
                 CTR64_PROF(27);
                 write_full<GPU_RGBA5551, true, u16>(*t, src, p.width, p.height, p.width);
             }
-            t->drawn = true;
+            t->drawn = t->ever = true;
             {
                 CTR64_PROF(31);
                 pica_cache_flush(t->data, storageBytes(*t));
@@ -2173,7 +2185,7 @@ void ContextImplPica::init2DTexture(const Context::InitTextureParams &p)
         case GPU_LA4: write_full<GPU_LA4>(*t, px.data(), p.width, p.height, p.width); break;
         default: write_full<GPU_RGBA8>(*t, px.data(), p.width, p.height, p.width); break;
         }
-        t->drawn = true;
+        t->drawn = t->ever = true;
         {
             CTR64_PROF(31);
             pica_cache_flush(t->data, storageBytes(*t));
@@ -2216,7 +2228,7 @@ void ContextImplPica::ensureStorage(u32 id)
 
 void ContextImplPica::writeTexels(Tex &t, const u32 *px, u32 x0, u32 y0, u32 w, u32 h)
 {
-    t.drawn = true;
+    t.drawn = t.ever = true;
     if (g_slowtex) {
         switch (t.fmt) {
         case GPU_RGB8: write_rect<GPU_RGB8>(t, px, x0, y0, w, h); break;
@@ -2319,7 +2331,7 @@ bool ContextImplPica::stagedUpdate(Tex &t, const u32 *px, u32 x0, u32 y0, u32 w,
     t.used_frame = pica_frame_number();
     t.dirty = true;
     t.gen++;
-    t.drawn = true;
+    t.drawn = t.ever = true;
     m_pending.push_back({stage, false, pica_frame_number(), bytes});
     ctr64_gfx_mem[3] += bytes;
     return true;
@@ -2411,7 +2423,7 @@ void ContextImplPica::update2DTexture(const Context::UpdateTextureDataParams &p)
         case GPU_LA4: write_full<GPU_LA4>(*t, px.data(), w, h, p.width); break;
         default: write_full<GPU_RGBA8>(*t, px.data(), w, h, p.width); break;
         }
-        t->drawn = true;
+        t->drawn = t->ever = true;
         pica_cache_flush(t->data, storageBytes(*t));
         t->dirty = true;
         t->gen++;
@@ -3743,16 +3755,47 @@ bool ContextImplPica::skipDraw(bool clear)
     }
     Tex *c = tex(drawFbo().color);
     ctr64_frame_drew = true;
-    if (ctr64_render_skip) {
+    /* only buffers that have been on screen: an off-screen image drawn once and reused (Pokemon
+     * Stadium's entry selection panels, GitHub #4) stayed broken until the screen was left
+     * when its frame was skipped; nor a buffer without an image yet: a new buffer whose first
+     * frame was skipped stayed blank where the game only draws over it (the same screen: the
+     * background flickered white/black) */
+    const FrameBuffer *cur = frameBufferList().getCurrent();
+    if (ctr64_render_skip && cur && cur->m_isMainBuffer && c && c->ever) {
         if (c)
             c->skipped = true;
         return true;
     }
     if (c) {
+        if (c->skipped && !(src && src->skipped))
+            healSkipped(*c);
         c->skipped = src && src->skipped; /* a copy of a marked buffer is as stale */
-        c->drawn = true;
+        c->drawn = c->ever = true;
     }
     return false;
+}
+
+/* A buffer that missed a frame is drawn again: it still holds the picture from before the
+ * skipped frame. A game that then redraws only what changes (Pokemon Stadium's entry selection
+ * after its panels slid in, GitHub #4) left it at the half-slid picture, shown every other frame
+ * until the screen was left. It gets the last picture shown first (the other buffer of a double-
+ * buffered game, a frame apart); a full redraw simply covers it. One GPU copy per skipped buffer. */
+void ContextImplPica::healSkipped(Tex &c)
+{
+    const Tex *s = tex(m_shown);
+    if (!s || s == &c || s->skipped || !s->data || !c.data || s->depth || c.depth || s->tw != c.tw ||
+        s->th != c.th || s->bpp != c.bpp || s->fmt != c.fmt || s->th_full || c.th_full)
+        return;
+    const u32 bytes = storageBytes(c);
+    if (s->vram)
+        pica_copy_from_vram(c.data, s->data, bytes);
+    else
+        pica_copy(c.data, s->data, bytes);
+    c.used_frame = pica_frame_number();
+    c.rows_used = s->rows_used;
+    c.dirty = true;
+    c.gen++;
+    ctr64_frames_healed++;
 }
 
 void ContextImplPica::texture_xforms(TexXform tx[2])
@@ -5134,6 +5177,7 @@ const u8 *ContextImplPica::readTextureAsync(CachedTexture *ct, s32 x0, s32 y0, u
     Tex *t = ct ? tex(u32(ct->name)) : nullptr;
     if (t && t->th_full)
         growStorage(u32(ct->name)); /* short storage: all of it is wanted */
+    healForRead(t);
     ReadJob j;
     if (!plan_read(t, x0, y0, w, h, j)) {
         a.finish();
@@ -5172,6 +5216,7 @@ const u8 *ContextImplPica::readTexture(CachedTexture *ct, s32 x0, s32 y0, u32 w,
     Tex *t = ct ? tex(u32(ct->name)) : nullptr;
     if (t && t->th_full)
         growStorage(u32(ct->name)); /* short storage: all of it is wanted */
+    healForRead(t);
     const bool rgba16 = g_ctr64ReadRgba16;
     const u32 bpp = rgba16 ? 2 : 4;
     out.resize((size_t)w * h * bpp); /* zeroed below only where nothing is read */

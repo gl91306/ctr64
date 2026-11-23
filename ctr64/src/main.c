@@ -838,11 +838,11 @@ static void run_game(void)
             };
             menu_set_stats(&ms);
             menu_draw_running();
-            extern unsigned ctr64_frames_drawskip; /* frameskip.c */
+            extern unsigned ctr64_frames_drawskip, ctr64_frames_healed; /* frameskip.c */
             if (g_stats) {
                 extern unsigned ctr64_crc_long[2]; /* GLideN64 CRC_OPT.cpp */
-                fprintf(g_stats, "  frameskip: %u frames drawn skipped, %u presents dropped\n",
-                        ctr64_frames_drawskip, ctr64_frames_skipped);
+                fprintf(g_stats, "  frameskip: %u frames drawn skipped, %u presents dropped, %u buffers healed\n",
+                        ctr64_frames_drawskip, ctr64_frames_skipped, ctr64_frames_healed);
                 fprintf(g_stats, "  texture hashes over 256 bytes: %u, %u KB\n", ctr64_crc_long[0],
                         ctr64_crc_long[1]);
                 ctr64_crc_long[0] = ctr64_crc_long[1] = 0;
@@ -857,6 +857,7 @@ static void run_game(void)
                 ctr64_gd_stat[0] = ctr64_gd_stat[1] = ctr64_gd_stat[2] = ctr64_gd_stat[3] = 0;
             }
             ctr64_frames_drawskip = 0;
+            ctr64_frames_healed = 0;
             ctr64_frames_skipped = 0;
             ctr64_prof_on = g_prof_file || ctr64_profiler == 2;
             if (g_settings.debug_info) {
