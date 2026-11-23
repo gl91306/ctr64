@@ -36,6 +36,10 @@ static char g_loaded_title[80];
 
 static bool is_rom(const char *name)
 {
+    /* hidden files: macOS puts a 4 KB "._<name>" next to every file it copies to a FAT card, with
+     * the same ending; listed, each showed as a second, unplayable copy of the game */
+    if (name[0] == '.')
+        return false;
     const char *dot = strrchr(name, '.');
     return dot && (!strcasecmp(dot, ".z64") || !strcasecmp(dot, ".n64") || !strcasecmp(dot, ".v64"));
 }
