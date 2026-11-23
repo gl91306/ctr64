@@ -36,6 +36,7 @@ void settings_defaults(Settings *s)
     s->fb_emulation = true;
     s->anti_aliasing = false;
     s->aspect = ASPECT_43;
+    s->border = BORDER_ART;
     s->stick_range = 100;
     s->swap_dpad = false;
     s->map[IN_A] = KEY_A;
@@ -266,6 +267,8 @@ void settings_load(const char *path)
             s->anti_aliasing = atoi(v) != 0;
         else if (!strcmp(k, "aspect"))
             s->aspect = clampi(atoi(v), 0, ASPECT_COUNT - 1);
+        else if (!strcmp(k, "borders"))
+            s->border = clampi(atoi(v), 0, BORDER_COUNT - 1);
         else if (!strcmp(k, "dark_mode"))
             s->dark_mode = atoi(v) != 0;
         else if (!strcmp(k, "bottom_screen"))
@@ -290,9 +293,9 @@ bool settings_save(const char *path)
     const Settings *s = &shared;
     fprintf(f, "volume=%d\naudio=%d\nframeskip=%d\nspeed_limit=%d\nthreaded_video=%d\nthreaded_audio=%d\n"
             "debug_info=%d\nfb_copy=%d\nfb_emulation=%d\nremember_blocks=%d\nfast_compile=%d\n"
-            "anti_aliasing=%d\naspect=%d\nprofiler=%d\ndark_mode=%d\nbottom_screen=%d\n", s->volume,
+            "anti_aliasing=%d\naspect=%d\nborders=%d\nprofiler=%d\ndark_mode=%d\nbottom_screen=%d\n", s->volume,
             s->audio, s->frameskip, s->speed_limit, s->threaded_video, s->threaded_audio, s->debug_info, s->fb_copy,
-            s->fb_emulation, s->remember_blocks, s->fast_compile, s->anti_aliasing, s->aspect,
+            s->fb_emulation, s->remember_blocks, s->fast_compile, s->anti_aliasing, s->aspect, s->border,
             s->profiler, s->dark_mode, s->bottom_screen);
     Controls c;
     ctrl_get(&c, s);

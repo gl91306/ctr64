@@ -15,6 +15,7 @@
 #include <time.h>
 
 #include "audio_ndsp.h"
+#include "border.h"
 #include "core_host.h"
 #include "crash.h"
 #include "debug_crumb.h"
@@ -1304,6 +1305,7 @@ int main(void)
                 g_stats = prof_stats_begin(DATA_DIR "/stats.log"); /* written by a background thread */
             ctr64_time_mark("stats log open");
             menu_init(DATA_DIR "/settings.txt");
+            border_prepare(rom); /* the sides of a 4:3 picture */
             ctr64_time_mark("menu ready");
             static aptHookCookie apt_cookie;
             aptHook(&apt_cookie, apt_hook, NULL);
@@ -1335,6 +1337,7 @@ int main(void)
             prof_end(); /* closes the statistics stream too */
             g_stats = NULL;
             core_host_unload();
+            border_free();
             pica_lcd_gamma(false);
             {   /* dev switch blockmap.txt: the rest of the block map (ctr_jit.c) */
                 extern void ctr_jit_blockmap_flush(void);

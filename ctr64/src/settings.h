@@ -20,6 +20,8 @@ enum {
 #define FB_COPY_GAME (-1)
 #define FB_COPY_ASYNC 2
 enum { ASPECT_43, ASPECT_STRETCH, ASPECT_WIDE, ASPECT_COUNT };
+/* what fills the sides of a 4:3 picture (border.h) */
+enum { BORDER_OFF, BORDER_ART, BORDER_CONSOLE, BORDER_COUNT };
 /* bottom_screen while a game runs: the menu card and speed, black, or the backlight off */
 enum { BOTTOM_MENU, BOTTOM_BLANK, BOTTOM_OFF, BOTTOM_COUNT };
 
@@ -38,6 +40,7 @@ typedef struct {
     bool fb_emulation; /* GLideN64 frame buffer emulation (applies when a game starts) */
     bool anti_aliasing; /* render at 2x and scale down (New 3DS; applies when a game starts) */
     int aspect;        /* ASPECT_*: 4:3, stretched to 5:3, widescreen hack (applies when a game starts) */
+    int border;        /* BORDER_*: the sides of the screen next to a 4:3 picture */
     bool dark_mode;    /* the bottom-screen UI in dark colours (ui_set_dark) */
     int bottom_screen; /* BOTTOM_*: the bottom screen while a game runs (any touch opens the menu) */
     int stick_range; /* percent: 100 = full N64 deflection at the Circle Pad's edge */

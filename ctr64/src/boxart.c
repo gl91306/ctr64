@@ -446,7 +446,7 @@ static void png_quiet(png_structp png, png_const_charp msg)
 
 /* PNG -> RGBA8 (malloc), large ones at 1/2, 1/4... size (the art is shrunk to 256 pixels anyway);
  * NULL with a reason in *err. Row by row, so that leaving the list stops it. */
-static u8 *png_decode(const u8 *p, size_t n, int *w, int *h, const char **err)
+static u8 *png_decode(const u8 *p, size_t n, int *w, int *h, const volatile bool *quit, const char **err)
 {
     PngIn in = {p, p + n};
     png_infop info = NULL;
@@ -495,7 +495,7 @@ static u8 *png_decode(const u8 *p, size_t n, int *w, int *h, const char **err)
         }
         for (int pass = 0; pass < passes - 1; pass++)
             for (int y = 0; y < ih; y++) {
-                if (B.quit) {
+                if (*quit) {
                     *err = "stopped";
                     png_error(png, "stop");
                 }
@@ -503,7 +503,7 @@ static u8 *png_decode(const u8 *p, size_t n, int *w, int *h, const char **err)
             }
         u8 *o = out;
         for (int y = 0; y < ih; y++) {
-            if (B.quit) {
+            if (*quit) {
                 *err = "stopped";
                 png_error(png, "stop");
             }
@@ -545,6 +545,28 @@ static u8 *png_decode(const u8 *p, size_t n, int *w, int *h, const char **err)
     return NULL;
 }
 
+/* border.c: a PNG or JPG file as RGBA8 (malloc; large ones at 1/2, 1/4... size), NULL if it cannot
+ * be read. Not while the game list is open. */
+u8 *boxart_read_image(const char *path, int *w, int *h)
+{
+    static const volatile bool no_quit = false;
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    rewind(f);
+    u8 *data = size > 8 && size <= (long)MAX_IMAGE ? malloc((size_t)size) : NULL;
+    const bool got = data && fread(data, 1, (size_t)size, f) == (size_t)size;
+    fclose(f);
+    const char *err = "";
+    u8 *rgba = !got ? NULL
+               : !memcmp(data, "\x89PNG", 4) ? png_decode(data, (size_t)size, w, h, &no_quit, &err)
+                                             : jpg_decode(data, (size_t)size, w, h, &no_quit, &err);
+    free(data);
+    return rgba;
+}
+
 /* one of the user's images -> the game's own cache file; the image is removed when that worked */
 static void import_one(int game, const char *file)
 {
@@ -577,7 +599,7 @@ static void import_one(int game, const char *file)
     }
     const u64 t1 = osGetTime();
     if (n)
-        rgba = !memcmp(data, "\x89PNG", 4) ? png_decode(data, n, &w, &h, &err) : jpg_decode(data, n, &w, &h, &B.quit, &err);
+        rgba = !memcmp(data, "\x89PNG", 4) ? png_decode(data, n, &w, &h, &B.quit, &err) : jpg_decode(data, n, &w, &h, &B.quit, &err);
     free(data);
     const u64 t2 = osGetTime();
     const bool ok = rgba && save_image(rgba, w, h, bin, true);
@@ -629,7 +651,7 @@ static bool download_one(CURL *c, Art *a, Buf *b)
             return false;
         int w, h;
         const char *err;
-        u8 *rgba = png_decode(b->p, b->n, &w, &h, &err);
+        u8 *rgba = png_decode(b->p, b->n, &w, &h, &B.quit, &err);
         if (!rgba && (!strcmp(err, "not a PNG") || !strcmp(err, "size not supported")))
             continue;
         snprintf(path, sizeof(path), ART_DIR "/%s.bin", a->key);

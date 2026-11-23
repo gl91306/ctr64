@@ -59,6 +59,7 @@ sdmc:/3ds/ctr64/states/<ROM>.stateN  save states, slots 0-9
 sdmc:/3ds/ctr64/settings.txt       settings and button mapping (written by the menu)
 sdmc:/3ds/ctr64/controls/          per-game button mappings (when a game has its own)
 sdmc:/3ds/ctr64/boxart/            downloaded box art
+sdmc:/3ds/ctr64/borders/           your own side border pictures (optional)
 sdmc:/3ds/ctr64/jit/               per-game lists of compiled code (makes later starts smoother)
 sdmc:/3ds/ctr64/core.log           log of the last session; crash.txt if it crashed
 ```
@@ -97,7 +98,8 @@ pauses and opens the menu:
   overwriting a used slot, Reset, Game list and Exit ask for confirmation first.
 - **Audio**: volume, sound on or off
 - **Video**: frameskip (Auto by default: it skips drawing only while the game runs behind),
-  fps limit, anti-aliasing (New 3DS), screen shape (4:3, stretch, widescreen),
+  fps limit, anti-aliasing (New 3DS), screen shape (4:3, stretch, widescreen), **side borders**
+  (see below),
   **dark mode**, **bottom screen in game** (Menu, Blank, or Off: the backlight goes off; any
   tap still opens the menu), frame buffer emulation and copy mode, and options for threads and
   compiling
@@ -109,6 +111,13 @@ pauses and opens the menu:
   saves the controls for just that game (`controls/` folder); START again goes back to the shared
   ones. On a New 3DS the C-Stick works for the C buttons in addition to their mapped buttons.
 - **Reset**, **Game list**, **Exit**
+
+**Side borders** fill the bars left and right of a 4:3 picture: **Box art** (the default: the
+game's box art, blurred and darkened), **Console** (grey plastic with a D-pad and buttons) or
+**Off**. Your own picture wins over both: put a `.png` or `.jpg` named like the ROM into
+`sdmc:/3ds/ctr64/borders` (`My Game.z64`: `My Game.png`), or `default.png` for every game without
+its own. A 400x240 picture is used as it is (only its outer 40 pixels on each side show); other
+sizes are scaled to cover the screen.
 
 Default controls:
 

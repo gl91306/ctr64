@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "audio_ndsp.h"
+#include "border.h"
 #include "core_host.h"
 #include "remote.h"
 #include "rom_browser.h"
@@ -205,7 +206,7 @@ typedef enum { PAGE_MAIN, PAGE_AUDIO, PAGE_VIDEO, PAGE_CONTROLS } Page;
 
 enum { M_RESUME, M_SAVE, M_LOAD, M_SLOT, M_AUDIO, M_VIDEO, M_CONTROLS, M_RESET, M_GAME_LIST, M_EXIT, M_COUNT };
 enum { A_VOLUME, A_SOUND, A_COUNT };
-enum { V_FRAMESKIP, V_LIMIT, V_AA, V_ASPECT, V_DARK, V_BOTTOM, V_FB_EMU, V_FB_COPY, V_THREADED, V_THREADED_AUDIO, V_PRECOMPILE,
+enum { V_FRAMESKIP, V_LIMIT, V_AA, V_ASPECT, V_BORDER, V_DARK, V_BOTTOM, V_FB_EMU, V_FB_COPY, V_THREADED, V_THREADED_AUDIO, V_PRECOMPILE,
        V_FAST_COMPILE, V_PROFILER, V_DEBUG, V_COUNT };
 #define PAD_N ((int)(sizeof(k_n64pad_hot) / sizeof(k_n64pad_hot[0])))
 #define PAD_STICK -1
@@ -376,6 +377,13 @@ static void list_item(int i, const char **label, char *v, size_t vn, bool *dim)
         *label = "Screen";
         snprintf(v, vn, "%s%s", as[g_settings.aspect],
                  !g_no_game && g_settings.aspect != ctr64_aspect_applied() ? " *" : "");
+        break;
+    }
+    case V_BORDER: {
+        static const char *const bs[] = {"Off", "Box art", "Console"};
+        *label = "Side borders (4:3)";
+        snprintf(v, vn, "%s", bs[g_settings.border]);
+        *dim = g_settings.aspect != ASPECT_43;
         break;
     }
     case V_DARK:
@@ -897,6 +905,10 @@ static bool change(int i, int dir)
         } else if (i == V_ASPECT) {
             s->aspect = (s->aspect + (dir ? dir : 1) + ASPECT_COUNT) % ASPECT_COUNT;
             settings_publish();
+        } else if (i == V_BORDER) {
+            s->border = (s->border + (dir ? dir : 1) + BORDER_COUNT) % BORDER_COUNT;
+            if (!g_no_game)
+                border_refresh();
         } else if (i == V_DARK) {
             s->dark_mode = !s->dark_mode;
             ui_set_dark(s->dark_mode);

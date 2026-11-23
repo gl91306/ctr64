@@ -55,6 +55,10 @@ void video_clear_draw(const PicaTarget *t, u32 rgba); /* a color target cleared 
 void video_draw_fullscreen(const void *tex, u16 tw, u16 th, GPU_TEXCOLOR fmt, u16 w, u16 h,
                            bool top_is_t0, bool linear);
 
+/* the side borders (border.h) over the bars of a 400x240 picture in t (240x400, the LCD's way
+ * round), when there are any */
+void video_draw_borders(const PicaTarget *t);
+
 void video_present(void);
 /* the frame ends with this 240x400 target (already the way round the LCD is) instead of the screen */
 void video_present_target(const PicaTarget *t);

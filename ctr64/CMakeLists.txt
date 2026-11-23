@@ -29,6 +29,7 @@ add_executable(ctr64
   src/gpu_test.c
   src/rom_browser.c
   src/boxart.c
+  src/border.c
   src/jpg.c
   src/rom_title.c
   src/rom_stream.c

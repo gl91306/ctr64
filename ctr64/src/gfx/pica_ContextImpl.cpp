@@ -4921,11 +4921,13 @@ void ContextImplPica::present()
     ensureFrame();
     Tex *c = tex(TEX_WINDOW_COLOR);
     if (m_winRot) {
+        video_draw_borders(&m_window.rt); /* over the black bars of a 4:3 picture */
         video_present_target(&m_window.rt);
         return;
     }
     pica_texture_flush_cache();
     video_draw_fullscreen(c->data, c->tw, c->th, GPU_RGBA8, c->w, c->h, false, true);
+    video_draw_borders(video_screen());
     video_present();
 }
 

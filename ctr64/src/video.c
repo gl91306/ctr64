@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "border.h"
 #include "ctr64_shaders_shbin.h"
 #include "ctru_abi.h"
 
@@ -285,6 +286,49 @@ void video_draw_fullscreen(const void *tex, u16 tw, u16 th, GPU_TEXCOLOR fmt, u1
                            bool top_is_t0, bool linear)
 {
     draw_screen_quad(tex, tw, th, fmt, w, h, top_is_t0, linear, 0, 400);
+}
+
+void video_draw_borders(const PicaTarget *t)
+{
+    bool changed = false;
+    const void *tex = border_texture(&changed);
+    if (!tex)
+        return;
+    PicaTev tev;
+    VideoBatch b;
+    if (changed)
+        pica_texture_flush_cache();
+    pica_bind_target(t);
+    pica_viewport(0, 0, t->width, t->height);
+    pica_scissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+    pica_depth_test(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+    pica_depth_map(-1.0f, 0.0f);
+    pica_cull(GPU_CULL_NONE);
+    pica_alpha_test(false, GPU_ALWAYS, 0);
+    pica_blend_off();
+    video_use_program(V.proj_screen);
+    pica_texture(0, tex, BORDER_TW, BORDER_TH, GPU_RGB565,
+                 GPU_TEXTURE_MAG_FILTER(GPU_NEAREST) | GPU_TEXTURE_MIN_FILTER(GPU_NEAREST) |
+                     GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE));
+    for (int unit = 1; unit < 3; unit++)
+        pica_texture(unit, NULL, 0, 0, GPU_RGBA8, 0);
+    pica_tev_default(&tev);
+    tev.src_rgb = GPU_TEVSOURCES(GPU_TEXTURE0, 0, 0);
+    tev.src_alpha = GPU_TEVSOURCES(GPU_CONSTANT, 0, 0);
+    tev.color = 0xFFFFFFFF;
+    pica_tev(0, &tev);
+    pica_tev_default(&tev);
+    for (int i = 1; i < 6; i++)
+        pica_tev(i, &tev);
+    /* memory row 0 = image row 0 is sampled at v = 1 */
+    const float u_side = (float)BORDER_SIDE / BORDER_TW, u_right = (float)BORDER_RIGHT_U / BORDER_TW;
+    const float v_bot = 1.0f - 240.0f / BORDER_TH;
+    if (video_batch_begin(&b, 12)) {
+        video_batch_quad4(&b, 0, 0, BORDER_SIDE, 240, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0, 1.0f, u_side, v_bot);
+        video_batch_quad4(&b, 400 - BORDER_SIDE, 0, 400, 240, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, u_right, 1.0f,
+                          u_right + u_side, v_bot);
+        video_batch_draw(&b);
+    }
 }
 
 void video_present(void)
