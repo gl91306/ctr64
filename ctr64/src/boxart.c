@@ -43,7 +43,7 @@
 #define URL_BASE "https://raw.githubusercontent.com/libretro-thumbnails/Nintendo_-_Nintendo_64/master/Named_Boxarts/"
 #define TEX 256
 #define TEX_BYTES (TEX * TEX * 2)
-#define MAX_GAMES 200
+#define MAX_GAMES 1000 /* as the game list (allocated while it is open) */
 #define KEEP 4                    /* textures kept on each side of the selection */
 #define POOL (2 * KEEP + 3)       /* texture buffers: the kept ones plus room to load ahead */
 #define LABELS 12                 /* title cards (A8 256x32) */
@@ -78,7 +78,7 @@ typedef struct {
 } Art;
 
 static struct {
-    Art art[MAX_GAMES];
+    Art *art;
     int n;
     volatile int sel;
     float pos;            /* carousel position (animated towards sel) */
@@ -143,7 +143,9 @@ static void thumb_safe(char *s)
 
 void boxart_begin(void)
 {
+    free(B.art); /* only left after a download thread that did not end (boxart_end) */
     memset(&B, 0, sizeof(B));
+    B.art = (Art *)calloc(MAX_GAMES, sizeof(Art));
     LightLock_Init(&B.lock);
     LightEvent_Init(&B.wake, RESET_ONESHOT);
     for (int i = 0; i < LABELS; i++)
@@ -153,7 +155,7 @@ void boxart_begin(void)
 
 void boxart_add(const char *path, const char *title, const char *id, bool hack)
 {
-    if (B.n >= MAX_GAMES)
+    if (!B.art || B.n >= MAX_GAMES)
         return;
     Art *a = &B.art[B.n++];
     a->tex = a->label = -1;
@@ -916,10 +918,13 @@ void boxart_end(void)
         threadJoin(B.loader, 3000000000LL);
         threadFree(B.loader);
     }
+    bool still_running = false;
     if (B.downloader) {
         /* curl gives up within a second (progress callback); a DNS lookup may take longer */
         if (R_SUCCEEDED(threadJoin(B.downloader, 8000000000LL)))
             threadFree(B.downloader);
+        else
+            still_running = true;
     }
     pica_wait_idle();
     for (int i = 0; i < POOL; i++)
@@ -932,6 +937,11 @@ void boxart_end(void)
         if (B.title_tex[i])
             linearFree(B.title_tex[i]);
     B.active = false;
+    if (!still_running) { /* else the download thread may still read the list: it stays */
+        free(B.art);
+        B.art = NULL;
+        B.n = 0;
+    }
 }
 
 /* ---- drawing ---------------------------------------------------------------------------- */

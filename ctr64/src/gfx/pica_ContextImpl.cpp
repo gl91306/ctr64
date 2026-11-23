@@ -265,6 +265,7 @@ bool g_noshadelin; /* dev switch noshadelin.txt: no screen-linear shade subdivis
 bool g_novramflush; /* dev switch novramflush.txt: no cache flush after CPU texel writes into VRAM */
 bool g_novpz;      /* dev switch novpz.txt: the N64 viewport's z scale and translation not applied */
 bool g_noproj;     /* dev switch noproj.txt: screen-linear shade by subdivision, not projective draws */
+bool g_noalphaover; /* dev switch noalphaover.txt: alpha blended with the colour's factors (setBlending) */
 bool g_noidxdraw;  /* dev switch noidxdraw.txt: indexed triangle lists drawn as plain lists (A/B) */
 
 bool g_nobanks;
@@ -1096,7 +1097,18 @@ public:
     void setDepthCompare(CompareParam mode) override { m_depthFunc = u32(mode); }
     void setViewport(s32 x, s32 y, s32 w, s32 h) override { m_vp[0] = x; m_vp[1] = y; m_vp[2] = w; m_vp[3] = h; }
     void setScissor(s32 x, s32 y, s32 w, s32 h) override { m_sc[0] = x; m_sc[1] = y; m_sc[2] = w; m_sc[3] = h; }
-    void setBlending(BlendParam s, BlendParam d) override { setBlendingSeparate(s, d, s, d); }
+    /* GLideN64's legacy blending gives alpha the colour's factors: a see-through draw then lowers
+     * the stored alpha (a*a + dst*(1-a)), where the N64 keeps coverage (an opaque pixel stays
+     * opaque). Gauntlet Legends' HUD is drawn into a buffer that is copied to the screen with an
+     * alpha test of 0.94: the 49% glow over the portrait made that area fail it (a black box).
+     * Alpha is composited "over" instead: src + dst * (1 - src). Dev switch noalphaover.txt: off. */
+    void setBlending(BlendParam s, BlendParam d) override
+    {
+        if (u32(s) == BL_SRC_ALPHA && u32(d) == BL_ONE_MINUS_SRC_ALPHA && !g_noalphaover)
+            setBlendingSeparate(s, d, BlendParam(BL_ONE), d);
+        else
+            setBlendingSeparate(s, d, s, d);
+    }
     void setBlendingSeparate(BlendParam sc, BlendParam dc, BlendParam sa, BlendParam da) override
     {
         m_blend[0] = u32(sc); m_blend[1] = u32(dc); m_blend[2] = u32(sa); m_blend[3] = u32(da);
@@ -1489,6 +1501,11 @@ void ContextImplPica::init()
     if (FILE *np = fopen("sdmc:/3ds/ctr64/noproj.txt", "r")) {
         fclose(np);
         g_noproj = true;
+    }
+    g_noalphaover = false;
+    if (FILE *nao = fopen("sdmc:/3ds/ctr64/noalphaover.txt", "r")) {
+        fclose(nao);
+        g_noalphaover = true;
     }
     g_noshadelin = false;
     if (FILE *ns = fopen("sdmc:/3ds/ctr64/noshadelin.txt", "r")) {
@@ -3797,7 +3814,7 @@ bool ContextImplPica::setupCombiner(bool rect)
         pica_tev_default(&t);
     u8 buf_rgb = 0, buf_a = 0;
     u32 buf_color = 0xFFFFFFFF;
-    bool alpha_test = false;
+    bool alpha_test = false, alpha_greater = false;
     u8 alpha_ref = 0;
 
     switch (m_kind) {
@@ -3880,23 +3897,34 @@ bool ContextImplPica::setupCombiner(bool rect)
             t.color = pica_const_color(to_u8(gDP.fogColor.r), to_u8(gDP.fogColor.g), to_u8(gDP.fogColor.b), 255);
         }
 
-        /* Alpha compare (UAlphaTestInfo + ShaderAlphaTest); cvgXAlpha discards below 0.125. */
+        /* Alpha compare (UAlphaTestInfo + ShaderAlphaTest); cvgXAlpha discards below 0.125.
+         * The RDP's threshold compare writes a pixel only when its alpha is GREATER than the
+         * blend colour's alpha (angrylion: comb_alpha > threshold), so with a threshold of 0 it
+         * still drops alpha-0 pixels. GLideN64 discards only alpha < threshold, i.e. nothing at
+         * 0: Gauntlet Legends' HUD portrait, drawn twice without blending and cut out by the
+         * test alone, became a black box (its second, 35x33 layer is transparent around the face). */
         float ref = -1.0f;
+        bool greater = false;
         if (cycle == G_CYC_COPY) {
             if (gDP.otherMode.alphaCompare & G_AC_THRESHOLD)
                 ref = 0.5f;
         } else if (cycle != G_CYC_FILL && (gDP.otherMode.alphaCompare & G_AC_THRESHOLD)) {
             ref = gDP.blendColor.a;
+            greater = true;
             if (cvg_alpha) {
                 if (0.125f < ref)
                     return false; /* the test compares the constant 0.125: every fragment fails */
                 ref = -1.0f;
+                greater = false;
             }
         }
-        if (cycle <= G_CYC_2CYCLE && gDP.otherMode.cvgXAlpha && ref < 0.125f)
+        if (cycle <= G_CYC_2CYCLE && gDP.otherMode.cvgXAlpha && ref < 0.125f) {
             ref = 0.125f;
-        if (ref > 0.0f) {
+            greater = false;
+        }
+        if (ref > 0.0f || (greater && ref >= 0.0f)) {
             alpha_test = true;
+            alpha_greater = greater;
             alpha_ref = to_u8(ref);
         }
         /* GLideN64 (ShaderAlphaTest) compares alpha1, cycle 1's alpha, not the output alpha;
@@ -3923,7 +3951,7 @@ bool ContextImplPica::setupCombiner(bool rect)
     for (int i = 0; i < pica_cmb::MAX_STAGES; i++)
         pica_tev(i, &tev[i]);
     pica_tev_buffer(buf_rgb, buf_a, buf_color);
-    pica_alpha_test(alpha_test, GPU_GEQUAL, alpha_ref);
+    pica_alpha_test(alpha_test, alpha_greater ? GPU_GREATER : GPU_GEQUAL, alpha_ref);
     return true;
 }
 

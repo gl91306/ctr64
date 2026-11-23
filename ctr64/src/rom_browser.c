@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <strings.h>
 
@@ -17,7 +18,7 @@
 void ctr64_time_mark(const char *what); /* main.c: timing.log */
 void ctr64_time_flush(void);
 
-#define MAX_ROMS 200
+#define MAX_ROMS 1000 /* the list is allocated while it is open (about 250 KB for 1000) */
 #define ROW_H 34  /* row pitch: a 30-pixel card and a 4-pixel gap */
 #define CARD_H 30
 #define LIST_Y (UI_HEADER_H + 6)
@@ -29,7 +30,7 @@ typedef struct {
     char tags[32];
     char id[5]; /* cartridge ID (box art) */
 } Rom;
-static Rom g_roms[MAX_ROMS];
+static Rom *g_roms;
 static int g_count;
 static char g_loaded_title[80];
 
@@ -148,7 +149,21 @@ static void draw_frame(void)
     ui_footer_button(UI_W - 8, NULL, "START  Quit", true);
 }
 
+static RomBrowserResult pick(const char *dir, char *out, size_t outsz);
+
 RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
+{
+    mkdir(dir, 0777); /* a missing roms folder: there it is, for the "No games found" card */
+    g_roms = (Rom *)malloc(MAX_ROMS * sizeof(Rom));
+    if (!g_roms)
+        return ROM_BROWSER_QUIT;
+    const RomBrowserResult r = pick(dir, out, outsz);
+    free(g_roms);
+    g_roms = NULL;
+    return r;
+}
+
+static RomBrowserResult pick(const char *dir, char *out, size_t outsz)
 {
     int sel = 0, scroll = 0;
     DIR *d = opendir(dir);

@@ -620,7 +620,10 @@ static void run_game(void)
     g_prof_file = pf != NULL;
     if (pf)
         fclose(pf);
-    ctr64_prof_on = g_settings.debug_info || g_prof_file || ctr64_profiler == 2;
+    /* the draw timers (stats.log "prof" line): each tick read is a kernel call, ~13 per draw, which
+     * halved the speed of draw-heavy scenes (Gauntlet, Mario Golf) with the debug screen on; that
+     * screen does not show them. Dev switch prof.txt or the detailed profiler turns them on. */
+    ctr64_prof_on = g_prof_file || ctr64_profiler == 2;
     /* development aid: crashtest.txt crashes at VI 300 to check the crash reporter ("abort" in it
      * calls abort(), otherwise an undefined instruction) */
     FILE *ct = fopen(DATA_DIR "/crashtest.txt", "r");
@@ -855,7 +858,7 @@ static void run_game(void)
             }
             ctr64_frames_drawskip = 0;
             ctr64_frames_skipped = 0;
-            ctr64_prof_on = g_settings.debug_info || g_prof_file || ctr64_profiler == 2;
+            ctr64_prof_on = g_prof_file || ctr64_profiler == 2;
             if (g_settings.debug_info) {
             printf("\x1b[%d;0Hemu    %6.2f ms/frame   \n", menu_debug_row(), emu_ms / 60);
             printf("gpu    %6.2f ms cpu, %5.2f ms wait   \n", s->cpu_ms, s->fence_wait_ms);
