@@ -39,9 +39,10 @@ FBI. ctr64 then appears on the HOME Menu.
 (178 MB), so games over about 48 MB load whole instead of being read from the SD card while they
 run. That helps **Conker's Bad Fur Day, Resident Evil 2, Pokemon Stadium 2, Dinosaur Planet, Paper
 Mario (Europe)** and big ROM hacks such as **Smash Remix**: no pauses while the game reads new parts
-from the SD card. The catch: the 3DS restarts its system when ctr64 opens and closes (10-20 s), and
-on some New 3DS it stays on a black screen; if so, go back to `ctr64.cia`. Both are the same app
-(installing one replaces the other) and share settings and saves. Old 3DS: use `ctr64.cia`.
+from the SD card. The only issue is that the 3DS restarts its system when ctr64 opens and closes (10-20 s), and
+on some New 3DS it stays on a black screen. If that happens to you go back to `ctr64.cia`.
+
+ Old 3DS: use `ctr64.cia`.
 
 On an Old 3DS, opening and closing the CIA takes about 10-20 seconds: it asks for an extended memory
 mode (80 MB), and the 3DS has to restart its system to switch to it, once when ctr64 opens and again
