@@ -147,6 +147,12 @@ sdmc:/3ds/ctr64/borders/My Hack.png     its side borders while it runs
 sdmc:/3ds/ctr64/borders/default.png     side borders for every game without its own
 ```
 
+<p align="center"><img src="docs/screenshots/hackart.png" alt="The game list with your own box art for Smash Remix" width="300"></p>
+
+<sub>Smash Remix box art in the screenshot by [Macho-King](https://macho-king.newgrounds.com/).</sub>
+
+![Side borders: box art, console, and your own pictures (Pokemon Stadium, Smash Remix)](docs/screenshots/borders.png)
+
 **Box art**: put the picture in `sdmc:/3ds/ctr64/boxart` and open ctr64. It converts the picture
 while the game list is open (about a second for a normal one), shows it, and then **removes the
 original**, so keep a copy on your PC. The converted file is `u_My Hack.bin`; delete it to go
