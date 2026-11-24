@@ -30,6 +30,9 @@ add_executable(ctr64
   src/rom_browser.c
   src/boxart.c
   src/border.c
+  src/vru.c
+  src/vru_rec.c
+  src/vru_model.S
   src/jpg.c
   src/rom_title.c
   src/rom_stream.c
@@ -93,3 +96,8 @@ ctr_generate_smdh(ctr64.smdh
   ICON "${CMAKE_CURRENT_SOURCE_DIR}/cia/icon.png")  # 48x48, from tools/icon/make_final.py
 
 ctr_create_3dsx(ctr64 SMDH ctr64.smdh)
+
+# the VRU phoneme model (tools/vru) is .incbin-ed by src/vru_model.S
+set_source_files_properties(src/vru_model.S PROPERTIES
+  COMPILE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/data"
+  OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/data/vru_model.bin")

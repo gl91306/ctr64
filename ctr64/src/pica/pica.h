@@ -168,6 +168,9 @@ void pica_texture_flush_cache(void);
 
 void pica_depth_test(bool enable, GPU_TESTFUNC func, u32 writemask /* GPU_WRITEMASK */);
 void pica_depth_map(float scale, float offset);
+/* stencil test against ref (all 8 bits); on depth pass the stencil is replaced by ref. Off for
+ * internal draws (pica_state_save). */
+void pica_stencil(bool enable, GPU_TESTFUNC func, u8 ref);
 void pica_cull(GPU_CULLMODE mode);
 void pica_alpha_test(bool enable, GPU_TESTFUNC func, u8 ref);
 void pica_blend(GPU_BLENDEQUATION eq_rgb, GPU_BLENDEQUATION eq_a, GPU_BLENDFACTOR src_rgb,

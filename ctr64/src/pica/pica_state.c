@@ -36,6 +36,7 @@ static struct {
 
     u32 access[4]; /* framebuffer color read/write, depth read/write (0x112-0x115) */
     u32 depth_color, depth_scale, depth_offset;
+    u32 stencil_test, stencil_op; /* 0: off (reset value) */
     u32 cull, alpha_test, blend_func, blend_color;
     bool effect_valid;
 
@@ -428,6 +429,20 @@ void pica_depth_test(bool enable, GPU_TESTFUNC func, u32 writemask)
     GPUCMD_AddMaskedWrite(GPUREG_GAS_DELTAZ_DEPTH, 0x8, (u32)GPU_MAKEGASDEPTHFUNC(func) << 24);
 }
 
+void pica_stencil(bool enable, GPU_TESTFUNC func, u8 ref)
+{
+    const u32 t = enable ? 1u | ((u32)(func & 7) << 4) | (0xFFu << 8) | ((u32)ref << 16) | (0xFFu << 24) : 0;
+    const u32 op = enable ? (u32)GPU_STENCIL_KEEP | ((u32)GPU_STENCIL_KEEP << 4) | ((u32)GPU_STENCIL_REPLACE << 8) : 0;
+    if (t != S.stencil_test) {
+        S.stencil_test = t;
+        GPUCMD_AddWrite(GPUREG_STENCIL_TEST, t);
+    }
+    if (op != S.stencil_op) {
+        S.stencil_op = op;
+        GPUCMD_AddWrite(GPUREG_STENCIL_OP, op);
+    }
+}
+
 void pica_depth_map(float scale, float offset)
 {
     u32 s = f32tof24(scale), o = f32tof24(offset);
@@ -612,6 +627,7 @@ static __typeof__(S) Ssave;
 void pica_state_save(void)
 {
     Ssave = S;
+    pica_stencil(false, GPU_ALWAYS, 0); /* internal draws: no stencil (the next game draw sets it again) */
 }
 
 void pica_state_restore(void)

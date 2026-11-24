@@ -119,6 +119,13 @@ game's box art, blurred and darkened), **Console** (grey plastic with a D-pad an
 its own. A 400x240 picture is used as it is (only its outer 40 pixels on each side show); other
 sizes are scaled to cover the screen.
 
+**Voice games**: Hey You, Pikachu! and Densha de GO! 64 use the N64's Voice Recognition Unit,
+and ctr64 uses the 3DS microphone for it. Hold the N64 **Z** button (L by default) while you
+speak, and let go when you are done; the game then gets the word you said. The words are
+recognized on the 3DS itself, with a small speech model built into ctr64 (no internet needed),
+after you let go, so the game keeps running at full speed while you talk. Speak clearly and
+close to the microphone; Densha de GO! 64 expects its Japanese words.
+
 Default controls:
 
 | N64 | New 3DS | Old 3DS |

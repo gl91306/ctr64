@@ -31,6 +31,7 @@ static const struct {
     {"B7", "Banjo-Tooie", "BANJO"},
     {"DY", "Diddy Kong Racing", "DIDDY"},
     {"DO", "Donkey Kong 64", "DONKEYKONG"},
+    {"D6", "Densha de GO! 64", "GO64"},
     {"FZ", "F-Zero X", "FZERO"},
     {"YS", "Yoshi's Story", "YOSHI"},
     {"K4", "Kirby 64: The Crystal Shards", "KIRBY"},
@@ -115,13 +116,79 @@ static bool from_file(const char *file, char *title, size_t tn, char *tags, size
     return true;
 }
 
+/* Japanese headers spell names in half-width katakana (JIS X 0201, 0xA6-0xDF), which the
+ * menu font has no letters for: written in upper-case romaji instead ("\xC3\xDE\xDD\xBC\xAC" ->
+ * "DENSHA"). Other bytes above 0x7F are dropped. */
+static void header_ascii(const unsigned char *src, int n, char *out, size_t on)
+{
+    static const char *const kana[0xDE - 0xA6] = {
+        "WO", "a", "i", "u", "e", "o", "ya", "yu", "yo", "tsu", "-", /* A6-B0: small kana, long mark */
+        "A", "I", "U", "E", "O", "KA", "KI", "KU", "KE", "KO", "SA", "SHI", "SU", "SE", "SO",
+        "TA", "CHI", "TSU", "TE", "TO", "NA", "NI", "NU", "NE", "NO", "HA", "HI", "FU", "HE", "HO",
+        "MA", "MI", "MU", "ME", "MO", "YA", "YU", "YO", "RA", "RI", "RU", "RE", "RO", "WA", "N"};
+    size_t k = 0;
+    bool sokuon = false; /* small tsu: double the next consonant */
+    size_t last = 0;     /* where the last syllable starts, and its kana */
+    unsigned lastc = 0;
+    for (int i = 0; i < n && k + 4 < on; i++) {
+        const unsigned c = src[i];
+        if (c < 0x80) {
+            out[k++] = (char)c;
+            lastc = 0;
+            continue;
+        }
+        if (c < 0xA6 || c > 0xDF)
+            continue;
+        if (c == 0xDE || c == 0xDF) { /* (han)dakuten: voice the syllable just written */
+            static const char *const dak[] = {"GA", "GI", "GU", "GE", "GO", "ZA", "JI", "ZU", "ZE", "ZO",
+                                              "DA", "JI", "ZU", "DE", "DO"}; /* KA-TO */
+            static const char *const hd[] = {"BA", "BI", "BU", "BE", "BO"}, *const hp[] = {"PA", "PI", "PU", "PE", "PO"};
+            const char *v = NULL;
+            if (c == 0xDE && lastc >= 0xB6 && lastc <= 0xC4)
+                v = dak[lastc - 0xB6];
+            else if (lastc >= 0xCA && lastc <= 0xCE)
+                v = (c == 0xDE ? hd : hp)[lastc - 0xCA];
+            else if (c == 0xDE && lastc == 0xB3)
+                v = "VU";
+            if (v) {
+                k = last;
+                while (*v && k + 1 < on)
+                    out[k++] = *v++;
+            }
+            lastc = 0;
+            continue;
+        }
+        const char *r = kana[c - 0xA6];
+        if (c == 0xAF) { /* small tsu */
+            sokuon = true;
+            continue;
+        }
+        if (c >= 0xAC && c <= 0xAE && k >= 2 && out[k - 1] == 'I') { /* KI + small YA -> KYA, SHI + YA -> SHA */
+            const bool palatal = (k >= 3 && (!strncmp(&out[k - 3], "SHI", 3) || !strncmp(&out[k - 3], "CHI", 3))) ||
+                                 out[k - 2] == 'J';
+            k--;
+            if (!palatal)
+                out[k++] = 'Y';
+            out[k++] = (char)toupper((unsigned char)r[1]);
+            continue;
+        }
+        if (sokuon && r[0] && !strchr("AIUEOaiueo-", r[0]))
+            out[k++] = r[0] == 'C' ? 'T' : r[0];
+        sokuon = false;
+        last = k;
+        lastc = c;
+        for (const char *q = r; *q && k + 1 < on; q++)
+            out[k++] = (char)toupper((unsigned char)*q);
+    }
+    out[k] = 0;
+}
+
 /* "SUPER MARIO 64  " -> "Super Mario 64"; short all-capital words (CPU, NBA) stay as they are */
 static void from_header(const unsigned char *h, char *title, size_t tn)
 {
-    char raw[21];
-    memcpy(raw, h + 0x20, 20);
-    raw[20] = 0;
-    for (int i = 19; i >= 0 && (raw[i] == ' ' || raw[i] == 0); i--)
+    char raw[64];
+    header_ascii(h + 0x20, 20, raw, sizeof(raw));
+    for (int i = (int)strlen(raw) - 1; i >= 0 && raw[i] == ' '; i--)
         raw[i] = 0;
     size_t n = 0;
     bool start = true;

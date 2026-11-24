@@ -1143,7 +1143,7 @@ index 2041bac..35d026f 100644
  
  		void drawTriangles(const DrawTriangleParameters & _params);
 diff --git a/GLideN64/src/GraphicsDrawer.cpp b/GLideN64/src/GraphicsDrawer.cpp
-index a2fb0af..1c1dc7f 100644
+index a2fb0af..f693fc8 100644
 --- a/GLideN64/src/GraphicsDrawer.cpp
 +++ b/GLideN64/src/GraphicsDrawer.cpp
 @@ -1,3 +1,8 @@
@@ -1176,7 +1176,25 @@ index a2fb0af..1c1dc7f 100644
  		}
  	}
  }
-@@ -642,6 +652,7 @@ void GraphicsDrawer::_updateTextures() const
+@@ -265,6 +275,17 @@ void GraphicsDrawer::_legacyBlending() const
+ 	if (gDP.otherMode.forceBlender != 0 && gDP.otherMode.cycleType < G_CYC_COPY) {
+ 		BlendParam sfactor, dfactor;
+ 
++#if defined(__3DS__)
++		/* ctr64: in 1-cycle mode the RDP blends with the first cycle's muxes only. Fog of the pixel
++		 * (fog colour * a + pixel * (1-a), no memory input) is done in the shader: blending with the
++		 * frame buffer as the table's 2-cycle meanings of these modes (0xC810, 0xC811, 0xC912) do
++		 * made Densha de GO! 64's scenery see-through. */
++		if (gDP.otherMode.cycleType == G_CYC_1CYCLE && gDP.otherMode.c1_m1a == 3 && gDP.otherMode.c1_m2a == 0) {
++			gfxContext.enable(enable::BLEND, false);
++			return;
++		}
++#endif
++
+ 		switch (blendmode)
+ 		{
+ 			// Mace objects
+@@ -642,6 +663,7 @@ void GraphicsDrawer::_updateTextures() const
  
  void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
  {
@@ -1184,7 +1202,7 @@ index a2fb0af..1c1dc7f 100644
  	CombinerInfo & cmbInfo = CombinerInfo::get();
  	cmbInfo.setPolygonMode(_drawingState);
  	cmbInfo.update();
-@@ -785,7 +796,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
+@@ -785,7 +807,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
  		}
  
  		setDepthCopyParameters();
@@ -1193,7 +1211,7 @@ index a2fb0af..1c1dc7f 100644
  	} else if (m_depthCopyMode != BgDepthCopyMode::eCopyDone &&
  		isCurrentColorImageDepthImage() &&
  		config.generalEmulation.enableFragmentDepthWrite != 0 &&
-@@ -819,6 +830,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
+@@ -819,6 +841,7 @@ void GraphicsDrawer::_updateStates(DrawingState _drawingState) const
  
  void GraphicsDrawer::_prepareDrawTriangle(DrawingState _drawingState)
  {
@@ -1201,7 +1219,7 @@ index a2fb0af..1c1dc7f 100644
  	m_texrectDrawer.draw();
  
  	if ((m_modifyVertices & MODIFY_XY) != 0)
-@@ -846,33 +858,147 @@ bool GraphicsDrawer::_canDraw() const
+@@ -846,33 +869,147 @@ bool GraphicsDrawer::_canDraw() const
  	return config.frameBufferEmulation.enable == 0 || frameBufferList().getCurrent() != nullptr;
  }
  
@@ -1355,7 +1373,7 @@ index a2fb0af..1c1dc7f 100644
  		}
  		frameBufferList().setBufferChanged(maxY);
  		if (config.frameBufferEmulation.copyDepthToRDRAM == Config::cdSoftwareRender &&
-@@ -882,11 +1008,22 @@ void GraphicsDrawer::drawTriangles()
+@@ -882,11 +1019,22 @@ void GraphicsDrawer::drawTriangles()
  				pCurrentDepthBuffer->setDirty();
  		}
  	} else {
@@ -1378,7 +1396,7 @@ index a2fb0af..1c1dc7f 100644
  	dropRenderState();
  }
  
-@@ -977,6 +1114,11 @@ void GraphicsDrawer::drawDMATriangles(u32 _numVtx)
+@@ -977,6 +1125,11 @@ void GraphicsDrawer::drawDMATriangles(u32 _numVtx)
  				pCurrentDepthBuffer->setDirty();
  		}
  	} else {
@@ -1390,7 +1408,7 @@ index a2fb0af..1c1dc7f 100644
  		gfxContext.drawTriangles(triParams);
  	}
  	dropRenderState();
-@@ -1072,6 +1214,10 @@ void GraphicsDrawer::_drawThickLine(u32 _v0, u32 _v1, float _width, u32 _flag)
+@@ -1072,6 +1225,10 @@ void GraphicsDrawer::_drawThickLine(u32 _v0, u32 _v1, float _width, u32 _flag)
  
  void GraphicsDrawer::drawLine(u32 _v0, u32 _v1, float _width, u32 _flag)
  {
@@ -1401,7 +1419,7 @@ index a2fb0af..1c1dc7f 100644
  	m_texrectDrawer.draw();
  	m_statistics.lines++;
  
-@@ -1108,6 +1254,7 @@ void GraphicsDrawer::drawLine(u32 _v0, u32 _v1, float _width, u32 _flag)
+@@ -1108,6 +1265,7 @@ void GraphicsDrawer::drawLine(u32 _v0, u32 _v1, float _width, u32 _flag)
  
  void GraphicsDrawer::drawRect(int _ulx, int _uly, int _lrx, int _lry)
  {
@@ -1409,7 +1427,7 @@ index a2fb0af..1c1dc7f 100644
  	m_texrectDrawer.draw();
  	m_statistics.fillRects++;
  
-@@ -1125,7 +1272,7 @@ void GraphicsDrawer::drawRect(int _ulx, int _uly, int _lrx, int _lry)
+@@ -1125,7 +1283,7 @@ void GraphicsDrawer::drawRect(int _ulx, int _uly, int _lrx, int _lry)
  
  	gfxContext.enable(enable::CULL_FACE, false);
  
@@ -1418,7 +1436,7 @@ index a2fb0af..1c1dc7f 100644
  	const float W = 1.0f;
  	m_rect[0].x = static_cast<f32>(_ulx);
  	m_rect[0].y = static_cast<f32>(_uly);
-@@ -1319,8 +1466,21 @@ bool texturedRectPaletteMod(const GraphicsDrawer::TexturedRectParams & _params)
+@@ -1319,8 +1477,21 @@ bool texturedRectPaletteMod(const GraphicsDrawer::TexturedRectParams & _params)
  // Return true if actuial rendering is not necessary
  static bool(*texturedRectSpecial)(const GraphicsDrawer::TexturedRectParams & _params) = nullptr;
  
@@ -1440,7 +1458,7 @@ index a2fb0af..1c1dc7f 100644
  	gSP.changed &= ~CHANGED_GEOMETRYMODE; // Don't update cull mode
  	m_drawingState = DrawingState::TexRect;
  	m_statistics.texRects++;
-@@ -1369,7 +1529,7 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
+@@ -1369,7 +1540,7 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  		&& (cache.current[0] != nullptr)
  		//		&& (cache.current[0] == nullptr || cache.current[0]->format == G_IM_FMT_RGBA || cache.current[0]->format == G_IM_FMT_CI)
  		&& !bUseFbTexture && !bUseHdTexture);
@@ -1449,7 +1467,7 @@ index a2fb0af..1c1dc7f 100644
  	const float W = 1.0f;
  	const f32 ulx = _params.ulx;
  	const f32 uly = _params.uly;
-@@ -1514,6 +1674,15 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
+@@ -1514,6 +1685,15 @@ void GraphicsDrawer::drawTexturedRect(const TexturedRectParams & _params)
  	m_rect[3].bc1 = 1.0f;
  
  
@@ -1465,7 +1483,7 @@ index a2fb0af..1c1dc7f 100644
  	if (bUseTexrectDrawer) {
  		if (m_bBGMode) {
  			m_texrectDrawer.addBackgroundRect();
-@@ -1848,6 +2017,10 @@ void GraphicsDrawer::_setSpecialTexrect() const
+@@ -1848,6 +2028,10 @@ void GraphicsDrawer::_setSpecialTexrect() const
  		texturedRectSpecial = texturedRectPaletteMod;
  	else
  		texturedRectSpecial = nullptr;
@@ -1650,10 +1668,18 @@ index 992548c..00cca35 100644
  
  typedef struct
 diff --git a/GLideN64/src/RSP.cpp b/GLideN64/src/RSP.cpp
-index a6b6078..8d0fda0 100644
+index a6b6078..1cd371c 100644
 --- a/GLideN64/src/RSP.cpp
 +++ b/GLideN64/src/RSP.cpp
-@@ -23,13 +23,53 @@ using namespace std;
+@@ -5,6 +5,7 @@
+ #include "RDP.h"
+ #include "N64.h"
+ #include "uCodes/F3D.h"
++#include "uCodes/F3DEX2.h"
+ #include "uCodes/Turbo3D.h"
+ #include "uCodes/T3DUX.h"
+ #include "VI.h"
+@@ -23,13 +24,114 @@ using namespace std;
  #define SP_STATUS_HALT 0x0001
  #define SP_STATUS_BROKE 0x0002
  #define SP_STATUS_TASKDONE 0x0200
@@ -1680,6 +1706,67 @@ index a6b6078..8d0fda0 100644
 +/* DEV ONLY - remove */
 +extern "C" { unsigned ctr64_flushcmd[256], ctr64_flushsame[256]; }
 +static u32 ctr64_lastw[256][2];
++
++void RDP_SetPrimColor(u32 w0, u32 w1);
++void RDP_SetEnvColor(u32 w0, u32 w1);
++void RDP_SetTImg(u32 w0, u32 w1);
++void RDP_NoOp(u32 w0, u32 w1);
++int ctr64_keep_batch = 1; /* dev switch nokeepbatch.txt (pica_ContextImpl.cpp) */
++
++/* A command that sets render state between stashed triangles ends their batch. Many set what is
++ * already set (Mario Tennis' intro: most G_TEXTURE and a sixth of the prim colors repeat the
++ * values in effect, and RDP no-ops sit between them); those are carried out here and the batch goes on. Only the plain setters
++ * below; their state is compared before and after, and put back when it changed (the batch is
++ * then drawn and the command runs as usual). Returns true when the command was carried out. */
++static bool ctr64_same_state_cmd(u32 w0, u32 w1)
++{
++	const GBIFunc f = GBI.cmd[RSP.cmd];
++	u8 before[64];
++	void *state;
++	size_t n;
++	u32 *changed;
++	if (f == RDP_NoOp)
++		return true;
++	if (f == RDP_SetTImg && gSP.DMAOffsets.tex_offset == 0) {
++		/* the address for later texture loads (those end the batch themselves) */
++		state = &gDP.textureImage; n = sizeof(gDP.textureImage); changed = &gDP.changed;
++	} else if (f == RDP_SetPrimColor) {
++		state = &gDP.primColor; n = sizeof(gDP.primColor); changed = &gDP.changed;
++	} else if (f == RDP_SetEnvColor) {
++		state = &gDP.envColor; n = sizeof(gDP.envColor); changed = &gDP.changed;
++	} else if (f == F3DEX2_SetOtherMode_L || f == F3DEX2_SetOtherMode_H || f == F3D_SetOtherMode_L ||
++			   f == F3D_SetOtherMode_H) {
++		state = &gDP.otherMode; n = sizeof(gDP.otherMode); changed = &gDP.changed;
++	} else if (f == F3DEX2_Texture || f == F3D_Texture) {
++		/* the texture settings and the two tile pointers it sets */
++		u8 tb[sizeof(gSP.texture) + sizeof(gSP.textureTile)];
++		static_assert(sizeof(tb) <= sizeof(before), "texture state");
++		memcpy(tb, &gSP.texture, sizeof(gSP.texture));
++		memcpy(tb + sizeof(gSP.texture), gSP.textureTile, sizeof(gSP.textureTile));
++		const u32 ch = gSP.changed;
++		f(w0, w1);
++		const bool same = memcmp(tb, &gSP.texture, sizeof(gSP.texture)) == 0 &&
++						  memcmp(tb + sizeof(gSP.texture), gSP.textureTile, sizeof(gSP.textureTile)) == 0;
++		if (!same) {
++			memcpy(&gSP.texture, tb, sizeof(gSP.texture));
++			memcpy(gSP.textureTile, tb + sizeof(gSP.texture), sizeof(gSP.textureTile));
++		}
++		gSP.changed = ch;
++		return same;
++	} else {
++		return false;
++	}
++	static_assert(sizeof(gDP.primColor) <= sizeof(before) && sizeof(gDP.otherMode) <= sizeof(before) &&
++				  sizeof(gDP.textureImage) <= sizeof(before), "state");
++	memcpy(before, state, n);
++	const u32 ch = *changed;
++	f(w0, w1);
++	const bool same = memcmp(before, state, n) == 0;
++	if (!same)
++		memcpy(state, before, n);
++	*changed = ch;
++	return same;
++}
 +#endif
 +
 +#ifdef __3DS__
@@ -1707,7 +1794,7 @@ index a6b6078..8d0fda0 100644
  		if ((RSP.PC[RSP.PCi] + 8) > RDRAMSize) {
  #ifdef DEBUG_DUMP
  			if ((config.debug.dumpMode & DEBUG_DETAIL) != 0)
-@@ -42,8 +82,8 @@ void _ProcessDList()
+@@ -42,8 +144,8 @@ void _ProcessDList()
  			break;
  		}
  
@@ -1718,7 +1805,7 @@ index a6b6078..8d0fda0 100644
  		RSP.cmd = _SHIFTR(RSP.w0, 24, 8);
  
  #ifdef DEBUG_DUMP
-@@ -54,11 +94,40 @@ void _ProcessDList()
+@@ -54,11 +156,46 @@ void _ProcessDList()
  		u32 pci = RSP.PCi;
  		if (RSP.count == 1)
  			--pci;
@@ -1737,6 +1824,12 @@ index a6b6078..8d0fda0 100644
 +				   ((c == G_MOVEMEM && (_SHIFTR(RSP.w0, 0, 8) == G_MV_LIGHT || _SHIFTR(RSP.w0, 0, 8) == G_MV_NORMALES)) ||
 +				    (c == G_MOVEWORD && (_SHIFTR(RSP.w0, 16, 8) == G_MW_NUMLIGHT || _SHIFTR(RSP.w0, 16, 8) == G_MW_SEGMENT ||
 +				                         _SHIFTR(RSP.w0, 16, 8) == G_MW_COORD_MOD)))))) {
++				if (ctr64_keep_batch && ctr64_same_state_cmd(RSP.w0, RSP.w1)) {
++					ctr64_lastw[c][0] = RSP.w0; /* DEV ONLY */
++					ctr64_lastw[c][1] = RSP.w1;
++					RSP_CheckDLCounter();
++					continue;
++				}
 +				/* DEV ONLY - remove: which commands end batches */
 +				ctr64_flushcmd[c]++;
 +				if (ctr64_lastw[c][0] == RSP.w0 && ctr64_lastw[c][1] == RSP.w1)
@@ -1760,7 +1853,7 @@ index a6b6078..8d0fda0 100644
  }
  
  static
-@@ -88,6 +157,9 @@ void _ProcessDListFactor5()
+@@ -88,6 +225,9 @@ void _ProcessDListFactor5()
  #endif
  
  		RSP.nextCmd = _SHIFTR(*(u32*)&RDRAM[RSP.PC[RSP.PCi] + 8], 24, 8);
@@ -1770,7 +1863,7 @@ index a6b6078..8d0fda0 100644
  
  		GBI.cmd[RSP.cmd](RSP.w0, RSP.w1);
  		RSP.PC[RSP.PCi] += 8;
-@@ -164,6 +236,10 @@ void RSP_ProcessDList()
+@@ -164,6 +304,10 @@ void RSP_ProcessDList()
  			RSP.PC[1] = *(u32*)&DMEM[0xff8];
  			*REG.SP_STATUS &= ~0x300;  // clear sig1 | sig2
  			*REG.SP_STATUS |= 0x800;   // set sig4
@@ -1781,7 +1874,7 @@ index a6b6078..8d0fda0 100644
  		}
  	}
  
-@@ -184,6 +260,19 @@ void RSP_ProcessDList()
+@@ -184,6 +328,19 @@ void RSP_ProcessDList()
  	}
  
  	if (RSP.infloop && REG.SP_STATUS) {
@@ -1801,7 +1894,7 @@ index a6b6078..8d0fda0 100644
  		*REG.SP_STATUS &= ~(SP_STATUS_TASKDONE | SP_STATUS_HALT | SP_STATUS_BROKE);
  		return;
  	}
-@@ -287,6 +376,21 @@ void RSP_Init()
+@@ -287,6 +444,21 @@ void RSP_Init()
  		TFH.shutdown();
  
  	strncpy(RSP.romname, romname, 21);
@@ -4322,6 +4415,27 @@ index 15a490f..a085ffa 100644
  #ifdef __APPLE__
     /* Create or recreate converter if sample rate changed */
     if (!audio_converter || converter_input_rate != (unsigned)GameFreq)
+diff --git a/custom/mupen64plus-core/plugin/emulate_game_controller_via_libretro.c b/custom/mupen64plus-core/plugin/emulate_game_controller_via_libretro.c
+index 8a132d4..dc048b8 100644
+--- a/custom/mupen64plus-core/plugin/emulate_game_controller_via_libretro.c
++++ b/custom/mupen64plus-core/plugin/emulate_game_controller_via_libretro.c
+@@ -410,6 +410,16 @@ EXPORT void CALL inputInitiateControllers(CONTROL_INFO ControlInfo)
+        else
+           controller[i].control->Plugin = PLUGIN_NONE;
+     }
++#if defined(__3DS__)
++    {   /* ctr64: a VRU on this port for the games that use one (ctr64/src/vru.c), -1: none */
++        extern int ctr64_vru_port;
++        if (ctr64_vru_port >= 0 && ctr64_vru_port < 4) {
++            controller[ctr64_vru_port].control->Present = 1;
++            controller[ctr64_vru_port].control->Plugin = PLUGIN_NONE;
++            controller[ctr64_vru_port].control->Type = CONT_TYPE_VRU;
++        }
++    }
++#endif
+ 
+    getKeys = inputGetKeys_default;
+    inputGetKeys_default_descriptor();
 diff --git a/libretro/libretro.c b/libretro/libretro.c
 index 4a9f129..9d772bc 100644
 --- a/libretro/libretro.c
@@ -10384,6 +10498,53 @@ index ef31870..6f2ca6a 100644
      init_work(&save->work, savestates_save_m64p_work);
      queue_work(&save->work);
  
+diff --git a/mupen64plus-core/src/plugin/dummy_input.c b/mupen64plus-core/src/plugin/dummy_input.c
+index d6fcad8..349f97b 100644
+--- a/mupen64plus-core/src/plugin/dummy_input.c
++++ b/mupen64plus-core/src/plugin/dummy_input.c
+@@ -86,20 +86,42 @@ void dummyinput_RenderCallback(void)
+ {
+ }
+ 
++#if defined(__3DS__)
++/* ctr64: the Voice Recognition Unit (port 4 in Hey You, Pikachu! and Densha de GO! 64) is served
++ * by the frontend (ctr64/src/vru.c: 3DS microphone and word matching) */
++void ctr64_vru_send_word(uint16_t length, uint16_t *word, uint8_t lang);
++void ctr64_vru_set_mic(int state);
++void ctr64_vru_read_results(uint16_t *error_flags, uint16_t *num_results, uint16_t *mic_level, uint16_t *voice_level,
++                            uint16_t *voice_length, uint16_t *matches);
++void ctr64_vru_clear_words(uint8_t length);
++#endif
++
+ void dummyinput_SendVRUWord(uint16_t length, uint16_t *word, uint8_t lang)
+ {
++#if defined(__3DS__)
++    ctr64_vru_send_word(length, word, lang);
++#endif
+ }
+ 
+ void dummyinput_SetMicState(int state)
+ {
++#if defined(__3DS__)
++    ctr64_vru_set_mic(state);
++#endif
+ }
+ 
+ void dummyinput_ReadVRUResults(uint16_t *error_flags, uint16_t *num_results, uint16_t *mic_level, uint16_t *voice_level, uint16_t *voice_length, uint16_t *matches)
+ {
++#if defined(__3DS__)
++    ctr64_vru_read_results(error_flags, num_results, mic_level, voice_level, voice_length, matches);
++#endif
+ }
+ 
+ void dummyinput_ClearVRUWords(uint8_t lenght)
+ {
++#if defined(__3DS__)
++    ctr64_vru_clear_words(lenght);
++#endif
+ }
+ 
+ void dummyinput_SetVRUWordMask(uint8_t length, uint8_t *mask)
 diff --git a/mupen64plus-core/src/plugin/plugin.c b/mupen64plus-core/src/plugin/plugin.c
 index e0246bb..dd7ce5f 100644
 --- a/mupen64plus-core/src/plugin/plugin.c

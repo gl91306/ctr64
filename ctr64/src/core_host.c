@@ -17,6 +17,7 @@ extern char ctr64_rs_md5[33]; /* rom_stream.c */
 #include "input_script.h"
 #include "libretro.h"
 #include "settings.h"
+#include "vru.h"
 
 void ctr64_time_mark(const char *what); /* main.c: timing.log */
 
@@ -321,6 +322,19 @@ static int16_t RETRO_CALLCONV input_state(unsigned port, unsigned device, unsign
 {
     u32 k = hidKeysHeld();
 
+    if (port == 3 && vru_active()) {
+        /* the VRU's port: Z while the player talks (held talk button = the N64 Z button's 3DS
+         * button(s)) and until the words are matched (vru.c) */
+        const bool held = g_input_script.loaded /* scripted tests: the script's Z */
+                              ? input_script_state(ctr64_vi_count + 1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2) != 0
+                              : !H.input_blocked && (k & g_settings.map[IN_Z]) != 0;
+        const bool z = vru_talk(held);
+        if ((device & RETRO_DEVICE_MASK) != RETRO_DEVICE_JOYPAD)
+            return 0;
+        if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
+            return z ? (1 << RETRO_DEVICE_ID_JOYPAD_L2) : 0;
+        return id == RETRO_DEVICE_ID_JOYPAD_L2 && z;
+    }
     if (port != 0)
         return 0;
     if (g_input_script.loaded) /* <data dir>/inputs.txt replaces the pad (development aid) */
@@ -627,6 +641,7 @@ static void rom_id_from_header(const unsigned char *d, long size)
     }
     snprintf(H.rom_id, sizeof(H.rom_id), "%02X%02X%02X%02X%02X%02X%02X%02X-%02X", h[0x10], h[0x11], h[0x12],
              h[0x13], h[0x14], h[0x15], h[0x16], h[0x17], h[0x3E]);
+    vru_detect(h);
 }
 
 void ctr64_mem_prepare(long rom_bytes, const char *game_id);
@@ -1006,6 +1021,7 @@ void core_host_unload(void)
         ctr_jit_thread_stop();
     }
     retro_unload_game();
+    vru_shutdown();
     ctr64_gfx_async_stop();
     ctr64_audio_async_stop();
     audio_ndsp_exit();

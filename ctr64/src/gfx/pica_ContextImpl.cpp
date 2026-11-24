@@ -119,6 +119,7 @@ extern "C" unsigned int ctr64_gfx_stats[8]; /* core_compat/gln64_ctr.c */
 extern "C" unsigned int ctr64_gfx_fcram[2]; /* core_compat/gln64_ctr.c: draws to FCRAM color/depth */
 extern "C" bool pica_gputime; /* DEV ONLY gputime.txt (pica.c) */
 extern int ctr64_stash; /* gSP.cpp: triangle batching (dev switch nostash.txt) */
+extern int ctr64_keep_batch; /* RSP.cpp: repeated state commands keep the batch (dev switch nokeepbatch.txt) */
 extern int ctr64_flat_stash; /* gSP.cpp: flat-shaded triangles stashed (dev switch noflatstash.txt) */
 extern int ctr64_std_fast; /* gSP.cpp: standard vertex fast path (dev switch nostdvtx.txt) */
 extern "C" unsigned int ctr64_gfx_vram_moves[2]; /* KB moved into / out of VRAM (keepInVram) */
@@ -265,6 +266,7 @@ bool g_slowtex; /* dev switch slowtex.txt: texture uploads by the old per-texel 
 bool g_noguard; /* dev switch noguard.txt: no guard band clipping (A/B) */
 bool g_noshadelin; /* dev switch noshadelin.txt: no screen-linear shade subdivision (A/B) */
 bool g_novramflush; /* dev switch novramflush.txt: no cache flush after CPU texel writes into VRAM */
+bool g_noshadeonce; /* dev switch noshadeonce.txt: prim-depth draws without the stencil "shade once" */
 bool g_novpz;      /* dev switch novpz.txt: the N64 viewport's z scale and translation not applied */
 bool g_noproj;     /* dev switch noproj.txt: screen-linear shade by subdivision, not projective draws */
 bool g_noalphaover; /* dev switch noalphaover.txt: alpha blended with the colour's factors (setBlending) */
@@ -1360,6 +1362,7 @@ private:
     u32 m_cullMode = CM_BACK;
     bool m_depthWrite = true;
     u32 m_depthFunc = CMP_LESS;
+    u32 m_depthClears = 0; /* depth buffer clears: new stencil tags (applyState) */
     s32 m_vp[4] = {0, 0, WINDOW_W, WINDOW_H};
     s32 m_sc[4] = {0, 0, WINDOW_W, WINDOW_H};
     u32 m_blend[4] = {BL_ONE, BL_ZERO, BL_ONE, BL_ZERO};
@@ -1545,6 +1548,10 @@ void ContextImplPica::init()
         fclose(fs);
         ctr64_flat_stash = 0;
     }
+    if (FILE *nk = fopen("sdmc:/3ds/ctr64/nokeepbatch.txt", "r")) {
+        ctr64_keep_batch = 0;
+        fclose(nk);
+    }
     if (FILE *ns = fopen("sdmc:/3ds/ctr64/nostash.txt", "r")) { /* gSP.cpp: no triangle batching */
         fclose(ns);
         ctr64_stash = 0;
@@ -1552,6 +1559,10 @@ void ContextImplPica::init()
     if (FILE *sv = fopen("sdmc:/3ds/ctr64/nostdvtx.txt", "r")) { /* gSP.cpp: generic vertex path */
         fclose(sv);
         ctr64_std_fast = 0;
+    }
+    if (FILE *no = fopen("sdmc:/3ds/ctr64/noshadeonce.txt", "r")) {
+        g_noshadeonce = true;
+        fclose(no);
     }
     if (FILE *no = fopen("sdmc:/3ds/ctr64/novpz.txt", "r")) {
         fclose(no);
@@ -1724,7 +1735,8 @@ void ContextImplPica::clearDepthBuffer()
     Tex *d = tex(f.depth);
     const u32 area = (u32)f.rt.width * f.rt.height;
     if (!d || d->data != f.rt.depth || d->zclean < area) {
-        pica_clear_depth(&f.rt, 0xFFFFFF);
+        pica_clear_depth(&f.rt, 0xFFFFFF); /* stencil 0 */
+        m_depthClears++;
         if (d && d->data == f.rt.depth)
             d->zclean = area;
     }
@@ -2765,6 +2777,30 @@ bool ContextImplPica::applyState(bool depth_allowed)
         if (Tex *d = tex(f.depth))
             d->zclean = 0;
     pica_depth_map(k_depth_scale, (depth && m_enPolyOffset) ? k_poly_offset : 0.0f);
+
+    /* Prim-depth shapes shade each pixel once: with compare "in front" + update, the RDP rejects
+     * every later piece of the same depth where an earlier one drew. The PICA's depth is not exact
+     * enough for that (pieces of one depth differ by rounding: Mario Tennis' intro shadows showed
+     * darker speckles and patches where body parts overlap); the stencil buffer marks the pixels
+     * instead, one tag per depth buffer clear and prim depth. */
+    /* (prim depth at the maximum compares as "buffer at max" on the N64: later layers pass; GLideN64
+     * then uses LEQUAL, Mario Tennis' scoreboard draws text over its board that way) */
+    const bool once = depth && m_depthWrite && func == GPU_LESS && !RSP.LLE && gDP.otherMode.depthSource == G_ZS_PRIM &&
+                      gDP.otherMode.depthCompare && gDP.otherMode.depthMode != ZMODE_INTER &&
+                      gDP.otherMode.depthMode != ZMODE_DEC && f.rt.depth_fmt == GPU_RB_DEPTH24_STENCIL8 && !g_noshadeonce;
+    if (once) {
+        static u8 tag;
+        static u32 tag_clears = ~0u;
+        static float tag_z = -2.0f;
+        if (tag_clears != m_depthClears || tag_z != gDP.primDepth.z) {
+            tag = tag == 255 ? 1 : tag + 1;
+            tag_clears = m_depthClears;
+            tag_z = gDP.primDepth.z;
+        }
+        pica_stencil(true, GPU_NOTEQUAL, tag);
+    } else {
+        pica_stencil(false, GPU_ALWAYS, 0);
+    }
 
     /* Measured against GLideN64's GL output: for the same window coordinates the PICA's cull
      * modes select the opposite winding to GL's (GL culls back = clockwise faces here). */
