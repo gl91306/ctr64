@@ -553,7 +553,10 @@ void vru_recognize(const int16_t *pcm, int samples, int rate, const VruWord *wor
     }
     free(lp);
     for (int i = 0; i < ntop; i++) {
-        float d = topd[i] * 1000.0f; /* calibrated: tools/vru/eval.py */
+        /* games accept a word under 0x640 (1600). Right words score 0-0.18 here and unrelated speech
+         * 0.23-0.53 (synthetic voices, tools/vru): x6000 puts the line near 0.27, so unrelated speech is
+         * "not understood" instead of taken for the nearest word */
+        float d = topd[i] * 6000.0f;
         out->match[i * 2] = (uint16_t)top[i];
         out->match[i * 2 + 1] = (uint16_t)(d > 0x7FFF ? 0x7FFF : d);
         if (vru_rec_debug)

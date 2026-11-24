@@ -157,7 +157,20 @@ static RomBrowserResult pick(const char *dir, char *out, size_t outsz);
 
 RomBrowserResult rom_browser_pick(const char *dir, char *out, size_t outsz)
 {
-    mkdir(dir, 0777); /* a missing roms folder: there it is, for the "No games found" card */
+    /* a missing roms folder (a CIA installed without the release zip's 3ds folder): it and the
+     * folders above it are made, for the "No games found" card */
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "%s", dir);
+        for (char *q = strchr(path, '/'); q; q = strchr(q + 1, '/')) {
+            if (q > path && q[-1] == ':')
+                continue; /* "sdmc:/" */
+            *q = 0;
+            mkdir(path, 0777);
+            *q = '/';
+        }
+        mkdir(path, 0777);
+    }
     g_roms = (Rom *)malloc(MAX_ROMS * sizeof(Rom));
     if (!g_roms)
         return ROM_BROWSER_QUIT;

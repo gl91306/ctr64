@@ -48,8 +48,8 @@ Old 3DS gives the app less memory, so use the CIA there.
 
 Copy the `3ds` folder from the release zip to the root of the SD card as well: it holds
 `3ds/ctr64/jit/shipped/`, lists of compiled code for some popular games that make their run
-minutes smoother. Then put your games in `sdmc:/3ds/ctr64/roms/`. The other folders are created
-on first start.
+minutes smoother. Then put your games in `sdmc:/3ds/ctr64/roms/`. If you start ctr64 before
+making that folder, it creates it (and the other folders) for you.
 
 ```
 sdmc:/3ds/dspfirm.cdc              DSP firmware (sound)
@@ -83,13 +83,7 @@ while the game list is open (about 350 KB per game, once) and keeps a 128 KB cop
 the screen in `sdmc:/3ds/ctr64/boxart`; games are matched by the cartridge ID in the ROM, so file names do not
 matter. Without Wi-Fi, or for games without art (ROM hacks, test ROMs), a card with the title
 is shown. To fetch a game's art again, delete its file from that folder (`.none` marks a game
-that has no art).
-
-You can use your own pictures, for example for ROM hacks: put a `.png` or `.jpg` with the same name
-as the ROM into that folder (`My Hack.z64`: `My Hack.png`) and open ctr64. It converts the picture
-while the game list is open (about a second for a normal one), shows it, and removes the original,
-so keep a copy. Delete `u_My Hack.bin` to go back to the normal art. If a picture does not show up,
-`boxart.log` in that folder says why. Progressive JPGs work, CMYK ones do not.
+that has no art). You can also use your own pictures, see [Your own box art and borders](#your-own-box-art-and-borders-rom-hacks).
 
 While a game runs, the bottom screen shows the speed. **SELECT** or a tap on the bottom screen
 pauses and opens the menu:
@@ -106,7 +100,7 @@ pauses and opens the menu:
 - **Controls**: tap a button on the N64 controller picture (or pick it with the D-pad), press A,
   then the 3DS button you want for it; hold two 3DS buttons to put it on both (for example
   shield on L and ZL). X clears, Y resets to the defaults. On the control stick, A selects the
-  Circle Pad range, which left/right then change. On the D-pad, A swaps the 3DS D-Pad and Circle
+  Circle Pad range (50-300%), which left/right then change. On the D-pad, A swaps the 3DS D-Pad and Circle
   Pad (the D-Pad then works as the stick, nice for racing games). With a game running, **START**
   saves the controls for just that game (`controls/` folder); START again goes back to the shared
   ones. On a New 3DS the C-Stick works for the C buttons in addition to their mapped buttons.
@@ -114,17 +108,15 @@ pauses and opens the menu:
 
 **Side borders** fill the bars left and right of a 4:3 picture: **Box art** (the default: the
 game's box art, blurred and darkened), **Console** (grey plastic with a D-pad and buttons) or
-**Off**. Your own picture wins over both: put a `.png` or `.jpg` named like the ROM into
-`sdmc:/3ds/ctr64/borders` (`My Game.z64`: `My Game.png`), or `default.png` for every game without
-its own. A 400x240 picture is used as it is (only its outer 40 pixels on each side show); other
-sizes are scaled to cover the screen.
+**Off**. Your own border picture wins over both (see the next section).
 
 **Voice games**: Hey You, Pikachu! and Densha de GO! 64 use the N64's Voice Recognition Unit,
 and ctr64 uses the 3DS microphone for it. Hold the N64 **Z** button (L by default) while you
 speak, and let go when you are done; the game then gets the word you said. The words are
 recognized on the 3DS itself, with a small speech model built into ctr64 (no internet needed),
 after you let go, so the game keeps running at full speed while you talk. Speak clearly and
-close to the microphone; Densha de GO! 64 expects its Japanese words.
+close to the microphone; Densha de GO! 64 expects its Japanese words. For now it recognizes clear,
+slightly higher voices best; deep voices are recognized less often (a better model is planned).
 
 Default controls:
 
@@ -141,6 +133,30 @@ Default controls:
 Anti-aliasing, screen shape and frame buffer emulation take effect when a game starts. A changed
 value turns orange, and a banner offers **Restart** (X), which starts the same game again with
 the new settings (CIA; with the .3dsx, start ctr64 again).
+
+## Your own box art and borders (ROM hacks)
+
+ROM hacks usually have no box art online (or get the art of the game they are based on), and
+you may want your own picture next to a 4:3 game. Both work with a `.png` or `.jpg` named
+exactly like the ROM file, with the picture's extension instead of the ROM's:
+
+```
+sdmc:/3ds/ctr64/roms/My Hack.z64        the game
+sdmc:/3ds/ctr64/boxart/My Hack.png      its box art in the game list (top screen)
+sdmc:/3ds/ctr64/borders/My Hack.png     its side borders while it runs
+sdmc:/3ds/ctr64/borders/default.png     side borders for every game without its own
+```
+
+**Box art**: put the picture in `sdmc:/3ds/ctr64/boxart` and open ctr64. It converts the picture
+while the game list is open (about a second for a normal one), shows it, and then **removes the
+original**, so keep a copy on your PC. The converted file is `u_My Hack.bin`; delete it to go
+back to the downloaded art. Any size works (it is scaled to fit). If a picture does not show up,
+`boxart.log` in that folder says why. Progressive JPGs work, CMYK ones do not.
+
+**Borders**: put the picture in `sdmc:/3ds/ctr64/borders`, use the 4:3 screen shape and set
+Video > Side borders to anything but Off. A 400x240 picture is used as it is: the game covers its
+middle 320 pixels, so only the outer 40 pixels on each side show (draw your border there). Other
+sizes are scaled to cover the screen. Borders are read when a game starts.
 
 ## Building
 

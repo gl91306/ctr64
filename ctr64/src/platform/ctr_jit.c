@@ -772,6 +772,8 @@ void ctr_jit_init(void *base, unsigned int size)
     if (g_luma) {
         u8 actual = 0;
         rc = svcGetThreadAffinityMask(&actual, CUR_THREAD_HANDLE, 4);
+        if (R_FAILED(rc)) /* old 3DS: two cores, a count of 4 is out of range (D8E007FD, GitHub #12) */
+            rc = svcGetThreadAffinityMask(&actual, CUR_THREAD_HANDLE, 2);
         if (R_FAILED(rc)) jit_fail("read JIT affinity", (u32)rc);
         if (actual != 1)
             jit_fail("verify JIT affinity", actual);

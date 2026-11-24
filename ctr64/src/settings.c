@@ -131,7 +131,7 @@ static void ctrl_put(Settings *s, const Controls *c)
 static bool ctrl_parse(Settings *s, const char *k, const char *v)
 {
     if (!strcmp(k, "stick_range")) {
-        s->stick_range = clampi(atoi(v), 50, 150);
+        s->stick_range = clampi(atoi(v), 50, 300);
         return true;
     }
     if (!strcmp(k, "swap_dpad")) {

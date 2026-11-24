@@ -946,7 +946,7 @@ static bool change(int i, int dir)
             cycle_map(in, dir);
         else if (in == PAD_STICK) {
             s->stick_range += dir * 5;
-            s->stick_range = s->stick_range < 50 ? 50 : s->stick_range > 150 ? 150 : s->stick_range;
+            s->stick_range = s->stick_range < 50 ? 50 : s->stick_range > 300 ? 300 : s->stick_range;
         } else
             return false;
         return true;
