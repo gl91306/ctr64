@@ -35,6 +35,14 @@ Basically this project is mupen64plus-next + gliden64 ported to the 3ds with a c
 **CIA (recommended, required for Old 3DS):** copy `ctr64.cia` to the SD card and install it with
 FBI. ctr64 then appears on the HOME Menu.
 
+**New 3DS, big games: `ctr64_bigmem.cia`.** It asks the New 3DS for its largest memory mode
+(178 MB), so games over about 48 MB load whole instead of being read from the SD card while they
+run. That helps **Conker's Bad Fur Day, Resident Evil 2, Pokemon Stadium 2, Dinosaur Planet, Paper
+Mario (Europe)** and big ROM hacks such as **Smash Remix**: no pauses while the game reads new parts
+from the SD card. The catch: the 3DS restarts its system when ctr64 opens and closes (10-20 s), and
+on some New 3DS it stays on a black screen; if so, go back to `ctr64.cia`. Both are the same app
+(installing one replaces the other) and share settings and saves. Old 3DS: use `ctr64.cia`.
+
 On an Old 3DS, opening and closing the CIA takes about 10-20 seconds: it asks for an extended memory
 mode (80 MB), and the 3DS has to restart its system to switch to it, once when ctr64 opens and again
 when it goes back to the HOME Menu. That's normal, it's not frozen.
